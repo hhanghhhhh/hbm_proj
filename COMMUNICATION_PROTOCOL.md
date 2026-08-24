@@ -1,10 +1,10 @@
-# FPGA Communication Protocol
+# FPGA 通信协议规范
 
-## 1. Frame Format
+## 1. 帧格式
 
-All command and response messages use the same frame format.
+所有命令请求和响应均采用统一帧格式。
 
-| Field | Size |
+| 字段 | 长度 |
 |---|---:|
 | SOF | 2 Byte |
 | ADDR | 1 Byte |
@@ -14,7 +14,7 @@ All command and response messages use the same frame format.
 | PAYLOAD | N Byte |
 | CRC | 2 Byte |
 
-Frame format:
+帧格式：
 
 ```
 +--------+---------+--------+--------+--------+---------+---------+
@@ -24,18 +24,18 @@ Frame format:
 +--------+---------+--------+--------+--------+---------+---------+
 ```
 
-## 2. Basic Rules
+## 2. 基本规则
 
-- SOF is fixed as `0x55AA`.
-- ADDR is used to identify the target device.
-- Request and response use the same frame format.
-- Multi-byte data uses big-endian format.
-- CRC calculation does not include SOF.
-- Maximum LENGTH is 2048 Bytes.
+- SOF 固定为 `0x55AA`。
+- ADDR 用于区分目标设备。
+- 请求和响应使用相同帧格式。
+- 多字节数据统一采用大端格式。
+- CRC 校验范围不包含 SOF。
+- LENGTH 最大支持 2048 Byte。
 
-## 3. Design Principles
+## 3. 设计原则
 
-- Frame parsing should support streaming reception and CRC calculation during data reception.
-- CRC verification must complete before applying configuration or executing critical commands.
-- Large data transmission uses segmented packets.
-- Configuration update and firmware update should support complete verification before commit.
+- 接收过程中支持边接收边计算 CRC。
+- CRC 校验通过后，才允许执行配置更新或关键控制命令。
+- 大段数据采用分包传输方式。
+- 配置更新和固件升级需要支持完整校验后再提交生效。
