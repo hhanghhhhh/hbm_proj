@@ -119,7 +119,9 @@ payload_rd_data
 frame_done
 ```
 
-`frame_done` 由发送链路的 `tx_done` 产生或直接映射，表示当前响应已完整发送，可以释放当前请求并恢复接收下一帧。
+`frame_done` 由 `TX Frame Builder` 的 `tx_done` 产生或直接映射。
+
+当前定义中，`tx_done` 在响应帧最后一个 CRC 字节完成 `tx_valid && tx_ready` 握手后产生，表示完整响应帧已经全部提交给 UART TX 模块。Frame Parser 此时即可释放当前请求并恢复下一帧接收，不要求等待串口线上最后一个停止位实际发送完成。
 
 ---
 
@@ -155,7 +157,7 @@ tx_done / frame_done
 恢复下一帧接收
 ```
 
-Frame Parser 不在当前响应发送完成前接收下一条业务请求。
+主机等待完整响应后才发送下一请求，因此当前架构不考虑请求并发或多事务排队。
 
 ---
 
@@ -177,4 +179,4 @@ Frame Parser 不在当前响应发送完成前接收下一条业务请求。
 3. CRC 边接收边计算，避免二次扫描数据。
 4. CRC 校验通过后才产生 `frame_valid`。
 5. CMD、SEQ、LENGTH 作为帧元信息输出。
-6. 当前响应完整发送后才释放当前帧并恢复接收。
+6. `tx_done` 后释放当前帧并恢复下一次问答。
