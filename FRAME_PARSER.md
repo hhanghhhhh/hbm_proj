@@ -97,6 +97,20 @@ Frame Parser 内部包含 Payload RAM。
 - 后级模块根据 CMD 类型解析 Payload；
 - 当前事务结束前，Payload RAM 内容保持有效且不被下一帧覆盖。
 
+## RAM 读取时序
+
+Payload RAM 使用同步读方式：
+
+```text
+payload_rd_addr
+        |
+        | 1 clock delay
+        v
+payload_rd_data
+```
+
+业务模块需要按照固定 1clk 延迟读取 Payload 数据。
+
 ---
 
 # 6. 接口设计
@@ -117,6 +131,12 @@ cmd
 seq
 payload_length
 ```
+
+`frame_valid` 为单周期脉冲。
+
+CRC 校验成功后产生一次 `frame_valid`，表示当前完整请求已经提交给后级模块。
+
+ADDR/CMD/SEQ/LENGTH 作为事务上下文寄存器保持。
 
 ADDR、CMD、SEQ 在当前合法请求提交后保持有效，供请求路由和后续响应帧直接沿用。
 
@@ -170,7 +190,13 @@ tx_done / frame_done
 
 接收超时直接丢弃当前不完整帧并重新同步。
 
-事务超时的具体恢复策略和超时参数由后续实现确定。
+事务超时时：
+
+Frame Parser 产生 timeout/abort 信号。
+
+该信号通知后级模块清除当前事务状态。
+
+超时恢复后重新进入等待 SOF 状态。
 
 ---
 
