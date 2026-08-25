@@ -169,7 +169,59 @@ SEQ
 
 ---
 
-## 10. 待确认事项
+## 10. 接口时序约束
+
+通信模块内部所有 valid 信号均采用单周期脉冲形式：
+
+```
+frame_valid : 1 clock pulse
+
+req_valid   : 1 clock pulse
+
+rsp_valid   : 1 clock pulse
+
+tx_done     : 1 clock pulse
+```
+
+valid 信号表示事件发生，不表示状态保持。
+
+当前请求的上下文信息：
+
+```
+ADDR
+CMD
+SEQ
+LENGTH
+active_module
+```
+
+由对应模块锁存，并保持到当前事务结束。
+
+---
+
+## 11. 事务超时恢复
+
+Frame Parser 提供事务超时检测。
+
+当合法请求已经产生 `frame_valid`，但后续模块长期未完成响应时：
+
+Frame Parser 产生 timeout/abort 通知。
+
+该通知用于清除当前事务状态：
+
+- Frame Parser
+- CMD Dispatcher
+- Response Buffer
+- 业务模块
+- Error Response Generator
+
+均需要释放当前事务。
+
+超时恢复后，系统重新进入等待下一帧状态。
+
+---
+
+## 12. 待确认事项
 
 当前仍需后续统一确定：
 
@@ -178,7 +230,7 @@ SEQ
 
 ---
 
-## 11. 设计原则总结
+## 13. 设计原则总结
 
 1. 通信层与业务层分离。
 2. Frame Parser 内部保存接收 Payload RAM，并负责可靠收帧。
@@ -191,3 +243,7 @@ SEQ
 9. 响应 ADDR、CMD、SEQ 均沿用当前请求。
 10. 当前响应完成后才允许处理下一条请求。
 11. 新功能优先通过增加 CMD 和业务模块实现，不修改基础通信框架。
+12. 所有 valid 信号采用单周期脉冲。
+13. RAM 采用同步读模型，固定 1clk 读取延迟。
+14. Response Payload 第一个字节固定为 STATUS。
+15. SEQ 仅用于请求/响应匹配，不提供自动去重功能。
