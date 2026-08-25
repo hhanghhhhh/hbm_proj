@@ -20,7 +20,7 @@ Frame Parser 不负责解析业务含义，不处理具体 CMD 功能。
 
 通信帧格式：
 
-```
+```text
 +--------+---------+--------+--------+--------+---------+---------+
 | SOF    | ADDR    | CMD    | SEQ    | LENGTH | PAYLOAD | CRC     |
 +--------+---------+--------+--------+--------+---------+---------+
@@ -42,7 +42,7 @@ Frame Parser 不负责解析业务含义，不处理具体 CMD 功能。
 
 Frame Parser 采用流式接收方式：
 
-```
+```text
 RX Byte
    |
    v
@@ -66,12 +66,12 @@ CRC校验
    +---- 成功：frame_valid
 ```
 
-注意：
+约束：
 
-- 不需要等待整帧接收完成后重新解析；
-- 接收过程中完成字段解析和 CRC 累计计算；
+- 接收过程中完成字段解析和 CRC 累计计算，不进行二次扫描；
 - Payload 仅在接收过程中写入 RAM；
-- CRC 通过后才允许业务模块读取。
+- CRC 通过后才允许后级读取当前 Payload；
+- `frame_valid` 后停止接受新的请求帧，直到当前问答事务结束。
 
 ---
 
@@ -79,85 +79,47 @@ CRC校验
 
 Frame Parser 内部包含 Payload RAM。
 
-用途：
-
-- 暂存当前完整 Payload 数据；
-- 提供统一的数据访问接口给后级解析模块。
-
 设计原则：
 
 - 无论 Payload 长度大小，均通过 RAM 访问；
 - Frame Parser 不解析 Payload 内容；
-- 后级模块根据 CMD 类型解析 Payload。
-
-例如：
-
-```
-CMD_CONFIG_DATA
-        |
-        v
-读取 Payload RAM
-        |
-        v
-配置处理模块
-```
+- 后级模块根据 CMD 类型解析 Payload；
+- 当前事务结束前，Payload RAM 内容保持有效且不被下一帧覆盖。
 
 ---
 
 # 5. 接口设计
 
-## 输入
+输入字节流：
 
-```
+```text
 rx_byte
 rx_valid
 ```
 
-表示接收到的串行数据字节。
+帧有效及元信息输出：
 
----
-
-## 输出
-
-帧有效通知：
-
-```
+```text
 frame_valid
-```
-
-表示：
-
-- SOF 正确；
-- LENGTH 合法；
-- Payload 接收完成；
-- CRC 校验通过。
-
-同时输出：
-
-```
 cmd
 seq
 payload_length
 ```
 
-其中：
+Payload RAM 读取接口：
 
-- cmd：用于命令分发；
-- seq：用于请求和响应匹配；
-- payload_length：表示当前 Payload 有效长度。
-
----
-
-## Payload RAM 读取接口
-
-后级模块通过 RAM 读取 Payload：
-
-```
+```text
 payload_rd_addr
 payload_rd_data
 ```
 
-Frame Parser 不主动解析 Payload。
+当前事务完成输入：
+
+```text
+frame_done
+```
+
+`frame_done` 由发送链路的 `tx_done` 产生或直接映射，表示当前响应已完整发送，可以释放当前请求并恢复接收下一帧。
 
 ---
 
@@ -175,37 +137,44 @@ Frame Parser 不主动解析 Payload。
 
 ---
 
-# 7. 完成握手
+# 7. 单事务约束
 
-建议增加帧处理完成信号：
+当前通信采用严格一问一答模式：
 
+```text
+接收请求
+   ↓
+frame_valid
+   ↓
+业务处理并生成响应
+   ↓
+发送响应
+   ↓
+tx_done / frame_done
+   ↓
+恢复下一帧接收
 ```
-frame_ready
-        |
-        v
-业务模块读取 Payload
-        |
-        v
-frame_done
-```
 
-Frame Parser 收到 `frame_done` 后释放当前帧缓存，继续等待下一帧。
+Frame Parser 不在当前响应发送完成前接收下一条业务请求。
 
 ---
 
-# 8. 超时机制：
-- 接收超时：帧接收过程中数据中断
-- 处理超时：frame_valid 后未收到 frame_done
-超时后：
-- 清理状态机
-- 释放缓存
-- 返回等待 SOF 状态
+# 8. 超时机制
+
+至少考虑：
+
+- 接收超时：帧接收过程中数据中断；
+- 事务超时：`frame_valid` 后长期未收到 `frame_done`。
+
+超时后清理当前状态并返回等待 SOF 状态，具体超时参数由实现确定。
+
+---
 
 # 9. 设计原则总结
 
-1. Frame Parser 只负责通信可靠性，不负责业务。
-2. Payload 使用 RAM 缓存，业务模块统一读取。
+1. Frame Parser 只负责可靠收帧，不负责业务。
+2. Payload 使用内部 RAM 缓存，业务模块统一读取。
 3. CRC 边接收边计算，避免二次扫描数据。
-4. CRC 校验通过后才产生有效帧。
+4. CRC 校验通过后才产生 `frame_valid`。
 5. CMD、SEQ、LENGTH 作为帧元信息输出。
-6. 配置、升级等业务逻辑由后级模块处理。
+6. 当前响应完整发送后才释放当前帧并恢复接收。
