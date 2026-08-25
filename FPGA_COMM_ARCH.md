@@ -32,6 +32,8 @@ CMD Dispatcher
    +--> 配置模块
    +--> 在线升级模块
    +--> 其他业务模块
+   |
+   +--> Error Response Generator
               |
               v
        Response Buffer
@@ -62,13 +64,15 @@ TX Frame Builder --tx_done--> Frame Parser
 - ADDR、CMD、SEQ、LENGTH 字段解析；
 - PAYLOAD 接收并写入内部 Payload RAM；
 - CRC 流式计算与校验；
-- 长度检查和接收异常处理。
+- 长度检查和接收异常处理；
+- 保存当前合法请求元信息直到当前事务结束。
 
 约束：
 
 - 不解析业务含义；
 - 不处理具体 CMD；
-- CRC 校验通过后才提交给业务模块；
+- CRC 校验通过后才提交给后级；
+- SOF、接收超时、非法长度、CRC 错误等不可信帧直接丢弃，不生成错误响应；
 - 当前响应完成前，不接受下一条业务请求。
 
 详细约束见 `FRAME_PARSER.md`。
@@ -81,12 +85,14 @@ TX Frame Builder --tx_done--> Frame Parser
 
 - 根据 CMD 将请求分发到对应业务模块；
 - 输出当前 `active_module`；
-- 统一管理 Payload RAM 读地址路由。
+- 统一管理 Payload RAM 读地址路由；
+- 对未知或未分配 CMD 产生错误请求。
 
 约束：
 
 - 只负责请求路由，不执行具体业务逻辑；
-- 不负责响应发送和当前事务结束控制。
+- 不直接生成正常或错误通信帧；
+- 不负责当前事务结束控制。
 
 详细约束见 `CMD_DISPATCHER.md`。
 
@@ -94,7 +100,9 @@ TX Frame Builder --tx_done--> Frame Parser
 
 ## 5. 业务模块
 
-业务模块负责具体 CMD 的业务处理，并通过统一响应接口生成响应 Payload。
+业务模块负责具体 CMD 的业务处理，并通过统一响应接口生成正常响应 Payload。
+
+业务模块发现参数、状态、流程等业务错误时，进入统一错误响应机制，不自行生成完整错误帧。
 
 主要业务类别包括：
 
@@ -105,11 +113,21 @@ TX Frame Builder --tx_done--> Frame Parser
 - 批量读取；
 - 后续扩展模块。
 
-业务模块不直接生成 UART 通信帧。
+---
+
+## 6. Error Response Generator
+
+Error Response Generator 只处理“请求帧合法，但请求无法执行”的情况，例如未知 CMD、参数非法、设备状态错误等。
+
+它使用与普通业务模块一致的响应接口生成错误 Payload，并通过正常发送链路发送。
+
+不可信接收帧不进入 Error Response Generator。
+
+详细约束见 `ERROR_RESPONSE.md`。
 
 ---
 
-## 6. 配置和大数据处理原则
+## 7. 配置和大数据处理原则
 
 配置数据和固件数据采用分包传输。
 
@@ -117,12 +135,13 @@ TX Frame Builder --tx_done--> Frame Parser
 
 ---
 
-## 7. Response Buffer
+## 8. Response Buffer
 
 Response Buffer 仅负责：
 
-- 根据 `active_module` 选择当前业务模块的响应接口；
-- 将选中的 `rsp_wr_*`、`rsp_length`、`rsp_valid` 统一路由到 `TX Frame Builder`。
+- 根据 `active_module` 选择当前业务模块的正常响应接口；
+- 在错误响应有效时选择 Error Response Generator；
+- 将最终选中的 `rsp_wr_*`、`rsp_length`、`rsp_valid` 统一路由到 `TX Frame Builder`。
 
 Response Buffer 不包含 Response RAM，不解析业务，不生成帧格式，也不等待发送完成。
 
@@ -130,17 +149,17 @@ Response Buffer 不包含 Response RAM，不解析业务，不生成帧格式，
 
 ---
 
-## 8. TX Frame Builder
+## 9. TX Frame Builder
 
-TX Frame Builder 内部包含 Response RAM，并负责统一生成完整响应帧：
+TX Frame Builder 内部包含 Response RAM，并负责统一生成完整响应帧。
 
-- SOF；
-- ADDR；
-- CMD；
-- SEQ；
-- LENGTH；
-- PAYLOAD；
-- CRC。
+正常响应和错误响应均沿用当前请求的：
+
+```text
+ADDR
+CMD
+SEQ
+```
 
 发送过程中按实际发送字节流式累计 CRC，通过 `tx_byte` / `tx_valid` / `tx_ready` 与 UART TX 逐字节握手。
 
@@ -150,26 +169,25 @@ TX Frame Builder 内部包含 Response RAM，并负责统一生成完整响应�
 
 ---
 
-## 9. 待确认事项
+## 10. 待确认事项
 
-发送链路仍需统一确定：
+当前仍需后续统一确定：
 
-- 非法 CMD、业务错误等异常响应的产生位置和统一格式；
-- 响应 CMD、STATUS、ADDR 的具体规则；
-- CRC 的完整算法参数。
-
-这些规则确定后应优先固化在 `COMMUNICATION_PROTOCOL.md` 或对应模块约束文档中。
+- 错误码具体编号及是否需要附加错误信息；
+- CRC 的具体算法参数。
 
 ---
 
-## 10. 设计原则总结
+## 11. 设计原则总结
 
 1. 通信层与业务层分离。
 2. Frame Parser 内部保存接收 Payload RAM，并负责可靠收帧。
-3. CMD Dispatcher 只负责请求路由。
-4. 业务模块只负责具体业务和响应 Payload。
-5. Response Buffer 只负责响应接口 MUX。
-6. TX Frame Builder 内部保存 Response RAM，并统一生成和发送通信帧。
-7. 当前响应完成后才允许处理下一条请求。
-8. 大数据采用分块传输，关键配置完整校验后再生效。
-9. 新功能优先通过增加 CMD 和业务模块实现，不修改基础通信框架。
+3. 不可信接收帧直接丢弃，不返回错误响应。
+4. CMD Dispatcher 只负责请求路由，未知 CMD 进入统一错误响应机制。
+5. 业务模块只负责具体业务和正常响应 Payload。
+6. Error Response Generator 统一生成业务级错误响应 Payload。
+7. Response Buffer 只负责响应接口 MUX。
+8. TX Frame Builder 内部保存 Response RAM，并统一生成和发送正常/错误通信帧。
+9. 响应 ADDR、CMD、SEQ 均沿用当前请求。
+10. 当前响应完成后才允许处理下一条请求。
+11. 新功能优先通过增加 CMD 和业务模块实现，不修改基础通信框架。
