@@ -62,7 +62,11 @@ payload_rd_data
 
 CMD Dispatcher 仅对被选中的模块产生独立 `req_valid`。
 
-业务模块只有在自身 `req_valid` 有效时才允许处理当前请求。
+`req_valid` 为单周期脉冲。
+
+只有当前被选中的业务模块收到 `req_valid` 后，才允许开始处理当前请求。
+
+Dispatcher 不保持 `req_valid` 状态。
 
 `active_module` 表示当前请求所属业务模块，并提供给后续 Response Buffer 作为响应接口选择依据。
 
@@ -101,7 +105,19 @@ error_code
 
 ---
 
-## 7. 与响应链路的关系
+## 7. Transaction Abort
+
+收到 Frame Parser 的 abort 通知后：
+
+- 清除 `active_module`；
+- 释放当前请求状态；
+- 不产生响应。
+
+系统等待下一次合法 `frame_valid`。
+
+---
+
+## 8. 与响应链路的关系
 
 正常业务模块完成处理后，通过统一响应接口向 Response Buffer 提交响应。
 
@@ -111,7 +127,7 @@ CMD Dispatcher 不汇聚业务响应数据，不产生发送控制信号，也�
 
 ---
 
-## 8. 扩展原则
+## 9. 扩展原则
 
 新增业务模块时：
 
@@ -126,7 +142,7 @@ CMD Dispatcher 不汇聚业务响应数据，不产生发送控制信号，也�
 
 ---
 
-## 9. 设计原则总结
+## 10. 设计原则总结
 
 1. Dispatcher 只负责请求路由和 Payload 读接口选择。
 2. CMD 分类与业务模块一一对应，模块内部自行解析具体 CMD。
@@ -135,3 +151,5 @@ CMD Dispatcher 不汇聚业务响应数据，不产生发送控制信号，也�
 5. `active_module` 作为请求与响应两侧统一的业务模块选择依据。
 6. 未知 CMD 进入统一错误响应机制。
 7. Dispatcher 不负责响应发送和当前事务结束控制。
+8. `req_valid` 采用单周期脉冲，仅表示请求提交事件。
+9. abort 后清除当前事务状态，不生成响应。
