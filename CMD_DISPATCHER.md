@@ -8,11 +8,10 @@ CMD Dispatcher 位于 `Frame Parser` 与业务模块之间。
 
 - 接收 `Frame Parser` 提交的合法完整帧；
 - 根据 `CMD` 选择对应业务模块；
-- 管理当前请求从分发到处理完成的生命周期；
-- 统一管理 Payload RAM 读接口和业务完成返回；
-- 业务处理结束后向 `Frame Parser` 返回 `frame_done`。
+- 输出并保持当前 `active_module`；
+- 统一管理 Payload RAM 读地址路由。
 
-CMD Dispatcher 不解析 Payload 的业务含义，不执行具体业务逻辑。
+CMD Dispatcher 不解析 Payload 的业务含义，不执行具体业务逻辑，也不负责响应发送和 `frame_done`。
 
 ---
 
@@ -60,6 +59,8 @@ CMD Dispatcher 仅对被选中的模块产生独立 `req_valid`。
 
 业务模块只有在自身 `req_valid` 有效时才允许处理当前请求。
 
+`active_module` 表示当前请求所属业务模块，并提供给后续 Response Buffer 作为响应写接口选择依据。
+
 ---
 
 ## 5. Payload RAM 访问
@@ -72,7 +73,7 @@ Payload RAM 保持在 `Frame Parser` 内部。
 payload_rd_addr
 ```
 
-CMD Dispatcher 根据当前选中的业务模块进行地址 MUX，统一连接到 `Frame Parser` 的 `payload_rd_addr`。
+CMD Dispatcher 根据 `active_module` 对地址进行 MUX，统一连接到 `Frame Parser` 的 `payload_rd_addr`。
 
 `payload_rd_data` 可广播给所有业务模块。
 
@@ -80,23 +81,13 @@ CMD Dispatcher 根据当前选中的业务模块进行地址 MUX，统一连接�
 
 ---
 
-## 6. 业务完成接口
+## 6. 与响应链路的关系
 
-每个业务模块提供独立的完成信号：
+业务模块完成处理后，通过统一响应接口向 Response Buffer 写入响应数据并提交 `rsp_valid`。
 
-```text
-req_done
-```
+CMD Dispatcher 不汇聚业务响应数据，不产生发送控制信号，也不等待发送完成。
 
-CMD Dispatcher 仅采纳当前被选中模块的 `req_done`。
-
-业务处理完成后，由 CMD Dispatcher 产生：
-
-```text
-frame_done
-```
-
-通知 `Frame Parser` 释放当前帧及 Payload RAM。
+当前问答事务由发送链路的 `tx_done` 结束，`Frame Parser` 在此后恢复下一帧接收。
 
 ---
 
@@ -104,10 +95,11 @@ frame_done
 
 新增业务模块时：
 
-- 保持统一请求/完成接口规范；
-- 新增对应 `req_valid`、`payload_rd_addr`、`req_done` 接入；
+- 保持统一请求接口规范；
+- 新增对应 `req_valid`、`payload_rd_addr` 接入；
 - 在 CMD 分类中增加对应路由；
-- 扩展 Payload 地址 MUX 和后续响应 MUX；
+- 扩展 Payload 地址 MUX；
+- 将同一个 `active_module` 用于后续响应接口选择；
 - 不修改 `Frame Parser` 基础接口和帧格式。
 
 当业务模块数量较少时保持当前轻量接口，不引入 AXI、Wishbone 等通用总线。
@@ -116,10 +108,10 @@ frame_done
 
 ## 8. 设计原则总结
 
-1. Dispatcher 只负责路由和请求生命周期管理。
+1. Dispatcher 只负责请求路由和 Payload 读接口选择。
 2. CMD 分类与业务模块一一对应，模块内部自行解析具体 CMD。
 3. 公共请求信息广播，使用独立 `req_valid` 选通业务模块。
 4. Payload RAM 通过 MUX 供当前业务模块读取。
-5. 同一时刻只允许一个业务模块处理请求。
-6. 业务模块完成后统一由 Dispatcher 释放当前接收帧。
+5. `active_module` 作为请求与响应两侧统一的业务模块选择依据。
+6. Dispatcher 不负责响应发送和当前事务结束控制。
 7. 新增业务模块不应影响基础通信协议和 Frame Parser。
