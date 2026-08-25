@@ -22,6 +22,7 @@ UART RX
    |
    v
 Frame Parser
+ [Payload RAM]
    |
    v
 CMD Dispatcher
@@ -34,16 +35,19 @@ CMD Dispatcher
               |
               v
        Response Buffer
+       [response MUX]
               |
               v
        TX Frame Builder
+       [Response RAM]
               |
+       tx_byte / tx_valid
               v
            UART TX
-              |
-           tx_done
-              |
-              +--------> Frame Parser
+              ^
+           tx_ready
+
+TX Frame Builder --tx_done--> Frame Parser
 ```
 
 当前通信采用严格单事务、一问一答模式：主机发送一个请求，等待完整响应后再发送下一请求。
@@ -56,8 +60,8 @@ CMD Dispatcher
 
 - SOF 检测；
 - ADDR、CMD、SEQ、LENGTH 字段解析；
-- PAYLOAD 接收并写入内部 RAM；
-- CRC 计算与校验；
+- PAYLOAD 接收并写入内部 Payload RAM；
+- CRC 流式计算与校验；
 - 长度检查和接收异常处理。
 
 约束：
@@ -65,7 +69,7 @@ CMD Dispatcher
 - 不解析业务含义；
 - 不处理具体 CMD；
 - CRC 校验通过后才提交给业务模块；
-- 当前响应完整发送前，不接受下一条业务请求。
+- 当前响应完成前，不接受下一条业务请求。
 
 详细约束见 `FRAME_PARSER.md`。
 
@@ -115,14 +119,12 @@ CMD Dispatcher
 
 ## 7. Response Buffer
 
-Response Buffer 负责：
+Response Buffer 仅负责：
 
-- 提供所有业务模块共用的 Response RAM；
-- 根据 `active_module` 选择当前业务模块的响应写接口；
-- 在业务模块提交 `rsp_valid` 后启动一次响应发送；
-- 向 `TX Frame Builder` 提供响应 Payload 数据。
+- 根据 `active_module` 选择当前业务模块的响应接口；
+- 将选中的 `rsp_wr_*`、`rsp_length`、`rsp_valid` 统一路由到 `TX Frame Builder`。
 
-Response Buffer 不解析业务，不生成帧格式，也不等待发送完成。
+Response Buffer 不包含 Response RAM，不解析业务，不生成帧格式，也不等待发送完成。
 
 详细约束见 `RESPONSE_BUFFER.md`。
 
@@ -130,7 +132,7 @@ Response Buffer 不解析业务，不生成帧格式，也不等待发送完成�
 
 ## 8. TX Frame Builder
 
-TX Frame Builder 根据当前响应信息统一生成完整发送帧，包括：
+TX Frame Builder 内部包含 Response RAM，并负责统一生成完整响应帧：
 
 - SOF；
 - ADDR；
@@ -140,20 +142,34 @@ TX Frame Builder 根据当前响应信息统一生成完整发送帧，包括：
 - PAYLOAD；
 - CRC。
 
-发送完整响应后产生 `tx_done`。
+发送过程中按实际发送字节流式累计 CRC，通过 `tx_byte` / `tx_valid` / `tx_ready` 与 UART TX 逐字节握手。
 
-`tx_done` 用于结束当前问答事务，并通知 `Frame Parser` 释放当前请求、恢复下一帧接收。
+最后一个 CRC 字节被 UART TX 接收后产生 `tx_done`。`tx_done` 用于结束当前问答事务，并通知 `Frame Parser` 恢复下一帧接收。
+
+详细约束见 `TX_FRAME_BUILDER.md`。
 
 ---
 
-## 9. 设计原则总结
+## 9. 待确认事项
+
+发送链路仍需统一确定：
+
+- 非法 CMD、业务错误等异常响应的产生位置和统一格式；
+- 响应 CMD、STATUS、ADDR 的具体规则；
+- CRC 的完整算法参数。
+
+这些规则确定后应优先固化在 `COMMUNICATION_PROTOCOL.md` 或对应模块约束文档中。
+
+---
+
+## 10. 设计原则总结
 
 1. 通信层与业务层分离。
-2. Frame Parser 只负责可靠收帧。
+2. Frame Parser 内部保存接收 Payload RAM，并负责可靠收帧。
 3. CMD Dispatcher 只负责请求路由。
 4. 业务模块只负责具体业务和响应 Payload。
-5. Response Buffer 统一缓存和提交响应。
-6. TX Frame Builder 统一生成通信帧。
-7. 当前响应发送完成后才允许处理下一条请求。
+5. Response Buffer 只负责响应接口 MUX。
+6. TX Frame Builder 内部保存 Response RAM，并统一生成和发送通信帧。
+7. 当前响应完成后才允许处理下一条请求。
 8. 大数据采用分块传输，关键配置完整校验后再生效。
 9. 新功能优先通过增加 CMD 和业务模块实现，不修改基础通信框架。
