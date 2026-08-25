@@ -96,7 +96,25 @@ UART TX
 
 ADDR、CMD、SEQ 由当前请求上下文提供并保持到当前事务结束，业务模块和 Error Response Generator 不自行修改这些字段。
 
-错误类型通过响应 Payload 中的错误码表达。
+错误响应 Payload 第一字节固定为 STATUS。
+
+格式：
+
+```text
++--------+----------------+
+| STATUS | ERROR_INFO     |
++--------+----------------+
+```
+
+STATUS 非 0 表示错误。
+
+后续 ERROR_INFO 可用于提供：
+
+- error code
+- 参数索引
+- 附加诊断信息
+
+具体错误码后续统一定义。
 
 ---
 
@@ -123,6 +141,6 @@ Error Response Generator 作为 Response Buffer 的一个特殊响应源接入�
 后续仍需统一确定：
 
 - 错误码具体编号及含义；
-- 错误 Payload 是否需要除错误码之外的附加信息。
+- 错误 Payload 是否需要除 STATUS 之外的附加信息。
 
 CRC 的具体算法参数暂不在本模块中规定。
