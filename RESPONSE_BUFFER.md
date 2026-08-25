@@ -22,8 +22,8 @@ Response Buffer 不解析业务含义，不缓存 Payload，不生成帧格式�
 ```text
 PARAM rsp_*  ----\
 CTRL rsp_*   -----\
-CONFIG rsp_* ------\
-FW rsp_*     -------+--> Response Buffer ----> TX Frame Builder
+CONFIG rsp_* ------+--> Response Buffer ----> TX Frame Builder
+FW rsp_*     -------/
 其他模块     ------/
 ERROR rsp_*  -----/
 
@@ -55,11 +55,39 @@ rsp_valid
 - 响应源先完成 Payload 写入，再产生 `rsp_valid`；
 - `rsp_valid` 表示当前响应已准备完成，可以由 `TX Frame Builder` 开始发送。
 
+`rsp_valid` 为单周期脉冲。
+
+响应模块完成 Payload RAM 写入后，产生一次 `rsp_valid`，通知 TX Frame Builder 可以开始发送。
+
 严格单事务模式下，不考虑多个响应源同时有效的情况。
 
 ---
 
-## 4. 与其他模块的边界
+## 4. Response Payload Format
+
+所有响应 Payload 统一格式：
+
+```text
++--------+----------------+
+| STATUS | DATA           |
++--------+----------------+
+```
+
+STATUS 定义：
+
+```text
+0x00 : SUCCESS
+非0  : 表示错误状态
+```
+
+因此正常响应和错误响应：
+
+- LENGTH 均至少为 1 Byte；
+- 第一个 Payload 字节固定为 STATUS。
+
+---
+
+## 5. 与其他模块的边界
 
 `CMD Dispatcher` 提供 `active_module` 用于正常业务响应选择。
 
@@ -71,7 +99,7 @@ Response RAM 位于 `TX Frame Builder` 内部，Response Buffer 不持有任何�
 
 ---
 
-## 5. 扩展原则
+## 6. 扩展原则
 
 新增业务模块时：
 
@@ -82,10 +110,12 @@ Response RAM 位于 `TX Frame Builder` 内部，Response Buffer 不持有任何�
 
 ---
 
-## 6. 设计原则总结
+## 7. 设计原则总结
 
 1. Response Buffer 只负责响应接口 MUX。
 2. Response Buffer 不包含 Response RAM。
 3. 正常业务和错误响应使用相同响应接口。
 4. `active_module` 用于正常响应选择，错误响应作为特殊响应源接入。
 5. Response RAM、帧生成和发送握手均由 `TX Frame Builder` 负责。
+6. `rsp_valid` 采用单周期脉冲，仅表示响应准备完成事件。
+7. 所有响应 Payload 第一个字节固定为 STATUS。
