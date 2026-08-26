@@ -113,6 +113,8 @@ TX Frame Builder --tx_done--> Frame Parser
 - 批量读取；
 - 后续扩展模块。
 
+具体 CMD 和 Payload 定义见 `CMD_DEFINITION.md`。
+
 ---
 
 ## 6. Error Response Generator
@@ -127,28 +129,7 @@ Error Response Generator 只处理“请求帧合法，但请求无法执行”�
 
 ---
 
-## 7. 配置和大数据处理原则
-
-配置数据和固件数据均允许采用分包传输。
-
-当前 I2C 大块配置采用简单的“数据写入 + 启动执行 + 状态查询”模型：
-
-- `CONFIG_DATA` 根据 BUS 和 OFFSET，将 DATA 写入对应 I2C 配置模块内部 RAM；
-- DATA 的内部格式不由通信协议解析，通信配置应用模块只负责数据搬运；
-- `CONFIG_START` 携带 BUS、I2C 地址、配置长度、是否存 Flash、配置模式等执行参数，触发对应 I2C 配置模块开始工作；
-- I2C 配置模块从自身 RAM 中读取并解析配置数据，完成实际 I2C 操作；
-- `CONFIG_STATUS` 用于回读配置过程和配置结果；
-- 当前不额外引入 `CONFIG_BEGIN`、`CONFIG_VERIFY`、`CONFIG_COMMIT`、`CONFIG_ABORT` 等配置传输状态，只有出现明确需求时再扩展。
-
-通信层只负责可靠收帧和业务路由。配置数据在通信帧 CRC 校验通过后才交给配置应用模块处理。
-
-配置数据内部组织、I2C 操作流程和复杂业务判断尽可能放在对应业务模块或上位机，不增加通信协议层复杂度。
-
-具体 CMD 和 Payload 定义见 `CMD_DEFINITION.md`。
-
----
-
-## 8. Response Buffer
+## 7. Response Buffer
 
 Response Buffer 仅负责：
 
@@ -162,7 +143,7 @@ Response Buffer 不包含 Response RAM，不解析业务，不生成帧格式，
 
 ---
 
-## 9. TX Frame Builder
+## 8. TX Frame Builder
 
 TX Frame Builder 内部包含 Response RAM，并负责统一生成完整响应帧。
 
@@ -182,7 +163,7 @@ SEQ
 
 ---
 
-## 10. 接口时序约束
+## 9. 接口时序约束
 
 通信模块内部所有 valid 信号均采用单周期脉冲形式：
 
@@ -212,7 +193,7 @@ active_module
 
 ---
 
-## 11. 事务超时恢复
+## 10. 事务超时恢复
 
 Frame Parser 提供事务超时检测。
 
@@ -234,7 +215,7 @@ Frame Parser 产生 timeout/abort 通知。
 
 ---
 
-## 12. 待确认事项
+## 11. 待确认事项
 
 当前仍需后续统一确定：
 
@@ -243,7 +224,7 @@ Frame Parser 产生 timeout/abort 通知。
 
 ---
 
-## 13. 设计原则总结
+## 12. 设计原则总结
 
 1. 通信层与业务层分离。
 2. Frame Parser 内部保存接收 Payload RAM，并负责可靠收帧。
