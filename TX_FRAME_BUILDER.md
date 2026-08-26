@@ -13,6 +13,7 @@ TX Frame Builder 位于 `Response Buffer` 与 UART TX 模块之间，负责缓�
 - 发送过程中同步累计 CRC，不对 Payload 进行二次扫描；
 - 通过 `tx_byte` / `tx_valid` / `tx_ready` 与 UART TX 模块逐字节握手；
 - 最后一个 CRC 字节成功提交给 UART TX 后产生 `tx_done`。
+- 负责 485 方向切换，发送前将方向设置为发送，等待必要的时间后开始发送，结束后等待所有 bit 全部发完，在 delay 一段时间后将方向设置为接收。
 
 TX Frame Builder 不解析具体业务含义，也不区分正常响应和错误响应。
 
