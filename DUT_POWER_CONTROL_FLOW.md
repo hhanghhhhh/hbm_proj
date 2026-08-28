@@ -1,6 +1,6 @@
 # 多板卡 DUT 电源控制整体流程说明
 
-> 本文用于说明整个多板卡电源控制系统如何工作，重点解释三根硬件线分别做什么，以及正常上电、正常下电、故障关断时各模块之间如何配合。
+> 本文用于说明整个多板卡电源控制系统如何工作，重点解释各硬件通道分别做什么，以及正常上电、正常下电、故障关断时各模块之间如何配合。
 >
 > 具体协议参数和 RTL 约束以 `DUT_POWER_CONTROL.md` 为准。
 
@@ -13,7 +13,7 @@
 1. 正常上电/下电时，20 块板卡要在同一个时间起点执行各自的 EN 时序；
 2. 任意一路电源故障时，要把该 DUT 分散在所有板卡上的电源都关掉，但不能影响其他 DUT。
 
-PC 通过 RS485 管理整个系统，但 PC 不能承担实时故障保护，因此实时同步和故障传播都由 FPGA 之间完成。
+PC 通过主 RS485 管理整个系统，但 PC 不承担实时故障保护，因此实时同步和故障传播由 FPGA 之间完成。
 
 ---
 
@@ -22,7 +22,7 @@ PC 通过 RS485 管理整个系统，但 PC 不能承担实时故障保护，因
 ```text
                           PC Master
                              |
-                             | RS485
+                             | 主 RS485
                              | 配置 / 查询 / READY / 故障清除
                              v
         +--------------------+--------------------+
@@ -31,20 +31,23 @@ PC 通过 RS485 管理整个系统，但 PC 不能承担实时故障保护，因
         |                    |                    |
         |<-------------- START_SYNC ------------>|
         |<-------------- FAULT_REQ ------------->|
-        |<-------------- FAULT_IO -------------->|
+        |<=========== FAULT_A / FAULT_B =========>|
+        |            专用差分 Fault Bus           |
         |                    |                    |
      128 x EN             128 x EN             128 x EN
 ```
 
-三根硬件线分工非常明确：
+板间实时控制使用三类硬件通道：
 
 ```text
-START_SYNC : 正常全系统上/下电同步
-FAULT_REQ  : 故障总线仲裁 + BUSY
-FAULT_IO   : 故障数据 + ACK
+START_SYNC      : 正常全系统上/下电同步
+FAULT_REQ       : 故障仲裁 + BUSY
+FAULT_A/B       : RS485 差分故障数据 + ACK
 ```
 
-RS485 不承担实时同步和实时故障传播。
+其中 `FAULT_A/B` 是一对差分线，因此物理上占两根导线。
+
+主 RS485 不承担实时同步和实时故障传播。
 
 ---
 
@@ -61,7 +64,7 @@ ON_SEQUENCE
 OFF_SEQUENCE
 ```
 
-它描述的是本板 128 路 EN 的正常动作顺序，不按 DUT 划分。
+它描述本板 128 路 EN 的正常动作顺序，不按 DUT 划分。
 
 例如：
 
@@ -96,13 +99,13 @@ Board11 DUT3_MASK = 本板属于 DUT3 的 EN
 
 每块板只需要知道自己的 mask，不需要知道其他板卡的具体接线。
 
-这个 mask 不用于正常上电顺序，主要用于 DUT 故障时的快速关断。
+该 mask 不参与正常上电顺序，只用于 DUT 故障时的快速关断和故障锁定。
 
 ---
 
 ## 4. START_SYNC 是干什么的
 
-`START_SYNC` 是一个持续电平信号：
+`START_SYNC` 是一个持续电平信号，由 Board0 作为唯一驱动节点，其余板卡只作为输入。
 
 ```text
 Low  = 系统正常目标为全部下电
@@ -121,12 +124,12 @@ High -> Low : 所有板卡启动 OFF_SEQUENCE
 1. 电平表示系统当前正常目标状态；
 2. 边沿提供所有板卡共同的 `T=0`。
 
-### 正常上电时序
+### 正常上电
 
 ```text
 PC
  |
- | RS485 下发各板 ON_SEQUENCE / OFF_SEQUENCE
+ | 主 RS485 下发各板 ON_SEQUENCE / OFF_SEQUENCE
  v
 20 块板保存配置
  |
@@ -134,9 +137,8 @@ PC
  v
 所有板 READY
  |
- | 指定控制节点
  v
-START_SYNC : Low -> High
+Board0: START_SYNC Low -> High
  |
  +----------+----------+----------+
  v          v          v          v
@@ -145,12 +147,10 @@ ON_SEQ    ON_SEQ                ON_SEQ
 T=0       T=0                   T=0
 ```
 
-PC 不需要按照实时顺序一块一块控制 EN，只需要提前把 sequence 配好。
-
-### 正常下电时序
+### 正常下电
 
 ```text
-START_SYNC : High -> Low
+Board0: START_SYNC High -> Low
  |
  +----------+----------+----------+
  v          v          v          v
@@ -159,37 +159,15 @@ OFF_SEQ   OFF_SEQ               OFF_SEQ
 T=0       T=0                   T=0
 ```
 
-正常下电仍然按照预配置的下电顺序执行。
+正常上/下电是整机动作，不按 DUT 单独启动。
 
 ---
 
-## 5. 为什么 START_SYNC 不区分 DUT
-
-当前系统的正常运行方式是所有 DUT 一起上电、一起下电。
-
-因此如果让 `START_SYNC` 携带 DUT 含义，反而会增加不必要的复杂度，而且只有一根线也无法表达多个 DUT 的独立启动状态。
-
-所以正常控制采用：
-
-```text
-整个系统一起 ON / OFF
-```
-
-而 DUT 维度只保留在故障保护中：
-
-```text
-某个 DUT fault -> 只 KILL 这个 DUT
-```
-
-两种控制逻辑互不混淆。
-
----
-
-## 6. DUT 故障时发生什么
+## 5. DUT 故障时发生什么
 
 假设 Board7 的某一路 EN 发生故障，并确定它属于 DUT3。
 
-第一步永远是本板立即关断，不等待任何通信：
+第一步永远是本板立即关断，不等待任何板间通信：
 
 ```text
 Board7 Local Fault
@@ -203,57 +181,112 @@ Board7 Local Fault
       +--> 记录 pending fault
 ```
 
-然后 Board7 才去竞争 Fault Bus，把 `KILL DUT3` 告诉其他板卡。
+然后 Board7 参与 Fault Bus 仲裁，把 `KILL DUT3` 发送给其他板卡。
+
+同一板卡如果同时存在多个 DUT fault，则分别记录 pending；一次 Fault Bus 事务只发送一个 DUT fault，结束后重新参与下一轮仲裁。
 
 ---
 
-## 7. FAULT_REQ 是干什么的
+## 6. FAULT_REQ 是干什么的
 
-`FAULT_REQ` 不传数据，它只表示 Fault Bus 是否被某个节点占用：
+`FAULT_REQ` 是一根低速共享开漏线，只负责：
+
+```text
+故障仲裁
++
+Fault Bus BUSY 指示
+```
+
+它不传输故障数据。
+
+定义：
 
 ```text
 High = Fault Bus 空闲
 Low  = 某块板已经获得 Fault Bus 所有权
 ```
 
-如果多个板同时发生故障，各板先按照 Board ID 对应的固定等待时隙竞争。
+因为 `FAULT_REQ` 只用于低速仲裁，所以即使 20 个节点并联后开漏释放上升沿较慢，也不要求达到 `FAULT_A/B` 的数据速率。
+
+仲裁时间独立于 Fault Bus 的 RS485 波特率。当前思路按固定时间窗口处理，例如：
+
+```text
+REQ_RELEASE_GUARD ≈ 20 us
+ARB_SLOT          ≈ 10 us
+```
+
+某板存在 pending fault 时：
 
 ```text
 FAULT_REQ = High
       |
-      +--> ARB_GUARD
+      +--> 等待 REQ_RELEASE_GUARD
       |
-      +--> Board0 竞争时刻
-      +--> Board1 竞争时刻
-      +--> ...
-      +--> Board19 竞争时刻
+      +--> 等待 BOARD_ID * ARB_SLOT
+      |
+      +--> 再次确认 FAULT_REQ 仍为 High
+      |
+      +--> 拉低 FAULT_REQ，获得 Fault Bus 所有权
 ```
 
-某块板到达自己的竞争时刻时，如果 `FAULT_REQ` 仍然是 High，就拉 Low，表示：
-
-```text
-“本次 Fault Bus 由我使用”
-```
-
-其他板一看到 `FAULT_REQ = Low`：
+其他等待中的板一旦检测到 `FAULT_REQ = Low`：
 
 ```text
 仲裁计数清零
-保留自己的 pending fault
+保留 pending fault
 等待当前事务结束
 ```
 
-当前事务结束后 `FAULT_REQ` 回到 High，仍有 pending fault 的板卡重新参与下一轮仲裁。
+当前事务结束后，发起方释放 `FAULT_REQ`。仍有 pending fault 的板卡在 `FAULT_REQ` 重新稳定为 High 后，从头参与下一轮仲裁。
 
-因此同一块板同时出现多个 DUT fault，也是一次发送一个，之后重新参加下一轮。
+因此开漏 `FAULT_REQ` 的关键不是上升沿必须很快，而是：
+
+```text
+各板对 High 的识别时间差
+必须明显小于 ARB_SLOT
+```
+
+通过足够的 release guard 和仲裁 slot 留出裕量。
 
 ---
 
-## 8. FAULT_IO 是干什么的
+## 7. FAULT_A/B 是干什么的
 
-取得 Fault Bus 所有权的板通过 `FAULT_IO` 发送一个固定长度故障帧。
+真正的故障数据不再使用单端开漏 `FAULT_IO`，而使用独立的一对 RS485 差分线：
 
-帧中包含：
+```text
+FAULT_A
+FAULT_B
+```
+
+20 块板各自配置一个 RS485 收发器。
+
+平时：
+
+```text
+所有节点 DE = 0
+所有节点监听总线
+```
+
+仲裁获胜节点：
+
+```text
+FAULT_REQ 拉 Low
+      |
+      +--> DE = 1
+      +--> 通过 FAULT_A/B 发送 Fault Frame
+```
+
+其他节点始终保持：
+
+```text
+DE = 0
+只接收
+```
+
+这样高速数据部分由 RS485 差分收发器主动驱动，不再受到 20 节点开漏 RC 上升时间的限制。
+
+当前 Fault Frame 仍保持固定 7 Byte：
 
 ```text
 SOF
@@ -261,90 +294,208 @@ SOURCE_ID
 DUT_ID
 FAULT_CODE
 EVENT_ID
-CRC16
+CRC16_H
+CRC16_L
 ```
 
-例如：
+CRC 使用 CRC-16/MODBUS 计算，多字节字段按项目统一规则采用大端。
+
+当前讨论的 Fault Bus 速率为：
 
 ```text
-Board7 -> 全部板卡：
-DUT3 fault，请执行 DUT3 KILL
+400 kbit/s
 ```
 
-所有板卡一直监听 `FAULT_IO`。
+该速率后续可根据实际线路和收发器测试调整，不影响仲裁和协议结构。
 
-某块板收到完整合法帧以后：
+---
+
+## 8. 其他板收到 Fault Frame 后做什么
+
+例如收到：
 
 ```text
 DUT_ID = 3
-     |
-     +--> 查本板 DUT3_MASK
-     |
-     +--> 本板 DUT3 对应 EN 立即关闭
-     |
-     +--> 锁存 DUT3 fault inhibit
-     |
-     +--> 等待自己的 ACK slot
 ```
 
-如果本板 DUT3 mask 为 0，也要 ACK，表示自己正确收到并处理了这个事件。
+每块板立即：
+
+```text
+查 DUT3_MASK
+    |
+    +--> 关闭本板 DUT3 对应 EN
+    +--> 锁存 DUT3 fault inhibit
+    +--> 准备在自己的 ACK slot 回应
+```
+
+即使某块板：
+
+```text
+DUT3_MASK = 0
+```
+
+也必须正常 ACK，因为 ACK 表示：
+
+> 本板正确收到该故障事件并完成处理。
+
+故障关断不运行正常 `OFF_SEQUENCE`，而是直接按 DUT mask 紧急关闭。
 
 ---
 
 ## 9. ACK 是怎么工作的
 
-不能让 20 块板同时 ACK，否则线路上的响应无法区分是谁发的。
+ACK 仍采用固定 Board ID 时隙，不发送完整 UART ACK byte。
 
-因此每个 Board ID 有一个固定 ACK 时隙：
+原因是 ACK 只需要表达一个信息：
+
+```text
+“这个节点已经正确收到并处理”
+```
+
+Board ID 已经由 ACK 所在的时间位置隐式表示，因此没有必要再次发送地址或完整字节。
+
+故障帧发送完成后，发起方释放 RS485 驱动：
+
+```text
+DE_sender = 0
+```
+
+经过固定 Turnaround 后进入 20 个 ACK slot：
 
 ```text
 Fault Frame
     |
-    +--> Turnaround Gap
+    +--> Turnaround
     |
-    +--> ACK Board0
-    +--> ACK Board1
+    +--> ACK_SLOT[0]
+    +--> ACK_SLOT[1]
     +--> ...
-    +--> ACK Board19
+    +--> ACK_SLOT[19]
 ```
 
-每块板只在自己的时隙内把 `FAULT_IO` 拉 Low。
+当前 400 kbit/s 下：
 
-发送方最终得到：
+```text
+bit_time = 2.5 us
+ACK_SLOT = 4 bit_time = 10 us
+```
+
+每个 slot 暂按：
+
+```text
+1 bit guard
+2 bit ACK active
+1 bit guard
+```
+
+即：
+
+```text
+|<--------- 10 us --------->|
+
+| 2.5 us |  5 us   | 2.5 us |
+| guard  | ACK有效 | guard  |
+```
+
+轮到某块板 ACK 时：
+
+```text
+DE = 1
+DI = 固定 ACK 电平
+保持约 5 us
+DE = 0
+```
+
+其余时间所有节点必须：
+
+```text
+DE = 0
+```
+
+不能主动驱动 Idle，避免两个 RS485 Driver 因时序重叠互相对打。
+
+故障发起方在 ACK 阶段保持自己的 Driver 关闭、Receiver 开启，并在每个固定 slot 中间采样，最终形成：
 
 ```text
 ack_bitmap[19:0]
 ```
 
-如果全部收到：
+---
+
+## 10. ACK 失败和重试
+
+如果全部节点 ACK：
 
 ```text
 事务完成
-FAULT_REQ -> High
+FAULT_REQ 释放为 High
 ```
 
-如果某些板没 ACK：
+如果存在未 ACK 节点：
 
 ```text
-保持 FAULT_REQ = Low
-重新发送同一个 EVENT_ID
-再次等待 ACK
+FAULT_REQ 继续保持 Low
+      |
+      +--> 重发同一 EVENT_ID 的 Fault Frame
+      +--> 再次进入 20 个 ACK slot
 ```
 
-首次失败后最多重发 2 次。
+首次失败后允许有限次数重试。
 
-如果仍有节点失败：
+如果达到重试上限仍失败：
 
 ```text
 记录 missing ACK bitmap
-释放 FAULT_REQ
+      |
+      +--> 结束当前事务
+      +--> 释放 FAULT_REQ
 ```
 
-不能因为一个坏节点把整个 Fault Bus 永久堵死。
+不能因为一个异常节点永久占用 Fault Bus，否则后续其他 DUT fault 将无法传播。
 
 ---
 
-## 10. START_SYNC 和 Fault 谁优先
+## 11. 当前一次 Fault 事务的大概时间
+
+以当前讨论值估算：
+
+```text
+Fault Bus         = 400 kbit/s
+bit_time          = 2.5 us
+REQ_RELEASE_GUARD = 20 us
+ARB_SLOT          = 10 us
+ACK_SLOT          = 10 us
+```
+
+7 Byte UART 8N1 Fault Frame：
+
+```text
+7 * 10 bit * 2.5 us = 175 us
+```
+
+20 个 ACK slot：
+
+```text
+20 * 10 us = 200 us
+```
+
+最低优先级 Board19 的首次仲裁约：
+
+```text
+20 us + 19 * 10 us = 210 us
+```
+
+再加约 10 us Turnaround，一次最坏首次完整事务约：
+
+```text
+210 + 175 + 10 + 200 ≈ 595 us
+```
+
+因此第一轮正常完成仍有较大的 1 ms 内时间裕量；如果进入重试，可以允许总时间超过 1 ms，以可靠传播故障为优先。
+
+---
+
+## 12. START_SYNC 和 Fault 谁优先
 
 Fault 永远优先。
 
@@ -364,7 +515,7 @@ DUT3 fault inhibit = 1
 
 即使 `START_SYNC` 一直保持 High，也不能重新打开 DUT3。
 
-概念上可以理解为：
+概念上：
 
 ```text
 normal_sequence_en
@@ -376,7 +527,7 @@ normal_sequence_en
     actual EN
 ```
 
-因此可能出现正常且允许的系统状态：
+因此可能出现：
 
 ```text
 START_SYNC = High
@@ -393,7 +544,7 @@ DUT4 = ON
 
 ---
 
-## 11. FPGA 复位时如何处理
+## 13. FPGA 复位时如何处理
 
 如果系统已经上电：
 
@@ -403,9 +554,7 @@ START_SYNC = High
 
 某块板 FPGA 突然复位，复位后不能看到 High 就自行执行一次 ON_SEQUENCE。
 
-原因是其他板卡可能一直处于 ON 状态，如果单块板自行重新上电，就无法保证跨板时序关系。
-
-因此规定：
+规定：
 
 ```text
 FPGA Reset
@@ -416,16 +565,17 @@ FPGA Reset
     +--> 等待下一次新的 Low -> High 边沿
 ```
 
-也就是说这种异常需要重新执行一次全系统正常 power cycle 才恢复。
+这样避免单块板在其他板保持 ON 的情况下自行重新执行上电时序。
 
 ---
 
-## 12. 三根线最终可以这样理解
+## 14. 各硬件通道最终可以这样理解
 
 ### START_SYNC
 
 ```text
-正常控制线
+单主推挽正常控制线
+Board0 唯一输出，其余板输入
 
 Low  : 全系统正常下电目标
 High : 全系统正常上电目标
@@ -436,37 +586,44 @@ High : 全系统正常上电目标
 ### FAULT_REQ
 
 ```text
-Fault Bus 所有权 / BUSY 线
+低速共享开漏线
 
-High : 总线空闲，可以参与仲裁
-Low  : 已有节点正在处理 Fault transaction
+High : Fault Bus 空闲，可以参与仲裁
+Low  : 已有节点获得总线所有权
+
+只负责：
+仲裁 + BUSY
 ```
 
-### FAULT_IO
+### FAULT_A/B
 
 ```text
-Fault Bus 数据线
+专用 RS485 差分 Fault Bus
 
-发送 KILL DUT_ID 等故障信息
+发送：
+Fault Frame
 +
-事务结束后复用为 20 个固定时隙 ACK
+20 个固定 ACK 时隙
+
+任何时刻只有当前发送节点或当前 ACK 节点允许 DE=1
+其余节点全部 DE=0
 ```
 
 ---
 
-## 13. 一次完整工作过程
+## 15. 一次完整工作过程
 
 ### 系统启动
 
 ```text
 PC
  |
- +--> RS485 配置各板 ON/OFF sequence
- +--> RS485 配置各板 DUT mask
+ +--> 主 RS485 配置各板 ON/OFF sequence
+ +--> 主 RS485 配置各板 DUT mask
  +--> 逐板确认 READY
  |
  v
-START_SYNC Low -> High
+Board0: START_SYNC Low -> High
  |
  v
 20 块板同步执行各自 ON_SEQUENCE
@@ -479,48 +636,63 @@ START_SYNC Low -> High
  |
  v
 本板立即关闭该 DUT
+并锁存 fault inhibit
  |
  v
 记录 pending fault
  |
  v
-FAULT_REQ 仲裁
+通过开漏 FAULT_REQ 按 Board ID 仲裁
  |
  v
 获胜节点拉低 FAULT_REQ
  |
  v
-FAULT_IO 发送 DUT fault
+打开本节点 RS485 Driver
+通过 FAULT_A/B 发送 DUT fault
+ |
+ v
+发送完成后释放 Driver
  |
  +----------+----------+----------+
  v          v          v          v
 Board0    Board1      ...       Board19
-按本地 DUT mask 关闭该 DUT
+收到合法帧后按本地 DUT mask 关闭该 DUT
  |
  v
 20 个固定 ACK slot
+各板只在自己的时隙短暂打开 Driver 回 ACK
  |
  v
-全部 ACK 或完成重试
+发起方得到 ack_bitmap
+ |
+ +--> 全部 ACK：结束事务
+ |
+ +--> 缺 ACK：重发 / 重试
  |
  v
 FAULT_REQ 释放
+ |
+ v
+仍有 pending fault 的板卡重新参与下一轮仲裁
 ```
 
 ### 系统正常关闭
 
 ```text
-START_SYNC High -> Low
+Board0: START_SYNC High -> Low
  |
  v
 20 块板同步执行各自 OFF_SEQUENCE
 ```
 
-整个系统的核心思路就是：
+整个系统的核心思路是：
 
 ```text
 正常动作按“整机”同步
 故障动作按“DUT”隔离
+FAULT_REQ 只负责仲裁
+RS485 差分 Fault Bus 负责可靠高速传播
 PC 负责配置
 FPGA 负责实时执行
 ```
