@@ -1,22 +1,50 @@
 `timescale 1ns / 1ps
 
 /*
- * UART 请求帧解析模块。
+ * Module Contract
  *
- * 本模块按非重叠方式搜索 16'h55AA 帧头，依次接收
- * ADDR/CMD/SEQ/LENGTH/PAYLOAD，将 Payload 写入内部双口 RAM IP，并对
- * ADDR 至 PAYLOAD 的全部字节计算 CRC-16/MODBUS。帧中的 CRC 字段采用
- * 大端顺序。只有长度、CRC 和本机地址全部校验通过后，才产生单周期
- * o_frame_valid 脉冲，将完整请求提交给后级。
+ * 模块职责：
+ * - 将 UART 字节流解析为完整请求帧，校验 LENGTH、CRC 和本机地址后提交给后级。
+ * - Payload 在接收过程中写入内部双口 RAM；合法事务期间请求上下文和 Payload 保持可用。
+ * - 提供接收超时、长度错误、CRC 错误、地址错误和事务超时的单周期诊断脉冲。
+ * - 不负责：解释 CMD/Payload 业务含义、生成错误响应或发送响应帧。
  *
- * 合法请求提交后进入忙状态，此时忽略所有 UART 接收字节。请求上下文和
- * Payload RAM 内容保持到 i_frame_done 到达或事务超时。接收错误会直接
- * 丢弃当前帧，触发错误判定的字节不复用于下一次帧头搜索。各类接收错误
- * 和事务超时输出均为单周期诊断/中止脉冲。
+ * 输入事务：
+ * - 每个 i_rx_valid=1 的时钟周期接收一个 i_rx_byte；帧格式遵循 COMMUNICATION_PROTOCOL.md。
+ * - SOF 按非重叠 55 AA 匹配；第二字节不是 AA 时直接重新等待 55，错误字节不复用于新帧头。
+ * - LENGTH 为大端，允许 0..MAX_PAYLOAD_LENGTH；Payload 从地址 0 起连续写入 RAM。
+ * - CRC 从 ADDR 到 PAYLOAD 逐字节累计，不包含 SOF 和 CRC 字段；接收 CRC 高字节在前。
  *
- * UART 时序按 8N1 格式计算，字节间超时为 1.5 个字符时间，即 15 个波特
- * 位周期。RAM 读端口为同步读，o_payload_rd_data 相对 i_payload_rd_addr
- * 的延迟由 ip_ram_uart_rx 决定，工程约定为 1 个时钟周期。
+ * 输出事务：
+ * - 仅当 LENGTH 合法、CRC 正确且 ADDR==i_local_addr 时，产生 1clk 的 o_frame_valid。
+ * - o_frame_valid 提交后，o_addr/o_cmd/o_seq/o_payload_length 和 Payload RAM 保持当前事务有效，
+ *   直到 i_frame_done 到达或事务超时。
+ * - i_frame_done 正常结束事务并释放接收；若与事务超时条件同拍，i_frame_done 优先。
+ *
+ * 关键时序：
+ * - 从检测到首个 SOF 字节 55 后开始字节间超时监测；每个 i_rx_valid 重新计时。
+ * - 字节间超时为 8N1 下 1.5 个字符时间，即 15 个波特位周期。
+ * - 合法请求提交后的 busy 期间忽略所有 i_rx_valid，不接收或排队下一请求。
+ * - Payload RAM 读口为同步读；工程约定 o_payload_rd_data 相对 i_payload_rd_addr 延迟 1clk。
+ * - o_frame_valid 以及所有 *_error/*_timeout 输出均为 1clk pulse。
+ *
+ * 异常与恢复：
+ * - reset：i_rst_n 在 i_clk 上升沿同步采样；低电平时回到等待 SOF，清除事务上下文和事件输出。
+ * - rx timeout：未完成帧的字节间隔超限时丢弃当前帧，产生 o_rx_timeout，并重新等待 SOF。
+ * - length error：LENGTH>MAX_PAYLOAD_LENGTH 时立即丢弃，产生 o_length_error，不写后续 Payload。
+ * - CRC/地址错误：CRC 先判定；CRC 错只产生 o_crc_error，CRC 正确但地址不匹配才产生 o_addr_error；
+ *   两种情况均不产生 o_frame_valid。
+ * - transaction timeout：合法请求提交后长期未收到 i_frame_done 时，释放事务、清除上下文并产生
+ *   o_transaction_timeout；Payload RAM 内容不作为事务完成后的有效数据继续使用。
+ *
+ * 使用约束：
+ * - 当前架构只允许一个已提交事务在途；后级必须最终给出 i_frame_done，或依赖事务超时恢复。
+ * - i_local_addr 应在当前帧接收和最终地址判定期间保持稳定。
+ * - 接收错误只提供诊断脉冲，不代表存在可交给业务层处理的合法请求。
+ *
+ * 参考：
+ * - COMMUNICATION_PROTOCOL.md：帧格式、字段含义和协议级错误处理规则。
+ * - FPGA_COMM_ARCH.md：通信链路、模块边界和全局事务约束。
  */
 module frame_parser #(
     parameter integer CLK_FREQ_HZ           = 100000000,
