@@ -1,12 +1,35 @@
 /*
-Module Name : UART_RX_Direct
-Description : Ultra-High Precision Native-Clock UART Receiver
-Features    :
-    - Direct sys_clk counter (No 16x phase truncation error).
-    - Auto-scaling 3-point majority voting.
-    - Start bit glitch rejection.
-    - Stop bit framing error detection & Early Exit.
-*/
+ * Module Contract
+ *
+ * 模块职责：
+ * - 将异步 8N1 UART 串行输入转换为并行字节和接收事件。
+ * - 对每个串行位进行三点多数表决，并拒绝未形成有效起始位的下降沿毛刺。
+ * - 检查停止位并报告帧格式错误。
+ * - 不负责：缓存连续字节、协议组帧、校验 CRC 或恢复错误字节。
+ *
+ * 输入事务：
+ * - 同步后的 i_uart_rx 下降沿启动候选字节接收；起始位多数表决为 0 才继续。
+ * - 有效起始位后依次接收 8 个最低位优先数据位和 1 个停止位。
+ * - 接收期间不会识别或排队新的起始沿。
+ *
+ * 输出事务：
+ * - 停止位表决为 1 时更新 o_rx_data，并产生 1clk 的 o_rx_valid。
+ * - 停止位表决为 0 时产生 1clk 的 o_rx_err，不产生 o_rx_valid。
+ * - 起始位毛刺被静默丢弃，不产生 o_rx_valid 或 o_rx_err。
+ *
+ * 关键时序：
+ * - 输入先经过多级同步；每个位在中点附近三个时刻采样并多数表决。
+ * - 每个位周期为 BIT_CYCLES=SYS_CLK_FREQ/BAUD_RATE 个 i_sys_clk 周期。
+ * - 停止位完成表决后提前回到空闲，以便接收紧邻的下一起始位。
+ *
+ * 异常与恢复：
+ * - reset：异步低有效，回到空闲，清除数据与事件输出并将同步链置为高电平。
+ * - 帧错误后自动回到空闲；模块没有 abort 或超时接口。
+ *
+ * 使用约束：
+ * - SYS_CLK_FREQ/BAUD_RATE 必须满足三点采样位置有效且周期可由 16 位计数器表示。
+ * - i_uart_rx 必须为空闲高电平的 8N1 信号；参数整除余数不会进行分数补偿。
+ */
 
 module UART_RX_Direct #(
     parameter SYS_CLK_FREQ = 100_000_000, 

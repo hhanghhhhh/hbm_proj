@@ -1,41 +1,43 @@
 `timescale 1ns / 1ps
 
 /*
- * 响应帧缓存、组帧与 RS485 发送方向控制模块。
+ * Module Contract
  *
- * 内部例化 ip_ram_uart_tx（2048 x 8，B 口同步读延迟 1clk）和
- * crc16_modbus。A 口接 Response Buffer 的响应写接口；i_rsp_valid
- * 到达时锁存请求 ADDR/CMD/SEQ 及响应 LENGTH，然后依次发送：
- * 55 AA | ADDR | CMD | SEQ | LENGTH_H LENGTH_L | PAYLOAD | CRC_H CRC_L。
- * LENGTH 允许为 0。CRC-16/MODBUS 只累计实际握手的 ADDR 至 PAYLOAD，
- * SOF 和 CRC 字段不参与累计，CRC 字段采用大端顺序。
+ * 模块职责：
+ * - 缓存响应 Payload，组装完整协议响应帧，并控制逐字节 UART 握手和 RS485 方向。
+ * - 对 ADDR 至 PAYLOAD 的实际发送字节计算 CRC-16/MODBUS。
+ * - 不负责：产生业务响应、检查响应长度、缓存多个响应、重试或配置 UART 波特率。
  *
- * UART TX 保持外部例化，使用 o_tx_byte/o_tx_valid/i_tx_ready 握手。
- * valid 是保持到握手的有效电平，不是单周期事件；ready 为 0 时，
- * 当前字节及 valid 保持不变。i_tx_ready 必须使用 UART_TX_Direct
- * 的空闲指示：它在整个起始位、数据位和停止位期间均为 0，不能接成
- * 带 FIFO 的“可继续入队”信号。波特率由外部 UART 配置，工程默认
- * 为 460800；本模块用 ready 等待物理发送结束，不重复计算字节时间。
+ * 输入事务：
+ * - 上游先用 i_rsp_wr_en 将全部 Payload 写入内部 2048x8 RAM，再以 i_rsp_valid 提交。
+ * - 空闲时 i_rsp_valid=1 的上升沿锁存 i_req_addr/i_req_cmd/i_req_seq/i_rsp_length。
+ * - 发送期间不接收或排队新的响应提交；LENGTH 允许为 0。
  *
- * i_rsp_valid -> 切换发送方向 -> 前延时 -> 发送完整帧 -> 等待最后
- * 停止位完成 -> 后延时 -> 切回接收方向，同时产生单周期 o_tx_done。
- * o_rs485_tx_en 为 1 表示发送，为 0 表示接收，可由顶层连接 DE/RE。
- * o_tx_done 接 Parser 的 frame_done，不在最后 CRC 字节入 UART 时产生。
+ * 输出事务：
+ * - 帧顺序为 55 AA|ADDR|CMD|SEQ|LENGTH_H|LENGTH_L|PAYLOAD|CRC_H|CRC_L。
+ * - CRC 不含 SOF 和 CRC 字段；CRC 字段以高字节在前发送。
+ * - o_tx_valid 保持到与 i_tx_ready 握手；阻塞期间 o_tx_byte 保持当前字节。
+ * - 最后 CRC 字节的 UART 停止位完成并经过后延时后，释放方向并产生 1clk o_tx_done。
  *
- * i_abort 接 Parser 的事务超时。中止时撤销尚未握手的字节，不提交
- * 后续字节；已经被 UART 接收的当前字节允许完整发完，再经过后延时
- * 切回接收，不产生 o_tx_done。异步复位则立即回到接收状态。
+ * 关键时序：
+ * - 提交后先置 o_rs485_tx_en=1并等待 PRE_DELAY_CYCLES，之后才提交首字节。
+ * - Payload RAM B 口为同步读，地址更新后等待一拍再加载发送字节。
+ * - i_tx_ready 必须表示 UART 完全空闲；每次握手后需保持低直到该字节停止位结束。
+ * - 完整帧发送后等待 UART ready，再执行 POST_DELAY_CYCLES 并将 o_rs485_tx_en 清零。
  *
- * 系统严格单事务：先写完 Payload，再提交 rsp_valid；发送期间上游
- * 不再写 RAM 或提交新响应。本模块不增加队列、长度检查或重试逻辑。
- * 主机下一次发送应避开后延时及板级收发器释放时间，不能只依据收到
- * 最后一个响应字节便立即驱动总线。abort 后重试也遵循相同方向约束。
+ * 异常与恢复：
+ * - reset：异步低有效，立即撤销 valid、释放 RS485 方向并回到空闲。
+ * - abort：同拍屏蔽新 UART 握手，停止后续字节；已被 UART 接收的字节允许发送完。
+ * - 若 abort 时已进入发送方向，模块等待 UART 空闲及后延时后释放方向，不产生 o_tx_done。
  *
- * 前后延时默认各 10us，为型号未确定时的保守初值，需按实际器件调整。
- * 参考：MAX485 驱动使能最大 70ns；SN65HVD3085E 从关断使能最大 4.5us
- * （均为对应手册测试条件）。此默认值不是所有 RS485 收发器的保证。
- * https://www.analog.com/media/en/technical-documentation/data-sheets/MAX1487-MAX491.pdf
- * https://www.ti.com/lit/ds/symlink/sn65hvd3082e.pdf
+ * 使用约束：
+ * - 上层必须保证单事务、Payload 长度不超过 RAM 容量，且发送期间不写 RAM。
+ * - o_tx_done 才表示总线方向已释放；主机不能仅凭收到最后字节立即驱动总线。
+ * - 前后延时参数必须按实际 RS485 收发器使能/关断时间和板级约束设置。
+ *
+ * 参考：
+ * - COMMUNICATION_PROTOCOL.md：响应帧格式和 CRC 覆盖范围。
+ * - TX_FRAME_BUILDER.md：发送链路与 RS485 方向时序。
  */
 module tx_frame_builder #(
     parameter integer CLK_FREQ_HZ        = 100000000,

@@ -1,0 +1,332 @@
+`timescale 1ns / 1ps
+`include "cmd_dispatcher_defs.vh"
+
+/*
+ * Module Contract
+ *
+ * 模块职责：
+ * - 处理 128 通道遥测使能位图更新和按位图选择的遥测回读请求。
+ * - 访问外部遥测 RAM，并将所选通道数据写入响应 RAM 接口。
+ * - 不负责：采集或冻结遥测数据、保存外部 RAM、组帧或等待 UART 发送完成。
+ *
+ * 输入事务：
+ * - 空闲时 i_req_valid=1 开始事务；处理期间忽略新请求。
+ * - TELEMETRY_ENABLE 和 TELEMETRY_READ 均要求 LENGTH=16，Payload 为大端 128 位位图。
+ * - Payload 首字节对应 bit[127:120]，末字节对应 bit[7:0]；bit[n] 选择通道 n。
+ * - 未知命令或长度错误产生公共错误事件，不开始正常响应。
+ *
+ * 输出事务：
+ * - ENABLE 收齐全部位图后一次性更新 o_telemetry_enable，并返回 STATUS_SUCCESS。
+ * - READ 先返回 STATUS_SUCCESS，再按通道号 0..127 返回所有置位通道的数据。
+ * - 每通道返回 VOLTAGE(2)|CURRENT(2)|STATUS(2)，三个 16 位字段均为大端。
+ * - READ_MASK=0 时只返回 STATUS；全通道响应长度为 769 字节。
+ * - 正常响应写完后产生 1clk o_rsp_valid；错误产生 1clk o_error_valid。
+ *
+ * 关键时序：
+ * - 请求 Payload RAM 按 1clk 同步读延迟访问；o_rsp_wr_en 写接口无反压。
+ * - 每个遥测项以 1clk o_tel_rd_en 发起同步读，再等待一拍后采样 i_tel_rd_data。
+ * - 通道 n 映射为 BUS=n[6:4]、DEVICE_ID=n[3:1]、RAIL=n[0]。
+ * - 每项外部 RAM 数据只取低 16 位；最后一次响应写入被接收后才提交 o_rsp_valid。
+ *
+ * 异常与恢复：
+ * - reset：异步低有效，回到空闲并清除遥测使能位图和所有事件输出。
+ * - abort：取消当前位图解析或回读，不产生完成事件。
+ * - abort 不回滚已完整提交的使能位图，也不清除外部响应 RAM 已接收的数据。
+ *
+ * 使用约束：
+ * - 上层必须保证单事务，并保持请求 Payload 在处理期间有效。
+ * - 回读不会冻结后台采集，同一响应内不同通道或项目可能来自不同采样时刻。
+ * - i_req_seq 未被使用；响应 CMD/SEQ 由外部发送链路沿用当前请求。
+ *
+ * 参考：
+ * - CMD_DEFINITION.md：遥测命令、位图和响应字段定义。
+ * - DUT_POWER_CONTROL_FLOW.md：遥测采集与总线通道映射。
+ */
+module telemetry_application (
+    input  wire         i_clk,
+    input  wire         i_rst_n,
+    input  wire         i_abort,
+    input  wire         i_req_valid,
+    input  wire [7:0]   i_req_cmd,
+    input  wire [7:0]   i_req_seq,
+    input  wire [15:0]  i_req_length,
+
+    output reg  [10:0]  o_payload_rd_addr,
+    input  wire [7:0]   i_payload_rd_data,
+
+    output reg          o_rsp_wr_en,
+    output reg  [10:0]  o_rsp_wr_addr,
+    output reg  [7:0]   o_rsp_wr_data,
+    output reg  [15:0]  o_rsp_length,
+    output reg          o_rsp_valid,
+    output reg          o_error_valid,
+    output reg  [7:0]   o_error_code,
+
+    output reg  [127:0] o_telemetry_enable,
+
+    output reg          o_tel_rd_en,
+    output reg  [2:0]   o_tel_rd_bus,
+    output reg  [8:0]   o_tel_rd_addr,
+    input  wire [31:0]  i_tel_rd_data
+);
+
+    localparam [3:0] ST_IDLE          = 4'd0;
+    localparam [3:0] ST_READ_WAIT     = 4'd1;
+    localparam [3:0] ST_READ_BYTE     = 4'd2;
+    localparam [3:0] ST_ENABLE_RSP    = 4'd3;
+    localparam [3:0] ST_READ_STATUS   = 4'd4;
+    localparam [3:0] ST_FIND_CHANNEL  = 4'd5;
+    localparam [3:0] ST_TEL_RAM_REQ   = 4'd6;
+    localparam [3:0] ST_TEL_RAM_WAIT  = 4'd7;
+    localparam [3:0] ST_TEL_CAPTURE   = 4'd8;
+    localparam [3:0] ST_CHANNEL_WRITE = 4'd9;
+    localparam [3:0] ST_RSP_DONE      = 4'd10;
+
+    localparam [1:0] TEL_VOLTAGE = 2'd0;
+    localparam [1:0] TEL_CURRENT = 2'd1;
+    localparam [1:0] TEL_STATUS  = 2'd2;
+
+    reg [3:0]   state;
+    reg [7:0]   req_cmd;
+    reg [127:0] request_mask;
+    reg [127:0] read_mask;
+    reg [6:0]   channel_index;
+    reg [1:0]   tel_item;
+    reg [15:0]  voltage_data;
+    reg [15:0]  current_data;
+    reg [15:0]  status_data;
+    reg [2:0]   channel_byte_index;
+    reg [10:0]  rsp_write_addr;
+    reg [7:0]   selected_channel_count;
+
+    wire [127:0] request_mask_next;
+
+    assign request_mask_next = {request_mask[119:0], i_payload_rd_data};
+
+    function [3:0] f_count_byte;
+        input [7:0] mask_byte;
+        integer bit_index;
+        begin
+            f_count_byte = 4'd0;
+            for (bit_index = 0; bit_index < 8;
+                 bit_index = bit_index + 1) begin
+                f_count_byte = f_count_byte + mask_byte[bit_index];
+            end
+        end
+    endfunction
+
+    function [1:0] f_ram_item;
+        input [1:0] item;
+        begin
+            case (item)
+                TEL_VOLTAGE: f_ram_item = 2'd1;
+                TEL_CURRENT: f_ram_item = 2'd2;
+                default:     f_ram_item = 2'd0;
+            endcase
+        end
+    endfunction
+
+    always @(posedge i_clk or negedge i_rst_n) begin
+        if (!i_rst_n) begin
+            state                <= ST_IDLE;
+            req_cmd              <= 8'd0;
+            request_mask         <= 128'd0;
+            read_mask            <= 128'd0;
+            channel_index        <= 7'd0;
+            tel_item             <= TEL_VOLTAGE;
+            voltage_data         <= 16'd0;
+            current_data         <= 16'd0;
+            status_data          <= 16'd0;
+            channel_byte_index   <= 3'd0;
+            rsp_write_addr       <= 11'd1;
+            selected_channel_count <= 8'd0;
+            o_payload_rd_addr    <= 11'd0;
+            o_rsp_wr_en          <= 1'b0;
+            o_rsp_wr_addr        <= 11'd0;
+            o_rsp_wr_data        <= 8'd0;
+            o_rsp_length         <= 16'd0;
+            o_rsp_valid          <= 1'b0;
+            o_error_valid        <= 1'b0;
+            o_error_code         <= 8'd0;
+            o_telemetry_enable   <= 128'd0;
+            o_tel_rd_en          <= 1'b0;
+            o_tel_rd_bus         <= 3'd0;
+            o_tel_rd_addr        <= 9'd0;
+        end else begin
+            o_rsp_wr_en   <= 1'b0;
+            o_rsp_valid   <= 1'b0;
+            o_error_valid <= 1'b0;
+            o_tel_rd_en   <= 1'b0;
+
+            if (i_abort) begin
+                state <= ST_IDLE;
+            end else begin
+                case (state)
+                    ST_IDLE: begin
+                        if (i_req_valid) begin
+                            req_cmd           <= i_req_cmd;
+                            request_mask      <= 128'd0;
+                            selected_channel_count <= 8'd0;
+                            o_payload_rd_addr <= 11'd0;
+                            if ((i_req_cmd ==
+                                 `COMM_CMD_TELEMETRY_ENABLE) ||
+                                (i_req_cmd ==
+                                 `COMM_CMD_TELEMETRY_READ)) begin
+                                if (i_req_length == 16'd16) begin
+                                    state <= ST_READ_WAIT;
+                                end else begin
+                                    o_error_valid <= 1'b1;
+                                    o_error_code  <=
+                                        `COMM_ERROR_LENGTH;
+                                end
+                            end else begin
+                                o_error_valid <= 1'b1;
+                                o_error_code  <=
+                                    `COMM_ERROR_UNKNOWN_CMD;
+                            end
+                        end
+                    end
+
+                    ST_READ_WAIT: begin
+                        // 地址已输出，本周期等待 Parser 同步 RAM 返回数据。
+                        state <= ST_READ_BYTE;
+                    end
+
+                    ST_READ_BYTE: begin
+                        request_mask <= request_mask_next;
+                        if (req_cmd == `COMM_CMD_TELEMETRY_READ)
+                            selected_channel_count <=
+                                selected_channel_count +
+                                f_count_byte(i_payload_rd_data);
+                        if (o_payload_rd_addr == 11'd15) begin
+                            if (req_cmd ==
+                                `COMM_CMD_TELEMETRY_ENABLE) begin
+                                // 全部位图收齐后一次提交，避免出现部分新配置。
+                                o_telemetry_enable <= request_mask_next;
+                                o_rsp_length       <= 16'd1;
+                                state              <= ST_ENABLE_RSP;
+                            end else begin
+                                read_mask          <= request_mask_next;
+                                channel_index      <= 7'd0;
+                                rsp_write_addr     <= 11'd1;
+                                o_rsp_length       <=
+                                    16'd1 +
+                                    (selected_channel_count +
+                                     f_count_byte(i_payload_rd_data)) *
+                                    16'd6;
+                                state <= ST_READ_STATUS;
+                            end
+                        end else begin
+                            o_payload_rd_addr <= o_payload_rd_addr + 1'b1;
+                            state             <= ST_READ_WAIT;
+                        end
+                    end
+
+                    ST_ENABLE_RSP: begin
+                        o_rsp_wr_en   <= 1'b1;
+                        o_rsp_wr_addr <= 11'd0;
+                        o_rsp_wr_data <= `COMM_STATUS_SUCCESS;
+                        state         <= ST_RSP_DONE;
+                    end
+
+                    ST_READ_STATUS: begin
+                        o_rsp_wr_en   <= 1'b1;
+                        o_rsp_wr_addr <= 11'd0;
+                        o_rsp_wr_data <= `COMM_STATUS_SUCCESS;
+                        state         <= ST_FIND_CHANNEL;
+                    end
+
+                    ST_FIND_CHANNEL: begin
+                        if (read_mask[channel_index]) begin
+                            // 全局通道映射为 BUS、DEVICE_ID 和 RAIL。
+                            o_tel_rd_bus  <= channel_index[6:4];
+                            o_tel_rd_addr <= {
+                                3'd0,
+                                channel_index[3:1],
+                                channel_index[0],
+                                f_ram_item(TEL_VOLTAGE)
+                            };
+                            tel_item <= TEL_VOLTAGE;
+                            state    <= ST_TEL_RAM_REQ;
+                        end else if (channel_index == 7'd127) begin
+                            state <= ST_RSP_DONE;
+                        end else begin
+                            channel_index <= channel_index + 1'b1;
+                        end
+                    end
+
+                    ST_TEL_RAM_REQ: begin
+                        o_tel_rd_en <= 1'b1;
+                        state       <= ST_TEL_RAM_WAIT;
+                    end
+
+                    ST_TEL_RAM_WAIT: begin
+                        // RAM 在本时钟沿接收读请求，下一状态再采样返回值。
+                        state <= ST_TEL_CAPTURE;
+                    end
+
+                    ST_TEL_CAPTURE: begin
+                        case (tel_item)
+                            TEL_VOLTAGE: begin
+                                voltage_data <= i_tel_rd_data[15:0];
+                                tel_item     <= TEL_CURRENT;
+                                o_tel_rd_addr[1:0] <=
+                                    f_ram_item(TEL_CURRENT);
+                                state <= ST_TEL_RAM_REQ;
+                            end
+                            TEL_CURRENT: begin
+                                current_data <= i_tel_rd_data[15:0];
+                                tel_item     <= TEL_STATUS;
+                                o_tel_rd_addr[1:0] <=
+                                    f_ram_item(TEL_STATUS);
+                                state <= ST_TEL_RAM_REQ;
+                            end
+                            default: begin
+                                status_data        <=
+                                    i_tel_rd_data[15:0];
+                                channel_byte_index <= 3'd0;
+                                state              <= ST_CHANNEL_WRITE;
+                            end
+                        endcase
+                    end
+
+                    ST_CHANNEL_WRITE: begin
+                        o_rsp_wr_en   <= 1'b1;
+                        o_rsp_wr_addr <= rsp_write_addr;
+                        case (channel_byte_index)
+                            3'd0: o_rsp_wr_data <= voltage_data[15:8];
+                            3'd1: o_rsp_wr_data <= voltage_data[7:0];
+                            3'd2: o_rsp_wr_data <= current_data[15:8];
+                            3'd3: o_rsp_wr_data <= current_data[7:0];
+                            3'd4: o_rsp_wr_data <= status_data[15:8];
+                            default: o_rsp_wr_data <= status_data[7:0];
+                        endcase
+
+                        if (channel_byte_index == 3'd5) begin
+                            if (channel_index == 7'd127) begin
+                                state <= ST_RSP_DONE;
+                            end else begin
+                                channel_index  <= channel_index + 1'b1;
+                                // 当前低字节已占用本地址，下一通道紧接后一地址。
+                                rsp_write_addr <= rsp_write_addr + 1'b1;
+                                state          <= ST_FIND_CHANNEL;
+                            end
+                        end else begin
+                            channel_byte_index <= channel_byte_index + 1'b1;
+                            rsp_write_addr     <= rsp_write_addr + 1'b1;
+                        end
+                    end
+
+                    ST_RSP_DONE: begin
+                        // 最后一个写脉冲在本时钟沿被响应 RAM 接收。
+                        o_rsp_valid <= 1'b1;
+                        state       <= ST_IDLE;
+                    end
+
+                    default: state <= ST_IDLE;
+                endcase
+            end
+        end
+    end
+
+endmodule

@@ -2,24 +2,39 @@
 `include "cmd_dispatcher_defs.vh"
 
 /*
- * 参数类 demo：读写一个 32 位内部测试寄存器。
+ * Module Contract
  *
- * CMD 0x10：请求 LENGTH=0；响应为 STATUS=0，加四字节大端寄存器值。
- * CMD 0x11：请求 LENGTH=4，Payload 为四字节大端值；响应只有 STATUS=0。
- * 本类别的其他子命令、错误长度通过 error_valid/error_code 提交给
- * 外部 Error Response Generator，本模块不生成错误响应 Payload。
+ * 模块职责：
+ * - 实现参数类 demo 请求，读取或原子更新 32 位内部测试寄存器 o_demo_param。
+ * - 生成成功响应 RAM 写事件，或将命令/长度错误提交给公共错误链路。
+ * - 不负责：解释其他参数、保存响应 RAM、组帧或等待 UART 发送完成。
  *
- * 请求公共字段由 Dispatcher 提供，仅在 i_req_valid 时采样。
- * i_req_seq 保留统一请求接口，响应帧的 CMD/SEQ 由外部发送链路沿用，
- * 本模块不修改响应上下文，也不等待串口发送结束。
- * Payload 读地址经 Dispatcher 连接到 Parser 的 1clk 同步读 RAM；
- * 响应写接口经 Response Buffer 连接 TX Frame Builder 的 RAM。
- * 完成全部响应写入后产生单周期 o_rsp_valid。
+ * 输入事务：
+ * - 空闲时在 i_req_valid=1 的上升沿采样 CMD 和 LENGTH；处理期间忽略新请求。
+ * - PARAM_READ 要求 LENGTH=0；PARAM_WRITE 要求 LENGTH=4，Payload 为大端 32 位值。
+ * - 写命令从地址 0..3 顺序读取 Payload，每个地址等待 Parser RAM 的 1clk 读延迟。
  *
- * 单事务约束由上层保证，不提供 ready、排队或重复请求检测。
- * i_abort 中止未完成的处理，不回滚已经完整写入的测试寄存器。
- * 全部四字节收齐后才更新 o_demo_param，防止中途 abort 提交部分值。
- * i_rst_n 为异步低有效复位。
+ * 输出事务：
+ * - PARAM_READ 返回 STATUS_SUCCESS，随后返回请求开始时快照的四字节大端参数值。
+ * - PARAM_WRITE 收齐四字节后一次性更新 o_demo_param，并返回单字节 STATUS_SUCCESS。
+ * - 正常响应全部写入后产生 1clk o_rsp_valid；错误产生 1clk o_error_valid 且无正常响应。
+ *
+ * 关键时序：
+ * - o_rsp_wr_en 每个有效周期写一个字节，外部响应 RAM 接口没有反压。
+ * - o_rsp_wr_en、o_rsp_valid 和 o_error_valid 均为单周期事件。
+ * - 参数写入仅在第四个 Payload 字节返回时提交，不暴露部分更新值。
+ *
+ * 异常与恢复：
+ * - reset：异步低有效，回到空闲并将 o_demo_param 清零。
+ * - abort：取消当前读取或响应生成并回到空闲，不产生完成或错误事件。
+ * - abort 不回滚已完整提交的参数，也不清除外部 RAM 已接收的响应字节。
+ *
+ * 使用约束：
+ * - 上层必须保证单事务，并保持请求上下文和 Payload 在处理期间有效。
+ * - i_req_seq 未被使用；响应帧 CMD/SEQ 由外部发送链路沿用当前请求。
+ *
+ * 参考：
+ * - CMD_DEFINITION.md：参数类命令和响应状态定义。
  */
 module demo_param (
     input  wire        i_clk,

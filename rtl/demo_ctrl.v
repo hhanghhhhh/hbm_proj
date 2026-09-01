@@ -2,20 +2,39 @@
 `include "cmd_dispatcher_defs.vh"
 
 /*
- * 控制类 demo：设置、查询一个内部测试使能标志，不驱动实际硬件输出。
+ * Module Contract
  *
- * CMD 0x20：请求 LENGTH=0；响应为 STATUS=0，再加一字节当前使能值。
- * CMD 0x21：请求 LENGTH=1，Payload 为 0 或 1；响应只有 STATUS=0。
- * 其他子命令、错误长度、非 0/1 参数通过统一错误请求接口上报。
+ * 模块职责：
+ * - 实现控制类 demo 请求，查询或设置内部测试使能标志 o_demo_enable。
+ * - 生成成功响应 RAM 写事件，或将命令、长度和参数错误提交给公共错误链路。
+ * - 不负责：驱动实际控制硬件、保存响应 RAM、组帧或等待 UART 发送完成。
  *
- * i_req_valid 为单周期请求事件，子命令由本模块识别；Payload 经
- * Dispatcher 从 Parser 的 1clk 同步读 RAM 读取。正常响应先通过
- * rsp_wr_* 写入外部响应 RAM，再产生单周期 o_rsp_valid。
- * i_req_seq 保留统一请求接口，发送链路负责沿用请求的 CMD/SEQ。
+ * 输入事务：
+ * - 空闲时在 i_req_valid=1 的上升沿采样 CMD 和 LENGTH；处理期间忽略新请求。
+ * - CTRL_READ 要求 LENGTH=0；CTRL_WRITE 要求 LENGTH=1，Payload[0] 只能为 0 或 1。
+ * - 写命令从固定地址 0 读取 Payload，并等待 Parser RAM 的 1clk 同步读延迟。
  *
- * 系统保证单条指令一收一发，不增加 busy 检测、队列或完成输入。
- * i_abort 只中止当前处理，不回滚已经生效的测试标志。
- * i_rst_n 为异步低有效复位。
+ * 输出事务：
+ * - CTRL_READ 返回 STATUS_SUCCESS 和当前使能值，共 2 字节。
+ * - CTRL_WRITE 成功更新 o_demo_enable，并返回单字节 STATUS_SUCCESS。
+ * - 正常响应逐字节产生 o_rsp_wr_en，最后一次写入被接收后产生 1clk o_rsp_valid。
+ * - 未知命令、错误长度或非法写值产生 1clk o_error_valid，不提交正常响应。
+ *
+ * 关键时序：
+ * - 响应写接口无 ready；外部 RAM 必须在每个 o_rsp_wr_en 上升沿接收数据。
+ * - o_rsp_valid、o_error_valid 和 o_rsp_wr_en 均为单周期事件。
+ *
+ * 异常与恢复：
+ * - reset：异步低有效，回到空闲并将 o_demo_enable 清零。
+ * - abort：优先取消当前读取或响应生成并回到空闲，不产生完成或错误事件。
+ * - abort 不回滚此前已经更新的 o_demo_enable，也不清除外部 RAM 已接收的数据。
+ *
+ * 使用约束：
+ * - 上层必须保证单事务，并保持请求上下文和 Payload 在本模块处理期间有效。
+ * - i_req_seq 未被本模块使用；发送链路负责沿用当前请求的 CMD/SEQ。
+ *
+ * 参考：
+ * - CMD_DEFINITION.md：控制类命令和响应状态定义。
  */
 module demo_ctrl (
     input  wire        i_clk,

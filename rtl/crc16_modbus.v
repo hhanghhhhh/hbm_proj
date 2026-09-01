@@ -1,12 +1,32 @@
 `timescale 1ns / 1ps
 
 /*
- * 流式 CRC-16/MODBUS 计算模块。
+ * Module Contract
  *
- * i_init 有效时同步装载标准初值 16'hFFFF。i_data_valid 每有效一个周期
- * 接收一个字节，按最低位优先方式使用反射多项式 16'hA001 进行计算。
- * o_crc 直接输出 16 位 CRC 数值，帧上传输时的高低字节顺序由上层模块
- * 决定。i_init 的优先级高于 i_data_valid。
+ * 模块职责：
+ * - 按 CRC-16/MODBUS 算法逐字节累计并输出当前 16 位 CRC 数值。
+ * - 不负责：划分帧边界、选择参与计算的字段或规定 CRC 的传输字节序。
+ *
+ * 输入事务：
+ * - i_init=1 在当前上升沿开始一次新的累计，装载初值 16'hFFFF。
+ * - i_data_valid=1 时在当前上升沿接收 i_data，并基于此前 o_crc 累计一个字节。
+ * - i_init 与 i_data_valid 同拍有效时只执行初始化，该字节不参与累计。
+ *
+ * 输出事务：
+ * - 每接收一个有效字节，o_crc 在该上升沿后更新为包含该字节的 CRC。
+ * - 无初始化和数据有效事件时，o_crc 保持不变；模块不产生 done/valid 脉冲。
+ *
+ * 关键时序：
+ * - 算法使用初值 16'hFFFF、反射多项式 16'hA001，并按输入字节最低位优先计算。
+ * - 上游若要读取最终 CRC，应在最后一个 i_data_valid 上升沿之后使用 o_crc。
+ *
+ * 异常与恢复：
+ * - reset：i_rst_n 在 i_clk 上升沿同步采样；低电平时将 o_crc 置为 16'hFFFF。
+ * - 模块没有 abort、错误检测或超时接口；重新开始累计必须由上游发出 i_init。
+ *
+ * 使用约束：
+ * - i_data 必须在 i_data_valid 对应的采样沿满足同步时序要求。
+ * - 帧内字段范围及最终高低字节发送顺序由调用模块保证。
  */
 module crc16_modbus (
     input  wire        i_clk,

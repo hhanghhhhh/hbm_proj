@@ -26,7 +26,7 @@
  * - 字节间超时为 8N1 下 1.5 个字符时间，即 15 个波特位周期。
  * - 合法请求提交后的 busy 期间忽略所有 i_rx_valid，不接收或排队下一请求。
  * - Payload RAM 读口为同步读；工程约定 o_payload_rd_data 相对 i_payload_rd_addr 延迟 1clk。
- * - o_frame_valid 以及所有 *_error/*_timeout 输出均为 1clk pulse。
+ * - o_frame_valid 以及所有 *_error、*_timeout 输出均为 1clk pulse。
  *
  * 异常与恢复：
  * - reset：i_rst_n 在 i_clk 上升沿同步采样；低电平时回到等待 SOF，清除事务上下文和事件输出。

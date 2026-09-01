@@ -65,110 +65,22 @@
 
 # 2.3 大块配置数据类
 
-本项目包含 8 条 I2C 总线，每条总线对应一个独立例化的 I2C 配置模块，模块内部包含配置 RAM。
+系统包含 8 条独立 I2C 总线，每路各有配置 RAM、结果 RAM 和配置执行模块。
 
-大块配置相关 CMD 当前保持简单，只负责：
+| CMD | 请求 Payload | 成功响应 Payload | 功能 |
+|---|---|---|---|
+| `0x10 CONFIG_DATA` | `BUS(1) + OFFSET(2) + DATA(4×N)` | `STATUS(1)` | 写配置 RAM |
+| `0x11 CONFIG_START` | `BUS(1) + I2C_ADDR(1) + CONFIG_LENGTH(2) + STORE_FLASH(1) + CONFIG_MODE(1)` | `STATUS(1)` | 启动配置 |
+| `0x12 CONFIG_STATUS` | 无 | `STATUS(1) + OK(1)` | 查询 8 条 I2C 总线状态 |
+| `0x13 CONFIG_RESULT_READ` | `BUS(1) + OFFSET(2) + LENGTH(2)` | `STATUS(1) + DATA(2×LENGTH)` | 读取结果 RAM |
 
-1. 将配置数据写入指定 I2C 总线对应的配置 RAM；
-2. 携带必要参数启动指定 I2C 设备的配置流程；
-3. 查询配置过程和配置结果。
+约束：
 
-当前定义：
-
-| CMD | 功能 |
-|---|---|
-| CONFIG_DATA | 下发配置数据 |
-| CONFIG_START | 开始执行配置 |
-| CONFIG_STATUS | 查询配置状态 / 结果 |
-
-当前不引入 `CONFIG_BEGIN`、`CONFIG_VERIFY`、`CONFIG_COMMIT`、`CONFIG_ABORT` 等额外配置传输状态，后续只有在实际需求出现时再扩展。
-
-### 2.3.1 CONFIG_DATA
-
-功能：
-
-将配置数据写入指定 I2C 总线对应模块的配置 RAM。
-
-请求 Payload：
-
-```text
-BUS | OFFSET | DATA
-```
-
-字段含义：
-
-| 字段 | 含义 |
-|---|---|
-| BUS | I2C 总线编号，用于选择 8 个 I2C 配置模块中的一个 |
-| OFFSET | DATA 在该模块配置 RAM 中的写入偏移地址 |
-| DATA | 要写入配置 RAM 的原始配置数据 |
-
-设计约束：
-
-- `DATA` 的具体内容和内部格式不属于上位机通信协议定义范围；
-- 通信配置应用模块只负责根据 `BUS` 选择对应 I2C 配置模块，并从 `OFFSET` 开始将 `DATA` 写入其 RAM；
-- `DATA` 后续如何解析、如何转换为 I2C 操作，由对应 I2C 配置模块负责；
-- 不在 Payload 中额外增加 DATA 长度字段，DATA 长度可由通信帧 `LENGTH` 推导；
-- 大块配置数据允许通过多条 `CONFIG_DATA` 分包写入不同 OFFSET。
-
-响应 Payload：
-
-```text
-STATUS
-```
-
-表示本次数据写入请求是否成功。
-
-### 2.3.2 CONFIG_START
-
-功能：
-
-启动指定 I2C 总线、指定 I2C 设备的配置流程。
-
-请求 Payload 暂定：
-
-```text
-BUS | I2C_ADDR | CONFIG_LENGTH | STORE_FLASH | CONFIG_MODE
-```
-
-字段含义：
-
-| 字段 | 含义 |
-|---|---|
-| BUS | I2C 总线编号 |
-| I2C_ADDR | 目标 I2C 设备地址 |
-| CONFIG_LENGTH | 本次需要处理的有效配置数据长度 |
-| STORE_FLASH | 本次配置是否需要保存到 Flash |
-| CONFIG_MODE | 本次配置模式 |
-
-设计约束：
-
-- `CONFIG_START` 只负责传递启动配置所需参数并触发对应 I2C 配置模块开始工作；
-- 配置模块从自身 RAM 中读取已经通过 `CONFIG_DATA` 下发的数据并进行解析；
-- I2C 操作时序、配置数据内部格式、不同配置模式的具体行为均由 I2C 配置模块定义，不进入通信协议层；
-- `STORE_FLASH`、`CONFIG_MODE` 的具体取值定义后续根据实际应用需求补充。
-
-响应 Payload：
-
-```text
-STATUS
-```
-
-该响应表示启动请求是否被接受，不代表整个 I2C 配置过程已经执行完成。
-
-### 2.3.3 CONFIG_STATUS
-
-功能：
-
-查询 I2C 配置过程中的状态和配置结果。
-
-当前仅确定该 CMD 的职责，具体请求 Payload、返回状态字段和错误信息格式后续结合 I2C 配置模块实际需要再定义。
-
-设计原则：
-
-- 只返回上位机实际需要使用的状态；
-- FPGA 负责报告事实状态，复杂判断和展示逻辑尽可能放在上位机；
-- 不提前加入没有明确用途的状态字段。
+- `BUS` 取值为 0～7，多字节字段采用大端顺序。
+- `CONFIG_DATA` 的 `OFFSET` 单位为一条 32 位配置记录，`DATA` 长度必须是 4 字节的整数倍。
+- `CONFIG_START` 的 `CONFIG_LENGTH` 单位为 32 位配置记录；成功响应表示启动请求已接收，不表示配置已经完成。
+- `CONFIG_STATUS` 的 `OK[7:0]` 分别对应 BUS7～BUS0，bit 为 1 表示对应 I2C 正常。
+- `CONFIG_RESULT_READ` 的 `OFFSET` 和 `LENGTH` 单位均为一个 16 位结果项；`LENGTH` 为 1～1023，且 `OFFSET + LENGTH <= 1024`。建议在配置完成后读取。
 
 ---
 
@@ -224,6 +136,19 @@ DATA     固件数据
 
 - 一次返回多个相关数据。
 - 对实时数据建议采用快照方式，保证数据来自同一时刻。
+
+---
+
+# 2.6 遥测类
+
+| CMD | 请求 Payload | 成功响应 Payload | 功能 |
+|---|---|---|---|
+| `0x20 TELEMETRY_ENABLE` | `ENABLE_MASK(16)` | `STATUS(1)` | 设置 128 通道遥测使能 |
+| `0x21 TELEMETRY_READ` | `READ_MASK(16)` | `STATUS(1) + DATA(6×N)` | 回读选中通道 |
+
+- 位图为 128 位大端数据，bit n 对应 channel n。
+- `channel[6:4]` 为 BUS，`channel[3:1]` 为设备，`channel[0]` 为 Rail。
+- 回读按通道号递增排列；每通道为 `VOLTAGE(2) + CURRENT(2) + STATUS(2)`，各字段采用大端顺序。
 
 ---
 

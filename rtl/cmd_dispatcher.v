@@ -2,23 +2,36 @@
 `include "cmd_dispatcher_defs.vh"
 
 /*
- * 合法请求的类别分发与 Payload RAM 读地址选择模块。
+ * Module Contract
  *
- * Frame Parser 提交 i_frame_valid 时，本模块锁存 CMD/SEQ/LENGTH，
- * 根据 CMD 高四位选择业务模块，并产生对应的单周期 req_valid。
- * req_cmd/req_seq/req_length 和 Payload 读数据广播给各业务模块，
- * 仅被 req_valid 选中的模块开始处理。类别内的子命令由业务模块识别；
- * 未接入类别只产生 error_valid/error_code，不选通业务模块。
+ * 模块职责：
+ * - 按请求 CMD 的高四位选择参数、控制、配置或遥测业务，并广播请求上下文。
+ * - 将当前业务模块的 Payload 读地址接到 Parser RAM，原样广播返回数据。
+ * - 不负责：识别类别内子命令、例化业务模块、保存 Payload 或等待响应完成。
  *
- * 系统严格单条请求一收一发，不设 busy、ready、队列或完成输入。
- * 正常响应结束后继续保留上下文和 active_module，下一条合法请求
- * 直接覆盖；i_abort 接 Frame Parser 的事务超时脉冲，清除当前选择。
+ * 输入事务：
+ * - i_frame_valid=1 的上升沿采样 i_frame_cmd/i_frame_seq/i_frame_length。
+ * - 已接入类别在同一沿更新公共请求字段和 o_active_module，并置位对应 req_valid。
+ * - 模块没有 busy/ready；新的 i_frame_valid 会覆盖此前保存的请求上下文。
  *
- * 业务模块由上层独立例化，不在本模块内部例化。
- * Payload RAM 位于 Frame Parser 内部，地址组合选择、数据直接广播，
- * 不增加 RAM 的 1clk 同步读延迟。没有业务选中时地址输出为 0。
- * 新增业务时只需增加类别译码、请求选通和读地址分支。
- * 所有接口使用同一个 i_clk，i_rst_n 为异步低有效复位。
+ * 输出事务：
+ * - 四路 req_valid 和 o_error_valid 均为 1clk pulse，且一次请求至多产生其中一路。
+ * - 未接入的 CMD 类别不选通业务模块，输出 COMM_ERROR_UNKNOWN_CMD 错误事件。
+ * - o_active_module 和公共请求字段保持到下一次合法请求覆盖、abort 或 reset。
+ *
+ * 关键时序：
+ * - 业务模块在 req_valid 有效的上升沿之后看到已寄存的公共请求字段。
+ * - o_payload_rd_addr 组合选择当前 active_module 的地址；无选择时为 0。
+ * - o_payload_rd_data 直接连接 i_payload_rd_data，不增加 Parser RAM 固有读延迟。
+ *
+ * 异常与恢复：
+ * - reset：异步低有效，清除请求上下文、模块选择和所有事件输出。
+ * - abort：优先于 i_frame_valid，清除上下文和选择，不产生请求或错误事件。
+ * - error：错误码保持到后续错误、abort 或 reset，但仅在 o_error_valid 时有效。
+ *
+ * 使用约束：
+ * - 上层必须保证同一时刻最多一个通信事务在途，且仅被选中的业务模块发起 RAM 读。
+ * - i_abort 用于取消当前选择；正常事务结束本身不会自动清除 o_active_module。
  */
 module cmd_dispatcher (
     input  wire        i_clk,
@@ -36,10 +49,14 @@ module cmd_dispatcher (
     output wire [7:0]  o_payload_rd_data,
     output reg         o_param_req_valid,
     output reg         o_ctrl_req_valid,
-    output reg  [1:0]  o_active_module,
+    output reg         o_config_req_valid,
+    output reg         o_telemetry_req_valid,
+    output reg  [3:0]  o_active_module,
 
     input  wire [10:0] i_param_payload_rd_addr,
     input  wire [10:0] i_ctrl_payload_rd_addr,
+    input  wire [10:0] i_config_payload_rd_addr,
+    input  wire [10:0] i_telemetry_payload_rd_addr,
     output reg  [10:0] o_payload_rd_addr,
     input  wire [7:0]  i_payload_rd_data,
 
@@ -54,6 +71,9 @@ module cmd_dispatcher (
         case (o_active_module)
             `COMM_MODULE_PARAM: o_payload_rd_addr = i_param_payload_rd_addr;
             `COMM_MODULE_CTRL:  o_payload_rd_addr = i_ctrl_payload_rd_addr;
+            `COMM_MODULE_CONFIG: o_payload_rd_addr = i_config_payload_rd_addr;
+            `COMM_MODULE_TELEMETRY:
+                o_payload_rd_addr = i_telemetry_payload_rd_addr;
             default:            o_payload_rd_addr = 11'd0;
         endcase
     end
@@ -65,12 +85,16 @@ module cmd_dispatcher (
             o_req_length      <= 16'd0;
             o_param_req_valid <= 1'b0;
             o_ctrl_req_valid  <= 1'b0;
+            o_config_req_valid <= 1'b0;
+            o_telemetry_req_valid <= 1'b0;
             o_active_module   <= `COMM_MODULE_NONE;
             o_error_valid     <= 1'b0;
             o_error_code      <= 8'd0;
         end else begin
             o_param_req_valid <= 1'b0;
             o_ctrl_req_valid  <= 1'b0;
+            o_config_req_valid <= 1'b0;
+            o_telemetry_req_valid <= 1'b0;
             o_error_valid    <= 1'b0;
 
             if (i_abort) begin
@@ -93,6 +117,14 @@ module cmd_dispatcher (
                     `COMM_CLASS_CTRL: begin
                         o_active_module  <= `COMM_MODULE_CTRL;
                         o_ctrl_req_valid <= 1'b1;
+                    end
+                    `COMM_CLASS_CONFIG: begin
+                        o_active_module    <= `COMM_MODULE_CONFIG;
+                        o_config_req_valid <= 1'b1;
+                    end
+                    `COMM_CLASS_TELEMETRY: begin
+                        o_active_module       <= `COMM_MODULE_TELEMETRY;
+                        o_telemetry_req_valid <= 1'b1;
                     end
                     default: begin
                         o_active_module <= `COMM_MODULE_NONE;
