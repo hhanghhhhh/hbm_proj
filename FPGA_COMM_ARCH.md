@@ -1,21 +1,10 @@
-# FPGA 通信架构设计说明
+# FPGA 通信架构
 
-## 1. 目的
+本文只描述 FPGA 通信子系统的**总体分层、模块边界和长期保持的全局约束**，作为快速理解工程的系统地图。
 
-本文定义 FPGA 内部通信处理模块的总体架构。
+具体帧格式、CMD/Payload 定义和模块内部行为不在本文重复维护，分别以协议文档、命令定义和 RTL 顶部 `Module Contract` 为准。
 
-设计目标：
-
-- 通信协议解析与业务功能解耦；
-- 支持参数/状态读取、设备控制、大块配置传输、在线升级等功能；
-- 通信数据经过完整校验后再进入业务处理；
-- 便于后续扩展 CMD 和维护。
-
----
-
-## 2. 总体架构
-
-FPGA 通信模块采用分层设计：
+## 1. 总体结构
 
 ```text
 UART RX
@@ -27,217 +16,118 @@ Frame Parser
    v
 CMD Dispatcher
    |
-   +--> 参数/状态模块
-   +--> 控制模块
-   +--> 配置模块
-   +--> 在线升级模块
-   +--> 其他业务模块
+   +--> 参数 / 状态业务
+   +--> 控制业务
+   +--> 配置业务
+   +--> 在线升级等业务
    |
    +--> Error Response Generator
               |
               v
        Response Buffer
-       [response MUX]
               |
               v
        TX Frame Builder
        [Response RAM]
               |
-       tx_byte / tx_valid
               v
            UART TX
-              ^
-           tx_ready
-
-TX Frame Builder --tx_done--> Frame Parser
 ```
 
-当前通信采用严格单事务、一问一答模式：主机发送一个请求，等待完整响应后再发送下一请求。
+通信层负责可靠收发、路由和统一响应链路；业务模块只处理具体 CMD 的业务含义。
 
----
+当前系统采用严格单事务、一问一答模式：同一时刻只处理一个已接收请求，当前事务结束后再接受下一条业务请求。
 
-## 3. Frame Parser
+## 2. 模块边界
 
-职责：
+### Frame Parser
 
-- SOF 检测；
-- ADDR、CMD、SEQ、LENGTH 字段解析；
-- PAYLOAD 接收并写入内部 Payload RAM；
-- CRC 流式计算与校验；
-- 长度检查和接收异常处理；
-- 保存当前合法请求元信息直到当前事务结束。
+- 负责可靠接收并校验完整通信帧；
+- 内部保存 Payload RAM 和当前请求上下文；
+- 只有可信完整帧才提交给后级；
+- 不解释 Payload 的业务含义，不执行具体 CMD。
 
-约束：
+### CMD Dispatcher
 
-- 不解析业务含义；
-- 不处理具体 CMD；
-- CRC 校验通过后才提交给后级；
-- SOF、接收超时、非法长度、CRC 错误等不可信帧直接丢弃，不生成错误响应；
-- 当前响应完成前，不接受下一条业务请求。
+- 根据 CMD 将合法请求路由到对应业务模块；
+- 管理当前业务模块选择和 Payload RAM 读地址路由；
+- 不执行具体业务，不负责响应组帧和发送。
 
-详细约束见 `FRAME_PARSER.md`。
+### 业务模块
 
----
+- 解析自身负责的 CMD 和 Payload；
+- 执行业务逻辑并产生统一响应 Payload；
+- 业务参数、状态或流程错误进入统一错误响应链路；
+- 新功能优先通过新增 CMD 和业务模块扩展，不修改基础通信框架。
 
-## 4. CMD Dispatcher
+### Error Response Generator
 
-职责：
+- 处理“请求帧可信，但请求无法执行”的业务级错误；
+- 使用与正常业务一致的响应链路；
+- 不处理 CRC、非法长度、接收超时等不可信帧错误。
 
-- 根据 CMD 将请求分发到对应业务模块；
-- 输出当前 `active_module`；
-- 统一管理 Payload RAM 读地址路由；
-- 对未知或未分配 CMD 产生错误请求。
+### Response Buffer
 
-约束：
+- 在正常业务响应和错误响应之间选择当前有效响应源；
+- 向 TX Frame Builder 提供统一响应接口；
+- 不保存 Response RAM，不生成完整通信帧。
 
-- 只负责请求路由，不执行具体业务逻辑；
-- 不直接生成正常或错误通信帧；
-- 不负责当前事务结束控制。
+### TX Frame Builder
 
-详细约束见 `CMD_DISPATCHER.md`。
+- 内部保存 Response RAM；
+- 统一生成正常响应和错误响应的完整发送帧；
+- 负责 CRC、UART TX 握手及 RS485 发送方向控制；
+- 发送侧事务完成的精确定义以 `rtl/tx_frame_builder.v` 顶部 `Module Contract` 为准。
 
----
+## 3. 全局不变量
 
-## 5. 业务模块
+以下规则属于通信框架的长期约束，修改时需要明确评估整个通信链路：
 
-业务模块负责具体 CMD 的业务处理，并通过统一响应接口生成正常响应 Payload。
+1. **通信层与业务层分离。** Frame Parser 不解释业务，业务模块不处理基础收帧可靠性。
+2. **可信后执行。** CRC、长度等基础校验通过后，请求才允许进入业务处理。
+3. **不可信帧静默丢弃。** SOF/接收超时/非法长度/CRC 错误等不生成业务错误响应。
+4. **可信请求的业务错误统一响应。** 未定义 CMD、参数非法、状态不允许等通过 Error Response Generator 返回错误。
+5. **严格单事务。** 当前问答事务未结束前，不启动下一条业务事务。
+6. **响应上下文沿用请求。** 正常响应和错误响应均沿用当前请求的 ADDR、CMD、SEQ。
+7. **SEQ 只用于请求/响应匹配。** 当前不提供自动去重、历史响应缓存或并发事务编号能力。
+8. **Response Payload 首字节为 STATUS。** 具体格式以 `COMMUNICATION_PROTOCOL.md` 为准。
+9. **Payload RAM 为同步读接口，固定 1clk 读取延迟。** 业务模块按该接口时序读取请求 Payload。
+10. **事务事件与字节握手区分。** `frame_valid`、业务 `req_valid`、`rsp_valid`、事务完成类信号属于事件脉冲；UART 字节侧 `tx_valid`/`tx_ready` 属于握手接口，`tx_valid` 可在等待 `tx_ready` 时保持。
+11. **事务异常可恢复。** 事务超时/abort 应使当前链路最终回到可接收下一事务的状态；各模块的具体清理行为由自身 `Module Contract` 定义。
 
-业务模块发现参数、状态、流程等业务错误时，进入统一错误响应机制，不自行生成完整错误帧。
+## 4. 单一事实来源
 
-主要业务类别包括：
+为避免同一约束在多份文档中重复维护，以下内容只在对应位置作为当前事实来源：
 
-- 参数 / 状态；
-- 控制；
-- 配置数据；
-- 在线升级；
-- 批量读取；
-- 后续扩展模块。
+| 内容 | 当前事实来源 |
+|---|---|
+| 总体分层、模块边界、全局不变量 | `FPGA_COMM_ARCH.md` |
+| 帧格式、CRC 范围、请求/响应通用规则 | `COMMUNICATION_PROTOCOL.md` |
+| CMD 分类、请求/响应 Payload 语义 | `CMD_DEFINITION.md` |
+| 单个 RTL 的当前外部行为、握手、时序、abort/reset 语义 | 对应 `.v` 文件顶部 `Module Contract` |
+| RTL 编码和 Module Contract 写法 | `VERILOG_CODING_GUIDELINES.md` |
+| 是否已经被验证、覆盖了什么、还有什么未证明 | 当前 Cocotb 验证报告 |
 
-具体 CMD 和 Payload 定义见 `CMD_DEFINITION.md`。
+早期的 `FRAME_PARSER.md`、`CMD_DISPATCHER.md`、`TX_FRAME_BUILDER.md`、`RESPONSE_BUFFER.md`、`ERROR_RESPONSE.md` 等模块设计文档可继续保留作为**历史设计输入和讨论记录**，但不要求随 RTL 持续同步，也不作为当前模块行为的唯一依据。
 
----
+当这些历史文档与协议、当前 RTL `Module Contract` 或已确认的新需求冲突时，应先确认当前设计意图，再更新真正的事实来源和验证用例，而不是机械同步所有旧文档。
 
-## 6. Error Response Generator
+## 5. 阅读与修改路径
 
-Error Response Generator 只处理“请求帧合法，但请求无法执行”的情况，例如未知 CMD、参数非法、设备状态错误等。
-
-它使用与普通业务模块一致的响应接口生成错误 Payload，并通过正常发送链路发送。
-
-不可信接收帧不进入 Error Response Generator。
-
-详细约束见 `ERROR_RESPONSE.md`。
-
----
-
-## 7. Response Buffer
-
-Response Buffer 仅负责：
-
-- 根据 `active_module` 选择当前业务模块的正常响应接口；
-- 在错误响应有效时选择 Error Response Generator；
-- 将最终选中的 `rsp_wr_*`、`rsp_length`、`rsp_valid` 统一路由到 `TX Frame Builder`。
-
-Response Buffer 不包含 Response RAM，不解析业务，不生成帧格式，也不等待发送完成。
-
-详细约束见 `RESPONSE_BUFFER.md`。
-
----
-
-## 8. TX Frame Builder
-
-TX Frame Builder 内部包含 Response RAM，并负责统一生成完整响应帧。
-
-正常响应和错误响应均沿用当前请求的：
+日常维护建议按以下顺序读取，避免为小改动重读整个工程：
 
 ```text
-ADDR
-CMD
-SEQ
+先看 FPGA_COMM_ARCH.md
+        |
+        +--> 涉及协议：COMMUNICATION_PROTOCOL.md
+        |
+        +--> 涉及业务：CMD_DEFINITION.md
+        |
+        +--> 涉及某模块：对应 RTL 顶部 Module Contract
+                              |
+                              +--> 需要排查实现时再读模块内部 RTL
+                              |
+                              +--> 需要确认正确性时看 Cocotb 验证报告
 ```
 
-发送过程中按实际发送字节流式累计 CRC，通过 `tx_byte` / `tx_valid` / `tx_ready` 与 UART TX 逐字节握手。
-
-最后一个 CRC 字节被 UART TX 接收后产生 `tx_done`。`tx_done` 用于结束当前问答事务，并通知 `Frame Parser` 恢复下一帧接收。
-
-详细约束见 `TX_FRAME_BUILDER.md`。
-
----
-
-## 9. 接口时序约束
-
-通信模块内部所有 valid 信号均采用单周期脉冲形式：
-
-```
-frame_valid : 1 clock pulse
-
-req_valid   : 1 clock pulse
-
-rsp_valid   : 1 clock pulse
-
-tx_done     : 1 clock pulse
-```
-
-valid 信号表示事件发生，不表示状态保持。
-
-当前请求的上下文信息：
-
-```
-ADDR
-CMD
-SEQ
-LENGTH
-active_module
-```
-
-由对应模块锁存，并保持到当前事务结束。
-
----
-
-## 10. 事务超时恢复
-
-Frame Parser 提供事务超时检测。
-
-当合法请求已经产生 `frame_valid`，但后续模块长期未完成响应时：
-
-Frame Parser 产生 timeout/abort 通知。
-
-该通知用于清除当前事务状态：
-
-- Frame Parser
-- CMD Dispatcher
-- Response Buffer
-- 业务模块
-- Error Response Generator
-
-均需要释放当前事务。
-
-超时恢复后，系统重新进入等待下一帧状态。
-
----
-
-## 11. 待确认事项
-
-当前仍需后续统一确定：
-
-- 错误码具体编号及是否需要附加错误信息；
-- CRC 的具体算法参数。
-
----
-
-## 12. 设计原则总结
-
-1. 通信层与业务层分离。
-2. Frame Parser 内部保存接收 Payload RAM，并负责可靠收帧。
-3. 不可信接收帧直接丢弃，不返回错误响应。
-4. CMD Dispatcher 只负责请求路由，未知 CMD 进入统一错误响应机制。
-5. 业务模块只负责具体业务和正常响应 Payload。
-6. Error Response Generator 统一生成业务级错误响应 Payload。
-7. Response Buffer 只负责响应接口 MUX。
-8. TX Frame Builder 内部保存 Response RAM，并统一生成和发送正常/错误通信帧。
-9. 响应 ADDR、CMD、SEQ 均沿用当前请求。
-10. 当前响应完成后才允许处理下一条请求。
-11. 新功能优先通过增加 CMD 和业务模块实现，不修改基础通信框架。
-12. 所有 valid 信号采用单周期脉冲。
-13. RAM 采用同步读模型，固定 1clk 读取延迟。
-14. Response Payload 第一个字节固定为 STATUS。
-15. SEQ 仅用于请求/响应匹配，不提供自动去重功能。
+模块外部可观察行为发生变化时，应同步更新该 RTL 的 `Module Contract` 和相关验证；仅内部实现重构且外部契约不变时，不要求修改本文。
