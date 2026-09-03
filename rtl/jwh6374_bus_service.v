@@ -2,6 +2,7 @@
 `include "jwh6374_common_defs.vh"
 
 /*
+
  * Module Contract
  *
  * 模块职责：
@@ -43,9 +44,24 @@
  * 参考：
  * - DUT_POWER_CONTROL_FLOW.md：配置、固化、遥测和告警的系统流程。
  * - DUT_POWER_CONTROL.md：JWH6374 访问约束和错误处理。
- */
 
-module jwh6374_bus_service_demo_8 #(
+
+本地设备号：device_id[5:0] = {TCA channel[2:0], address slot[2:0]}。
+JWH 地址：P_JWH_ADDR_BASE + slot。
+
+配置记录 32 bit：
+    [31:30] PAGE 0/1/2
+    [29:27] 0 Send Byte，1 Write Byte，2 Write Word，
+             3 Read Byte，4 Read Word
+    [26:19] PMBus Command
+    [18:3]  写数据
+    [2:0]   保留，必须为 0
+
+配置RAM不保存PAGE-valid或STORE命令。每条普通请求都明确携带目标PAGE，
+是否真正发送PAGE由内部 jwh6374_bus_controller 的“通道+地址+PAGE”缓存决定。
+*/
+
+module jwh6374_bus_service #(
     parameter integer P_SYS_CLK_FREQ          = 100_000_000,
     parameter integer P_I2C_BAUD_RATE         = 400_000,
     parameter integer P_I2C_TIMEOUT_MS        = 35,
@@ -299,7 +315,6 @@ module jwh6374_bus_service_demo_8 #(
             o_alert_report_channel     <= 3'd0;
             o_alert_report_device_mask <= 8'd0;
             o_current_device_id        <= 6'd0;
-            o_debug_state              <= ST_IDLE;
 
             r_bus_req_valid            <= 1'b0;
             r_bus_req_channel          <= 3'd0;
@@ -316,12 +331,10 @@ module jwh6374_bus_service_demo_8 #(
             o_tel_wr_en                <= 1'b0;
             o_alert_report_valid       <= 1'b0;
             r_bus_req_valid            <= 1'b0;
-            o_debug_state              <= ST_IDLE;
         end else begin
             o_cfg_ram_rd_en <= 1'b0;
             o_cfg_result_wr_en <= 1'b0;
             o_tel_wr_en     <= 1'b0;
-            o_debug_state   <= r_state;
 
             case (r_state)
                     // 空闲仲裁：按“寄存器任务 > 告警 > 遥测”启动任务。
@@ -765,7 +778,7 @@ module jwh6374_bus_service_demo_8 #(
         .o_resp_read_data      (w_bus_resp_read_data),
         .o_resp_error          (w_bus_resp_error),
         .o_resp_error_code     (w_bus_resp_error_code),
-        .o_debug_state                 (),
+        .o_debug_state         (),
         .i_scl_i               (i_scl_i),
         .o_scl_o               (o_scl_o),
         .o_scl_t               (o_scl_t),

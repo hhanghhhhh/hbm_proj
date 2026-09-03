@@ -125,7 +125,7 @@ module i2c_bus_unit #(
         .clkb  (i_clk)
     );
 
-    jwh6374_bus_service_demo_8 #(
+    jwh6374_bus_service #(
         .P_SYS_CLK_FREQ    (CLK_FREQ_HZ),
         .P_I2C_BAUD_RATE   (I2C_BAUD_RATE),
         .P_I2C_TIMEOUT_MS  (35),

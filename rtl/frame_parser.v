@@ -13,7 +13,8 @@
  * - 每个 i_rx_valid=1 的时钟周期接收一个 i_rx_byte；帧格式遵循 COMMUNICATION_PROTOCOL.md。
  * - SOF 按非重叠 55 AA 匹配；第二字节不是 AA 时直接重新等待 55，错误字节不复用于新帧头。
  * - LENGTH 为大端，允许 0..MAX_PAYLOAD_LENGTH；Payload 从地址 0 起连续写入 RAM。
- * - CRC 从 ADDR 到 PAYLOAD 逐字节累计，不包含 SOF 和 CRC 字段；接收 CRC 高字节在前。
+ * - CRC 从 SOF(55 AA) 到 PAYLOAD 逐字节累计，包含两个 SOF 字节，不包含 CRC 字段；
+ *   接收 CRC 高字节在前。
  *
  * 输出事务：
  * - 仅当 LENGTH 合法、CRC 正确且 ADDR==i_local_addr 时，产生 1clk 的 o_frame_valid。
@@ -112,12 +113,11 @@ module frame_parser #(
 
     /* 仅在 PAYLOAD 状态收到有效字节时写 RAM。 */
     wire       payload_ram_we;
-    wire [7:0] payload_ram_doa;
 
     assign payload_ram_we = (!request_busy) &&
                             (state == ST_PAYLOAD) && i_rx_valid;
 
-    /* CRC 从 ADDR 开始累计，不包含 SOF 和接收到的 CRC 字段。 */
+    /* CRC 从首个 SOF 字节开始累计，不包含接收到的 CRC 字段。 */
     crc16_modbus u_crc16_modbus (
         .i_clk        (i_clk),
         .i_rst_n      (i_rst_n),
@@ -128,23 +128,15 @@ module frame_parser #(
     );
 
     /* A 口由解析器写入 Payload，B 口供后级业务模块同步读取。 */
-    ip_ram_uart_rx u_payload_ram (
-        .doa   (payload_ram_doa),
+    ip_ram_uart u_payload_ram (
         .dia   (i_rx_byte),
         .addra (payload_wr_addr),
-        .cea   (1'b1),
+        .cea   (payload_ram_we),
         .clka  (i_clk),
-        .wea   (payload_ram_we),
-        .rsta  (~i_rst_n),
-        .ocea  (1'b1),
         .dob   (o_payload_rd_data),
-        .dib   (8'h00),
         .addrb (i_payload_rd_addr),
         .ceb   (1'b1),
-        .clkb  (i_clk),
-        .web   (1'b0),
-        .rstb  (~i_rst_n),
-        .oceb  (1'b1)
+        .clkb  (i_clk)
     );
 
     always @(posedge i_clk) begin
@@ -225,24 +217,28 @@ module frame_parser #(
                 if (i_rx_valid) begin
                     case (state)
                         ST_SOF_0: begin
-                            /* 搜索帧头首字节。 */
+                            /* 搜索帧头首字节，并以 55 作为新一轮 CRC 的首字节。 */
                             if (i_rx_byte == 8'h55) begin
-                                state <= ST_SOF_1;
+                                state          <= ST_SOF_1;
+                                crc_init       <= 1'b1;
+                                crc_data       <= 8'h55;
+                                crc_data_valid <= 1'b1;
                             end
                         end
 
                         ST_SOF_1: begin
                             /* 不支持重叠匹配：第二字节错误时直接回到 ST_SOF_0。 */
                             if (i_rx_byte == 8'hAA) begin
-                                state    <= ST_ADDR;
-                                crc_init <= 1'b1;
+                                state          <= ST_ADDR;
+                                crc_data       <= 8'hAA;
+                                crc_data_valid <= 1'b1;
                             end else begin
                                 state <= ST_SOF_0;
                             end
                         end
 
                         ST_ADDR: begin
-                            /* 从 ADDR 开始将每个协议字节送入 CRC。 */
+                            /* SOF 已累计，继续将 ADDR 及后续协议字节送入 CRC。 */
                             o_addr         <= i_rx_byte;
                             crc_data       <= i_rx_byte;
                             crc_data_valid <= 1'b1;

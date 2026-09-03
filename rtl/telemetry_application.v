@@ -126,6 +126,12 @@ module telemetry_application (
         end
     endfunction
 
+    // 包含当前最后一个位图字节的通道总数，扩展为 16 位后再参与移位。
+    wire [15:0] selected_channel_count_with_current;
+    assign selected_channel_count_with_current =
+        {8'd0, selected_channel_count} +
+        {12'd0, f_count_byte(i_payload_rd_data)};
+
     always @(posedge i_clk or negedge i_rst_n) begin
         if (!i_rst_n) begin
             state                <= ST_IDLE;
@@ -199,8 +205,7 @@ module telemetry_application (
                                 selected_channel_count +
                                 f_count_byte(i_payload_rd_data);
                         if (o_payload_rd_addr == 11'd15) begin
-                            if (req_cmd ==
-                                `COMM_CMD_TELEMETRY_ENABLE) begin
+                            if (req_cmd == `COMM_CMD_TELEMETRY_ENABLE) begin
                                 // 全部位图收齐后一次提交，避免出现部分新配置。
                                 o_telemetry_enable <= request_mask_next;
                                 o_rsp_length       <= 16'd1;
@@ -209,11 +214,11 @@ module telemetry_application (
                                 read_mask          <= request_mask_next;
                                 channel_index      <= 7'd0;
                                 rsp_write_addr     <= 11'd1;
-                                o_rsp_length       <=
+                                // 每通道 6 字节等于 4+2，使用移位加法避免推断 DSP。
+                                o_rsp_length <=
                                     16'd1 +
-                                    (selected_channel_count +
-                                     f_count_byte(i_payload_rd_data)) *
-                                    16'd6;
+                                    (selected_channel_count_with_current << 2) +
+                                    (selected_channel_count_with_current << 1);
                                 state <= ST_READ_STATUS;
                             end
                         end else begin

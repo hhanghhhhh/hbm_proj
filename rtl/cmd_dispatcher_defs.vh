@@ -10,19 +10,20 @@
 `define COMM_CLASS_CONFIG         4'h1
 `define COMM_CLASS_TELEMETRY      4'h2
 `define COMM_CLASS_PARAM          4'hA
-`define COMM_CLASS_CTRL           4'hB
+`define COMM_CLASS_CTRL           4'h3
 
 `define COMM_MODULE_NONE          4'h0
 `define COMM_MODULE_CONFIG        4'h1
 `define COMM_MODULE_TELEMETRY     4'h2
 `define COMM_MODULE_PARAM         4'hA
-`define COMM_MODULE_CTRL          4'hB
+`define COMM_MODULE_CTRL          4'h3
 
 
 `define COMM_CMD_PARAM_READ       8'hA0
 `define COMM_CMD_PARAM_WRITE      8'hA1
-`define COMM_CMD_CTRL_READ        8'hB0
-`define COMM_CMD_CTRL_WRITE       8'hB1
+`define COMM_CMD_DEBUG_EN_WRITE   8'h30
+`define COMM_CMD_EN_SEQUENCE_DATA 8'h31
+`define COMM_CMD_EN_SEQUENCE_START 8'h32
 
 /* 配置业务子命令；BUS 位于 Payload，由配置业务模块解析。 */
 `define COMM_CMD_CONFIG_DATA      8'h10

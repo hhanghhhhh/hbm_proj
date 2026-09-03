@@ -8,9 +8,10 @@
  * - 不负责：划分帧边界、选择参与计算的字段或规定 CRC 的传输字节序。
  *
  * 输入事务：
- * - i_init=1 在当前上升沿开始一次新的累计，装载初值 16'hFFFF。
+ * - i_init=1 在当前上升沿开始一次新的累计，初值为 16'hFFFF。
  * - i_data_valid=1 时在当前上升沿接收 i_data，并基于此前 o_crc 累计一个字节。
- * - i_init 与 i_data_valid 同拍有效时只执行初始化，该字节不参与累计。
+ * - i_init 与 i_data_valid 同拍有效时，以 16'hFFFF 为初值累计该字节，使调用者可在
+ *   帧首字节到达时同时启动新一轮 CRC。
  *
  * 输出事务：
  * - 每接收一个有效字节，o_crc 在该上升沿后更新为包含该字节的 CRC。
@@ -58,11 +59,15 @@ module crc16_modbus (
     endfunction
 
     always @(posedge i_clk) begin
-        /* 同步低有效复位；初始化请求优先于数据累计。 */
+        /* 同步低有效复位；初始化与数据同拍时从初值累计当前字节。 */
         if (!i_rst_n) begin
             o_crc <= 16'hFFFF;
         end else if (i_init) begin
-            o_crc <= 16'hFFFF;
+            if (i_data_valid) begin
+                o_crc <= next_crc16_modbus(16'hFFFF, i_data);
+            end else begin
+                o_crc <= 16'hFFFF;
+            end
         end else if (i_data_valid) begin
             o_crc <= next_crc16_modbus(o_crc, i_data);
         end

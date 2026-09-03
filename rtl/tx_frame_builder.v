@@ -5,7 +5,7 @@
  *
  * 模块职责：
  * - 缓存响应 Payload，组装完整协议响应帧，并控制逐字节 UART 握手和 RS485 方向。
- * - 对 ADDR 至 PAYLOAD 的实际发送字节计算 CRC-16/MODBUS。
+ * - 对 SOF(55 AA) 至 PAYLOAD 的实际发送字节计算 CRC-16/MODBUS。
  * - 不负责：产生业务响应、检查响应长度、缓存多个响应、重试或配置 UART 波特率。
  *
  * 输入事务：
@@ -15,7 +15,7 @@
  *
  * 输出事务：
  * - 帧顺序为 55 AA|ADDR|CMD|SEQ|LENGTH_H|LENGTH_L|PAYLOAD|CRC_H|CRC_L。
- * - CRC 不含 SOF 和 CRC 字段；CRC 字段以高字节在前发送。
+ * - CRC 包含两个 SOF 字节，不包含 CRC 字段；CRC 字段以高字节在前发送。
  * - o_tx_valid 保持到与 i_tx_ready 握手；阻塞期间 o_tx_byte 保持当前字节。
  * - 最后 CRC 字节的 UART 停止位完成并经过后延时后，释放方向并产生 1clk o_tx_done。
  *
@@ -105,9 +105,9 @@ module tx_frame_builder #(
     assign o_tx_valid = tx_valid && !i_abort;
     assign tx_accept = o_tx_valid && i_tx_ready;
 
-    /* 头部索引 0/1 为 SOF，其余为 ADDR/CMD/SEQ/LENGTH。 */
+    /* 头部索引 0/1 为 SOF，其余为 ADDR/CMD/SEQ/LENGTH；全部参与 CRC。 */
     assign crc_data_valid = tx_accept &&
-                            (((state == ST_HEADER) && (header_index >= 3'd2)) ||
+                            ((state == ST_HEADER) ||
                              (state == ST_PAYLOAD_SEND));
 
     crc16_modbus u_crc16_modbus (
@@ -120,23 +120,15 @@ module tx_frame_builder #(
     );
 
     /* A 口由业务响应源写入，B 口由发送状态机同步读取，不清空 RAM 内容。 */
-    ip_ram_uart_tx u_response_ram (
-        .doa   (),
+    ip_ram_uart u_response_ram (
         .dia   (i_rsp_wr_data),
         .addra (i_rsp_wr_addr),
-        .cea   (1'b1),
+        .cea   (i_rsp_wr_en),
         .clka  (i_clk),
-        .wea   (i_rsp_wr_en),
-        .rsta  (~i_rst_n),
-        .ocea  (1'b1),
         .dob   (ram_rd_data),
-        .dib   (8'd0),
         .addrb (ram_rd_addr),
         .ceb   (1'b1),
-        .clkb  (i_clk),
-        .web   (1'b0),
-        .rstb  (~i_rst_n),
-        .oceb  (1'b1)
+        .clkb  (i_clk)
     );
 
     always @(posedge i_clk or negedge i_rst_n) begin
