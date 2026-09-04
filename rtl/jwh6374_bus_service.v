@@ -11,14 +11,18 @@
  * 关键数据：
  * - device_id[5:3] 为 TCA 支路，device_id[2:0] 为地址槽；器件地址为
  *   P_JWH_ADDR_BASE + device_id[2:0]。
- * - 32 位配置记录为 PAGE[31:30]、OP[29:27]、COMMAND[26:19]、DATA[18:3]
- *   和 RESERVED[2:0]；成功记录在同索引结果 RAM 写入 16 位读值，写操作写 0。
- * - 遥测 RAM 地址为 {device_id[5:0], rail, item[1:0]}，item 0/1/2 分别表示
- *   STATUS_WORD、READ_VOUT、READ_IOUT；数据同时保存有效位和总线错误信息。
+ * - 32 位配置记录为 PAGE[31:30]、OP[29:27]、COMMAND[26:19]、DATA[18:3]、RESERVED[2:0]；
+ * - 成功记录在同索引结果 RAM 写入 16 位读值，写操作写 0。
+ * - 遥测 RAM 地址：{device_id[5:0], rail, item[1:0]}；
+ *   item 0/1/2 = STATUS_WORD / READ_VOUT / READ_IOUT。
+ * - 遥测 RAM 数据：
+ *   [31] VALID，[30] BUS_ERROR，[24:20] BUS_ERROR_CODE，[15:0] RAW_DATA，
+ *   其余位保留为 0。
  *
  * 关键约束：
- * - 每条记录必须显式携带 PAGE；配置 RAM 禁止直接写 PAGE 命令 00h，
- *   也禁止以 Send Byte 写 STORE_USER_ALL 命令 15h，这两项由本模块统一管理。
+ * - 配置记录禁止直接使用 PAGE 命令 00h；
+     PAGE 由每条记录的 PAGE 字段指定，
+     也禁止以 Send Byte 写 STORE_USER_ALL 命令 15h，这两项由本模块统一管理。
  * - 配置模式受 i_config_allowed 限制，在线访问不受此限制。
  * - 配置模式请求固化时，全部普通记录成功后按 PAGE0、PAGE1、PAGE2 依次执行
  *   STORE、MTP_BUSY 轮询和 CRC 读取；o_cfg_last_mtp_crc 最终保留 PAGE2 CRC。

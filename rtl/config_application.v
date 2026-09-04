@@ -2,47 +2,32 @@
 `include "cmd_dispatcher_defs.vh"
 
 /*
- * Module Contract
+ * 模块说明
  *
- * 模块职责：
- * - 解析配置类请求，为一条选定总线写配置记录、提交配置任务、查询状态或读取结果。
- * - 驱动外部配置 RAM、service 启动握手和结果 RAM 读接口，并生成正常/错误响应事件。
- * - 不负责：例化 RAM/service、解释 32 位配置记录、转换设备地址或取消已接收的后台任务。
+ * 功能：
+ * - 处理配置记录写入、配置任务启动、总线状态查询和配置结果回读命令。
+ * - 单次请求只选择一条 BUS；本模块驱动外部配置/结果 RAM 和 service 接口，
+ *   不解释 32 位配置记录内容，也不负责取消已被 service 接收的任务。
  *
- * 输入事务：
- * - 空闲时 i_req_valid=1 开始事务；处理期间忽略新请求，Payload RAM 读延迟按 1clk 处理。
- * - CONFIG_DATA：BUS(1)|OFFSET(2)|DATA(4*N)，N>=1；OFFSET 和记录均为大端。
- * - CONFIG_START：BUS(1)|I2C_ADDR(1)|CONFIG_LENGTH(2)|STORE_FLASH(1)|CONFIG_MODE(1)。
- * - CONFIG_STATUS：LENGTH=0；CONFIG_RESULT_READ：BUS(1)|OFFSET(2)|LENGTH(2)。
- * - BUS 必须小于 BUS_COUNT；未知命令、字段长度或范围非法时提交公共错误事件。
+ * 关键数据：
+ * - CONFIG_DATA Payload 为 BUS(1) | OFFSET(2) | DATA(4*N)，多字节字段均为大端；
+ *   OFFSET 以 32 位记录为单位，N>=1，写入范围不得越过 1024 项 RAM。
+ * - CONFIG_START Payload 为 BUS(1) | I2C_ADDR(1) | CONFIG_LENGTH(2) |
+ *   STORE_FLASH(1) | CONFIG_MODE(1)；设备号限定为 0..7，记录数最大为 1024。
+ * - CONFIG_STATUS 无 Payload，返回 STATUS 和 i_cfg_ok 快照；bit[n]=1 表示 BUSn 正常。
+ * - CONFIG_RESULT_READ Payload 为 BUS(1) | OFFSET(2) | LENGTH(2)，OFFSET/LENGTH
+ *   以 16 位结果项为单位；返回 STATUS 后跟随按地址递增的 16 位大端结果。
  *
- * 输出事务：
- * - CONFIG_DATA 将每四个数据字节组为一条 32 位记录，从 OFFSET 起连续写外部 RAM。
- * - CONFIG_START 收齐参数后保持 o_cfg_start 及参数稳定，直到 o_cfg_start&&i_cfg_ready 握手。
- * - DATA/START 成功返回单字节 STATUS_SUCCESS；STATUS 返回 STATUS_SUCCESS 和 i_cfg_ok 快照。
- * - RESULT_READ 返回 STATUS_SUCCESS，随后按地址递增返回指定数量的 16 位大端结果。
- * - 正常响应写完后产生 1clk o_rsp_valid；错误产生 1clk o_error_valid 且不提交正常响应。
+ * 关键约束：
+ * - BUS 必须处于 0..BUS_COUNT-1，BUS_COUNT 支持 1..8。
+ * - 结果读取 LENGTH 为 1..1023，且 OFFSET+LENGTH 不得超过 1024；读取期间
+ *   上层应避免目标 service 同时写结果 RAM。
+ * - service 执行期间不得覆盖其配置 RAM，也不得对同一总线重复启动任务。
  *
- * 关键时序：
- * - o_cfg_ram_wr_en、o_cfg_result_rd_en、o_rsp_wr_en 均为 1clk pulse，接口均无反压。
- * - 结果 RAM 读请求保持一拍，并再等待一拍后采样 i_cfg_result_rd_data。
- * - o_cfg_start 是可等待 ready 的电平，不是单周期 pulse；abort 同拍会组合屏蔽该信号。
- * - 最后一个响应写脉冲被外部 RAM 接收后，下一阶段才产生 o_rsp_valid。
- *
- * 异常与恢复：
- * - reset：异步低有效，回到空闲，清除事件、启动请求和输出参数。
- * - abort：取消未完成的解析、结果读取或尚未握手的启动请求，不产生完成事件。
- * - abort 不回滚已写配置记录/响应字节，也不取消此前已被 service 接收的任务。
- *
- * 使用约束：
- * - BUS_COUNT 限定为 1..8；配置和结果 RAM 均按 1024 项容量使用。
- * - CONFIG_DATA 不得越过记录 RAM 末尾；RESULT_READ 数量为 1..1023 且范围不得越界。
- * - 上层必须保证单事务，service 执行期间不覆盖其配置 RAM，并避免读取正在写的结果。
- * - I2C_ADDR 仅使用低 6 位，CONFIG_LENGTH 仅使用低 11 位，两个标志仅使用 bit0。
- *
- * 参考：
- * - CMD_DEFINITION.md：配置类命令、Payload 与错误码定义。
- * - DUT_POWER_CONTROL_FLOW.md：配置任务与后台 service 的系统级时序。
+ * 特殊行为：
+ * - CONFIG_START 的成功响应表示启动参数已被 service 接收，不表示配置任务已完成。
+ * - o_cfg_start 在 service 暂时不 ready 时持续等待并保持参数；i_abort 可取消尚未
+ *   握手的启动，但不回滚已写 RAM，也不取消此前已接收的后台任务。
  */
 module config_application #(
     parameter integer BUS_COUNT = 8
