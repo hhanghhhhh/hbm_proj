@@ -1,39 +1,25 @@
 `timescale 1ns / 1ps
 
 /*
- * Module Contract
+ * 模块说明
  *
- * 模块职责：
- * - 封装一条物理 I2C 总线的配置命令 RAM、结果 RAM、遥测 RAM 和业务 service。
- * - 提供通信侧配置写入/结果读取、遥测读取以及开漏式 I2C 引脚连接。
- * - 不负责：识别通信 CMD/BUS、解释结果数据、生成上层响应或取消已接收任务。
+ * 功能：
+ * - 封装一条物理 I2C 总线所需的配置命令 RAM、结果 RAM、遥测 RAM 和
+ *   jwh6374_bus_service，并提供通信侧读写接口及开漏引脚连接。
  *
- * 输入事务：
- * - i_cfg_ram_wr_en 在当前上升沿向 1024x32 命令 RAM 写入一条配置记录。
- * - 空闲 ready 下的 i_cfg_start 及参数由内部 service 接收，执行单颗器件任务。
- * - i_cfg_result_rd_en 和 i_tel_rd_en 分别发起结果 RAM 与遥测 RAM 的同步读取。
+ * 关键数据：
+ * - 配置命令 RAM 为 1024x32，结果 RAM 为 1024x16，遥测 RAM 为 512x32。
+ * - i_telemetry_enable 的 16 位分别控制本总线 8 个设备的两个 Rail。
  *
- * 输出事务：
- * - 配置完成信息、错误位置和最后 MTP CRC 原样输出自 service。
- * - 结果 RAM 为 1024x16，遥测 RAM 为 512x32；读数据保持各 RAM 的同步读时序。
- * - i_telemetry_enable 的 16 位分别控制本总线 8 个设备的两个 Rail 后台采集。
+ * 关键约束：
+ * - 外部必须预先完成 BUS 选择；同一任务执行期间不得覆盖命令 RAM 或重复启动。
+ * - io_i2c_scl/io_i2c_sda 为开漏三态连接，必须依赖板级上拉。
+ * - 工程必须提供三个真实 RAM IP 以及 service/controller 依赖源码。
  *
- * 关键时序：
- * - service 响应在本模块内固定 ready=1，o_cfg_resp_valid 可能仅保持到下一拍握手。
- * - SMB_ALERT 输入固定为无告警，因此本实例不会输出有效告警调查结果。
- * - io_i2c_scl/io_i2c_sda 以三态输出实现开漏连接，释放时由板级上拉维持高电平。
- *
- * 异常与恢复：
- * - reset：异步低有效，由各 RAM/service 按其接口复位行为处理。
- * - service 的 i_clear 固定为 0；通信 abort 不会通过本模块撤销 I2C 任务。
- *
- * 使用约束：
- * - 外部必须已按 BUS 选通写/启动/读使能，且同一任务执行期间不得覆盖命令 RAM。
- * - 所有接口使用 i_clk；工程必须提供三个真实 RAM IP 及 service/controller 依赖。
- * - TCA 和设备号到物理地址的语义由内部 service 及参数决定。
- *
- * 参考：
- * - DUT_POWER_CONTROL_FLOW.md：单总线配置执行与遥测存储流程。
+ * 特殊行为：
+ * - service 响应在内部固定 ready=1，外部需要在 o_cfg_resp_valid 有效时锁存结果。
+ * - service 的 clear 固定无效，SMB_ALERT# 固定为无告警；通信侧中止不会取消
+ *   已被 service 接收的 I2C 任务。
  */
 module i2c_bus_unit #(
     parameter integer CLK_FREQ_HZ = 100000000,

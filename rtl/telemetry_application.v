@@ -2,45 +2,28 @@
 `include "cmd_dispatcher_defs.vh"
 
 /*
- * Module Contract
+ * 模块说明
  *
- * 模块职责：
- * - 处理 128 通道遥测使能位图更新和按位图选择的遥测回读请求。
- * - 访问外部遥测 RAM，并将所选通道数据写入响应 RAM 接口。
- * - 不负责：采集或冻结遥测数据、保存外部 RAM、组帧或等待 UART 发送完成。
+ * 功能：
+ * - 处理 128 通道遥测使能位图更新和按位图选择的遥测回读；本模块只读取
+ *   外部遥测 RAM，不负责采集或冻结数据。
  *
- * 输入事务：
- * - 空闲时 i_req_valid=1 开始事务；处理期间忽略新请求。
- * - TELEMETRY_ENABLE 和 TELEMETRY_READ 均要求 LENGTH=16，Payload 为大端 128 位位图。
- * - Payload 首字节对应 bit[127:120]，末字节对应 bit[7:0]；bit[n] 选择通道 n。
- * - 未知命令或长度错误产生公共错误事件，不开始正常响应。
+ * 关键数据：
+ * - ENABLE 和 READ Payload 均为 16 字节大端位图，首字节对应 bit[127:120]；
+ *   bit[n] 映射为 BUS=n[6:4]、DEVICE_ID=n[3:1]、RAIL=n[0]。
+ * - ENABLE 位图完整收齐后一次性更新，避免出现部分新配置。
+ * - READ 按通道号 0..127 返回置位通道，
+ *   每通道为 VOLTAGE(2) | CURRENT(2) | STATUS(2)，
+ *   各字段均取 RAM 低 16 位并按大端输出。
+ * - 选择全部 128 个通道时，响应 Payload 长度为 1 + 128×6 = 769 字节。
  *
- * 输出事务：
- * - ENABLE 收齐全部位图后一次性更新 o_telemetry_enable，并返回 STATUS_SUCCESS。
- * - READ 先返回 STATUS_SUCCESS，再按通道号 0..127 返回所有置位通道的数据。
- * - 每通道返回 VOLTAGE(2)|CURRENT(2)|STATUS(2)，三个 16 位字段均为大端。
- * - READ_MASK=0 时只返回 STATUS；全通道响应长度为 769 字节。
- * - 正常响应写完后产生 1clk o_rsp_valid；错误产生 1clk o_error_valid。
+ * 关键约束：
+ * - 回读期间不会冻结后台遥测；同一响应中的不同通道或不同项目可能来自
+ *   不同采样时刻，使用方不得将其视为原子快照。
  *
- * 关键时序：
- * - 请求 Payload RAM 按 1clk 同步读延迟访问；o_rsp_wr_en 写接口无反压。
- * - 每个遥测项以 1clk o_tel_rd_en 发起同步读，再等待一拍后采样 i_tel_rd_data。
- * - 通道 n 映射为 BUS=n[6:4]、DEVICE_ID=n[3:1]、RAIL=n[0]。
- * - 每项外部 RAM 数据只取低 16 位；最后一次响应写入被接收后才提交 o_rsp_valid。
- *
- * 异常与恢复：
- * - reset：异步低有效，回到空闲并清除遥测使能位图和所有事件输出。
- * - abort：取消当前位图解析或回读，不产生完成事件。
- * - abort 不回滚已完整提交的使能位图，也不清除外部响应 RAM 已接收的数据。
- *
- * 使用约束：
- * - 上层必须保证单事务，并保持请求 Payload 在处理期间有效。
- * - 回读不会冻结后台采集，同一响应内不同通道或项目可能来自不同采样时刻。
- * - i_req_seq 未被使用；响应 CMD/SEQ 由外部发送链路沿用当前请求。
- *
- * 参考：
- * - CMD_DEFINITION.md：遥测命令、位图和响应字段定义。
- * - DUT_POWER_CONTROL_FLOW.md：遥测采集与总线通道映射。
+ * 特殊行为：
+ * - i_abort 可取消正在解析或回读的请求，但不回滚已完整提交的使能位图，
+ *   也不清除已写入外部响应 RAM 的字节。
  */
 module telemetry_application (
     input  wire         i_clk,
@@ -273,22 +256,19 @@ module telemetry_application (
                     ST_TEL_CAPTURE: begin
                         case (tel_item)
                             TEL_VOLTAGE: begin
-                                voltage_data <= i_tel_rd_data[15:0];
-                                tel_item     <= TEL_CURRENT;
-                                o_tel_rd_addr[1:0] <=
-                                    f_ram_item(TEL_CURRENT);
+                                voltage_data        <= i_tel_rd_data[15:0];
+                                tel_item            <= TEL_CURRENT;
+                                o_tel_rd_addr[1:0]  <= f_ram_item(TEL_CURRENT);
                                 state <= ST_TEL_RAM_REQ;
                             end
                             TEL_CURRENT: begin
-                                current_data <= i_tel_rd_data[15:0];
-                                tel_item     <= TEL_STATUS;
-                                o_tel_rd_addr[1:0] <=
-                                    f_ram_item(TEL_STATUS);
+                                current_data        <= i_tel_rd_data[15:0];
+                                tel_item            <= TEL_STATUS;
+                                o_tel_rd_addr[1:0]  <= f_ram_item(TEL_STATUS);
                                 state <= ST_TEL_RAM_REQ;
                             end
                             default: begin
-                                status_data        <=
-                                    i_tel_rd_data[15:0];
+                                status_data        <= i_tel_rd_data[15:0];
                                 channel_byte_index <= 3'd0;
                                 state              <= ST_CHANNEL_WRITE;
                             end

@@ -2,11 +2,25 @@
 `include "cmd_dispatcher_defs.vh"
 
 /*
- * EN 控制业务。
- * - 30：接收 16 字节大端 EN_STATE，直接更新 128 路 EN 状态。
- * - 31：接收 OFFSET(2)+DATA(2*N)，向 1024x16 时序 RAM 连续写入。
- * - 32：接收 SEQUENCE_ID(1)，向序列控制器提交启动脉冲。
- * 完整数据收齐后再提交控制输出；所有成功响应均为 STATUS(1)。
+ * 模块说明
+ *
+ * 功能：
+ * - 处理 128 路 EN 直接控制、EN 序列 RAM 写入和序列启动命令；三类命令
+ *   成功时均返回单字节 STATUS_SUCCESS。
+ *
+ * 关键数据：
+ * - 0x30 Payload 为 16 字节大端 EN_STATE，首字节对应 bit[127:120]；完整
+ *   收齐后一次性更新 o_en_state，不暴露部分更新状态。
+ * - 0x31 Payload 为 OFFSET(2) | DATA(2*N)，OFFSET 和 DATA 均为大端
+ *   16 位 word；N>=1，写入范围不得越过 1024x16 序列 RAM。
+ * - 0x32 Payload 为单字节 SEQUENCE_ID，仅低 4 位传给序列控制器。
+ *
+ * 关键约束：
+ * - 序列启动接口没有 ready/完成回传；上层必须保证控制器可接收启动，
+ *   本模块的成功响应只表示启动脉冲已经发出。
+ *
+ * 特殊行为：
+ * - i_abort 取消当前命令，但不回滚已更新的 EN 状态或已写入的序列 RAM。
  */
 module en_control_application (
     input  wire         i_clk,

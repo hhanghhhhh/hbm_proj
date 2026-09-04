@@ -1,33 +1,31 @@
 `timescale 1ns / 1ps
 
 /*
-128 路 EN 绝对状态序列执行器。
-
-RAM 容量计算（默认参数）：
-    目录：2 sequence * 1 word                 =   2 words
-    步骤：2 sequence * 32 steps * 9 words     = 576 words
-    合计：578 * 16 bit                        = 9248 bits
-    地址范围：RAM[0..577]，因此地址口需要 10 bit。
-    若 RAM 按 2^N 深度配置，则为 1024 * 16 bit，RAM[578..1023] 未使用。
-
-RAM 数据宽度为 16 bit，地址单位为 16-bit word。目录固定放在
-RAM[0..1]，每个序列占一个 word：
-    bit[15]    Reserved，必须为 0
-    bit[14:9]  StepCount，合法范围 0..32；0 表示空目录
-    bit[8:6]   Reserved，必须为 0
-    bit[5:0]   StartStepNumber，0-based，合法范围 0..63
-
-序列号、步骤号和 RAM 地址全部使用 0-based 编号。步骤编号不直接作为
-RAM 地址输出，控制器内部使用移位加法换算：
-    address = 2 + (StartStepNumber << 3) + StartStepNumber
-
-每一步固定占九个 word：
-    word 0..7 = EN_State[15:0] .. EN_State[127:112]
-    word 8    = Delay_ms，1 LSB = 1 ms
-
-九个同步 RAM 读请求背靠背发出；完整步骤缓存后，一拍原子更新全部
-128 路 EN。i_emergency_off 或 i_clear 会立即中止并清零全部 EN。
-*/
+ * 模块说明
+ *
+ * 功能：
+ * - 从内部 16 位 RAM 读取并执行 128 路 EN 绝对状态序列；每一步完整
+ *   缓存后原子更新全部 EN，再按毫秒延时进入下一步。
+ *
+ * 关键数据：
+ * - RAM 地址、序列号和步骤号均为 0-based。前 P_SEQUENCE_COUNT 个 word
+ *   为目录：Reserved[15]、StepCount[14:9]、Reserved[8:6]、StartStep[5:0]。
+ * - 每一步固定占 9 个 word：word 0..7 依次对应 EN_State[127:112] 至
+ *   EN_State[15:0]，word 8 为 Delay_ms，1 LSB=1 ms。
+ * - 步骤首地址为 P_SEQUENCE_COUNT + StartStepNumber*9；默认 2 个序列、
+ *   每序列最多 32 步，共使用 578 个 16 位 word。
+ * - 控制器内部使用移位加法换算：
+ *   address = P_SEQUENCE_COUNT + (StartStepNumber << 3) + StartStepNumber
+ * - 第一个序列的 StartStepNumber 就是 0，实际程序执行从 P_SEQUENCE_COUNT ram 地址开始取值
+ * 关键约束：
+ * - 非空目录的 Reserved 必须为 0，StepCount 不得超过 P_MAX_STEPS，且
+ *   StartStepNumber、末步骤和 RAM 结束地址均不得越界；空目录必须全 0。
+ * - 执行期间不得改写当前序列使用的 RAM 区域。
+ *
+ * 特殊行为：
+ * - 空目录正常完成且不改变 EN；非法序列号或目录产生 error 和 done。
+ * - i_emergency_off 或 i_clear 会立即中止序列并清零全部 EN，不产生完成事件。
+ */
 
 module en_sequence_controller #(
     parameter integer P_SYS_CLK_FREQ   = 100_000_000,
@@ -239,14 +237,14 @@ module en_sequence_controller #(
 
                     if (r_response_valid) begin
                         case (r_capture_count)
-                            4'd0: r_next_en_state[15:0]    <= w_ram_rd_data;
-                            4'd1: r_next_en_state[31:16]   <= w_ram_rd_data;
-                            4'd2: r_next_en_state[47:32]   <= w_ram_rd_data;
-                            4'd3: r_next_en_state[63:48]   <= w_ram_rd_data;
-                            4'd4: r_next_en_state[79:64]   <= w_ram_rd_data;
-                            4'd5: r_next_en_state[95:80]   <= w_ram_rd_data;
-                            4'd6: r_next_en_state[111:96]  <= w_ram_rd_data;
-                            4'd7: r_next_en_state[127:112] <= w_ram_rd_data;
+                            4'd0: r_next_en_state[127:112] <= w_ram_rd_data;
+                            4'd1: r_next_en_state[111:96]  <= w_ram_rd_data;
+                            4'd2: r_next_en_state[95:80]   <= w_ram_rd_data;
+                            4'd3: r_next_en_state[79:64]   <= w_ram_rd_data;
+                            4'd4: r_next_en_state[63:48]   <= w_ram_rd_data;
+                            4'd5: r_next_en_state[47:32]   <= w_ram_rd_data;
+                            4'd6: r_next_en_state[31:16]   <= w_ram_rd_data;
+                            4'd7: r_next_en_state[15:0]    <= w_ram_rd_data;
                             4'd8: r_delay_units            <= w_ram_rd_data;
                             default: begin end
                         endcase

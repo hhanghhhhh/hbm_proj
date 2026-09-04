@@ -1,43 +1,27 @@
 `timescale 1ns / 1ps
 
 /*
- * Module Contract
+ * 模块说明
  *
- * 模块职责：
- * - 缓存响应 Payload，组装完整协议响应帧，并控制逐字节 UART 握手和 RS485 方向。
- * - 对 SOF(55 AA) 至 PAYLOAD 的实际发送字节计算 CRC-16/MODBUS。
- * - 不负责：产生业务响应、检查响应长度、缓存多个响应、重试或配置 UART 波特率。
+ * 功能：
+ * - 缓存响应 Payload，组装协议响应帧，并控制逐字节 UART 发送及 RS485 方向。
  *
- * 输入事务：
- * - 上游先用 i_rsp_wr_en 将全部 Payload 写入内部 2048x8 RAM，再以 i_rsp_valid 提交。
- * - 空闲时 i_rsp_valid=1 的上升沿锁存 i_req_addr/i_req_cmd/i_req_seq/i_rsp_length。
- * - 发送期间不接收或排队新的响应提交；LENGTH 允许为 0。
+ * 关键数据：
+ * - 帧格式为 55 AA | ADDR | CMD | SEQ | LENGTH_H | LENGTH_L | PAYLOAD |
+ *   CRC_H | CRC_L；CRC-16/MODBUS 覆盖两个 SOF 字节至 Payload。
+ * - 内部响应 RAM 为 2048x8；上游必须先写完 Payload，再提交 i_rsp_valid。
  *
- * 输出事务：
- * - 帧顺序为 55 AA|ADDR|CMD|SEQ|LENGTH_H|LENGTH_L|PAYLOAD|CRC_H|CRC_L。
- * - CRC 包含两个 SOF 字节，不包含 CRC 字段；CRC 字段以高字节在前发送。
- * - o_tx_valid 保持到与 i_tx_ready 握手；阻塞期间 o_tx_byte 保持当前字节。
- * - 最后 CRC 字节的 UART 停止位完成并经过后延时后，释放方向并产生 1clk o_tx_done。
+ * 关键约束：
+ * - 系统只允许一个响应在途，发送期间上游不得改写 RAM 或提交新响应。
+ * - i_tx_ready 必须表示 UART 物理发送完全空闲，在当前字节停止位结束前保持为 0，
+ *   不能连接为带 FIFO 发送器的“可继续写入”指示。
+ * - RS485 前后延时参数必须按实际收发器和板级方向切换要求设置。
  *
- * 关键时序：
- * - 提交后先置 o_rs485_tx_en=1并等待 PRE_DELAY_CYCLES，之后才提交首字节。
- * - Payload RAM B 口为同步读，地址更新后等待一拍再加载发送字节。
- * - i_tx_ready 必须表示 UART 完全空闲；每次握手后需保持低直到该字节停止位结束。
- * - 完整帧发送后等待 UART ready，再执行 POST_DELAY_CYCLES 并将 o_rs485_tx_en 清零。
- *
- * 异常与恢复：
- * - reset：异步低有效，立即撤销 valid、释放 RS485 方向并回到空闲。
- * - abort：同拍屏蔽新 UART 握手，停止后续字节；已被 UART 接收的字节允许发送完。
- * - 若 abort 时已进入发送方向，模块等待 UART 空闲及后延时后释放方向，不产生 o_tx_done。
- *
- * 使用约束：
- * - 上层必须保证单事务、Payload 长度不超过 RAM 容量，且发送期间不写 RAM。
- * - o_tx_done 才表示总线方向已释放；主机不能仅凭收到最后字节立即驱动总线。
- * - 前后延时参数必须按实际 RS485 收发器使能/关断时间和板级约束设置。
- *
- * 参考：
- * - COMMUNICATION_PROTOCOL.md：响应帧格式和 CRC 覆盖范围。
- * - TX_FRAME_BUILDER.md：发送链路与 RS485 方向时序。
+ * 特殊行为：
+ * - o_tx_done 在最后字节停止位结束、后延时完成且 RS485 已切回接收后产生；
+ *   主机不能仅凭收到最后一个字节立即驱动总线。
+ * - i_abort 停止提交后续字节，但允许 UART 发完已接收字节，再经后延时释放方向；
+ *   被中止的事务不产生 o_tx_done。
  */
 module tx_frame_builder #(
     parameter integer CLK_FREQ_HZ        = 100000000,
