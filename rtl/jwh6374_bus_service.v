@@ -2,64 +2,33 @@
 `include "jwh6374_common_defs.vh"
 
 /*
-
- * Module Contract
+ * 模块说明
  *
- * 模块职责：
- * - 在一条物理 I2C 总线上顺序执行单颗 JWH6374 的配置或在线访问记录表。
- * - 可在配置成功后依次固化三个 PAGE，轮询 MTP_BUSY 并读取 MTP CRC。
- * - 空闲时按使能位图轮询 8 个设备的双 Rail 遥测，并调查 SMB_ALERT 下降沿。
- * - 不负责：保存配置/结果/遥测 RAM、生成通信响应或跨物理总线仲裁。
+ * 功能：
+ * - 管理一条物理 I2C 总线，顺序执行单颗 JWH6374 的配置或在线访问记录表。
+ * - 总线空闲时轮询遥测，并在 SMB_ALERT# 下降沿后通过 ARA 定位告警器件。
  *
- * 输入事务：
- * - o_cfg_ready=1 时，i_cfg_start=1 的上升沿采样模式、设备号、记录数和固化标志。
- * - 记录数必须为 1..P_MAX_CFG_RECORDS；配置模式还要求 i_config_allowed=1。
- * - 32 位记录字段为 PAGE[31:30]、OP[29:27]、COMMAND[26:19]、DATA[18:3]、RESERVED[2:0]。
- * - RESERVED 必须为 0，PAGE/OP 必须合法，记录不得直接写 PAGE 命令 00h 或 STORE 15h。
+ * 关键数据：
+ * - device_id[5:3] 为 TCA 支路，device_id[2:0] 为地址槽；器件地址为
+ *   P_JWH_ADDR_BASE + device_id[2:0]。
+ * - 32 位配置记录为 PAGE[31:30]、OP[29:27]、COMMAND[26:19]、DATA[18:3]
+ *   和 RESERVED[2:0]；成功记录在同索引结果 RAM 写入 16 位读值，写操作写 0。
+ * - 遥测 RAM 地址为 {device_id[5:0], rail, item[1:0]}，item 0/1/2 分别表示
+ *   STATUS_WORD、READ_VOUT、READ_IOUT；数据同时保存有效位和总线错误信息。
  *
- * 输出事务：
- * - 每条成功记录向同索引结果 RAM 写 16 位结果；读操作写回数据，写/Send 写 0。
- * - 任务结束后保持 o_cfg_resp_valid 及错误信息，直到与 i_cfg_resp_ready 握手。
- * - 遥测轮询把状态/电压/电流及总线错误写到 o_tel_wr_*；每次只执行一个项目后让出仲裁。
- * - 告警报告保持支路号和设备位图，直到 valid/ready 握手。
- *
- * 关键时序：
+ * 关键约束：
+ * - 每条记录必须显式携带 PAGE；配置 RAM 禁止直接写 PAGE 命令 00h，
+ *   也禁止以 Send Byte 写 STORE_USER_ALL 命令 15h，这两项由本模块统一管理。
+ * - 配置模式受 i_config_allowed 限制，在线访问不受此限制。
+ * - 配置模式请求固化时，全部普通记录成功后按 PAGE0、PAGE1、PAGE2 依次执行
+ *   STORE、MTP_BUSY 轮询和 CRC 读取；o_cfg_last_mtp_crc 最终保留 PAGE2 CRC。
  * - 空闲仲裁优先级固定为配置/在线任务、已锁存告警、后台遥测。
- * - 配置 RAM 为同步读：读使能一拍，等待一拍后捕获记录。
- * - 下层总线请求 valid 保持到 ready；响应由 controller 的 valid 事件返回。
- * - 配置且 store_after=1 时，普通记录全部成功后依次执行 PAGE0/1/2 的 STORE、忙轮询和 CRC 读。
  *
- * 异常与恢复：
- * - reset：异步低有效，清除在途任务、事件、错误信息、告警锁存和总线请求。
- * - clear：同步回到空闲并撤销对外 valid/使能；告警同步链和待处理位同时清零。
- * - 记录、许可、数量、总线或 MTP 超时错误终止当前任务，并在配置响应中报告首个失败索引。
- * - MTP_BUSY 轮询期间仅地址/命令/数据 NACK 可重试，其他总线错误直接结束任务。
- *
- * 使用约束：
- * - 配置模式仅在外部确认设备允许配置时启动；在线模式不检查 i_config_allowed。
- * - i_cfg_* 参数必须从启动握手到被采样保持稳定，RAM 内容在任务执行期间不得覆盖。
- * - 本参考实现遥测设备号固定轮询 0..7；配置设备号仍使用完整 6 位输入。
- * - JWH 地址为 P_JWH_ADDR_BASE 加 device_id 低三位，device_id 高三位选择 TCA 支路。
- *
- * 参考：
- * - DUT_POWER_CONTROL_FLOW.md：配置、固化、遥测和告警的系统流程。
- * - DUT_POWER_CONTROL.md：JWH6374 访问约束和错误处理。
-
-
-本地设备号：device_id[5:0] = {TCA channel[2:0], address slot[2:0]}。
-JWH 地址：P_JWH_ADDR_BASE + slot。
-
-配置记录 32 bit：
-    [31:30] PAGE 0/1/2
-    [29:27] 0 Send Byte，1 Write Byte，2 Write Word，
-             3 Read Byte，4 Read Word
-    [26:19] PMBus Command
-    [18:3]  写数据
-    [2:0]   保留，必须为 0
-
-配置RAM不保存PAGE-valid或STORE命令。每条普通请求都明确携带目标PAGE，
-是否真正发送PAGE由内部 jwh6374_bus_controller 的“通道+地址+PAGE”缓存决定。
-*/
+ * 特殊行为：
+ * - MTP_BUSY 轮询期间允许地址、命令或数据 NACK 重试，其他总线错误直接结束任务。
+ * - 后台遥测固定轮询 device_id 0..7；配置/在线访问仍接受完整 6 位 device_id。
+ * - i_clear 会取消在途业务并清除待处理告警，不生成取消响应。
+ */
 
 module jwh6374_bus_service #(
     parameter integer P_SYS_CLK_FREQ          = 100_000_000,

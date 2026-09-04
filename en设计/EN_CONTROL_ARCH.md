@@ -46,3 +46,7 @@ assign o_jwh_power_enable = debug_en_state[111:0];
 ```
 
 因此目前 `sequence_en_state[127:0]` 不影响板级 EN 引脚。
+
+## 4. EN 竞争
+
+可使用 START_SYNC，该信号代表是否生在输出，非正在输出时切到 debug_en
