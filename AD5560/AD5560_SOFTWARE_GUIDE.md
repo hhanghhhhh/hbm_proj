@@ -11,6 +11,8 @@
 - `RESET`、`BUSY`、`SYNC`、`SDO` 等数字接口；
 - 主要控制寄存器的作用；
 - Force Voltage、Current Range、Measure、Clamp、Comparator；
+- `FORCE/EXTFORCE`、`SENSE`、`DUTGND`、`SYS_FORCE/SYS_SENSE` 等引脚的区别；
+- `GPO` 普通输出功能以及通过 GPO 引出片上热二极管的测温功能；
 - `SW_INH` / `HW_INH` 与输出使能；
 - Alarm 配置、故障读取与清除；
 - Slew Rate 和 Ramp Function；
@@ -20,7 +22,7 @@
 
 本文主要依据 Analog Devices **AD5560 Rev.F Data Sheet** 整理。模拟外围、电源轨、PCB、散热和外部补偿元件等仍应以原始数据手册为最终依据。
 
-> 本文重点是 AD5560 自身机理和 FPGA 控制接口。已有的 [`AD5560_CONTROL.md`](./AD5560_CONTROL.md) 更侧重 DUT 上下电、`SW_INH/HW_INH`、Slew Rate 和 Ramp 时序。
+> 本文重点是 AD5560 自身机理和 FPGA 控制接口。已有的 [`AD5560_CONTROL.md`](./AD5560_CONTROL.md) 更侧重 DUT 上下电、`SW_INH/HW_INH`、Slew Rate、Ramp 和 LOAD 时序。
 
 ---
 
@@ -61,12 +63,13 @@ VREF ---> FIN DAC ---> Force Amplifier ---> FORCE / EXTFORCE ---> DUT
 7. 电流/电压窗口比较器；
 8. Kelvin Sense / DUTGND 异常检测；
 9. 芯片温度检测和 Thermal Shutdown；
-10. Programmable Slew Rate；
-11. FIN DAC Ramp；
-12. DAC Offset/Gain Correction；
-13. Force Amplifier Compensation；
-14. 多颗器件 Gang；
-15. Diagnostic 内部节点测量。
+10. 片上多点 Thermal Diode Array；
+11. Programmable Slew Rate；
+12. FIN DAC Ramp；
+13. DAC Offset/Gain Correction；
+14. Force Amplifier Compensation；
+15. 多颗器件 Gang；
+16. Diagnostic 内部节点测量。
 
 AD5560 **没有内部 ADC 把实际电压/电流直接转换为数字码**。实际测量值主要从模拟 `MEASOUT` 输出，再由系统外部 ADC 采样并送回 FPGA。
 
@@ -79,7 +82,7 @@ AD5560 **没有内部 ADC 把实际电压/电流直接转换为数字码**。实
 Force 路径负责输出：
 
 ```text
-FIN DAC -> Force Amplifier -> FORCE -> DUT
+FIN DAC -> Force Amplifier -> FORCE / EXTFORCE -> DUT
 ```
 
 Measure 路径负责观测：
@@ -176,9 +179,7 @@ FIN、CLL、CLH 以及 Comparator DAC 等都采用类似的 `x1 / m / c` 结构�
 
 ### 5.1 Calibration Engine 的作用
 
-Calibration Engine 位于 SPI 可见的 `x1/m/c` 寄存器和实际 DAC `x2` 之间。
-
-FPGA 写入 DAC `x1` 后，AD5560 不会立即把 `x1` 原码送入 DAC，而是执行：
+FPGA 写入 DAC `x1` 后，AD5560 执行：
 
 ```text
 Write x1
@@ -199,28 +200,24 @@ Calibration Engine
 加载到实际 DAC
 ```
 
-因此 FPGA 看到的是“目标码 `x1`”，真正驱动模拟 DAC 的是内部 `x2`。
+因此 FPGA 看到的是目标码 `x1`，真正驱动模拟 DAC 的是内部 `x2`。
 
 ### 5.2 什么操作会启动 Calibration Engine
 
 **对应 DAC 的 `x1` 写入会启动 Calibration Engine。**
-
-每次新的 `x1` 写入完成后，AD5560 都会用当时保存的 `m`、`c` 重新计算 `x2`。
 
 相反：
 
 - 写 `m` 不启动 Calibration Engine；
 - 写 `c` 不启动 Calibration Engine。
 
-因此 `m/c` 寄存器更新本身只是改变后续校正运算使用的系数。
+因此：
 
-从器件机理上可以得到一个重要结论：
-
-> 单独更新 `m/c` 并不会使当前已加载的 `x2` 自动重新计算。新的 `m/c` 会在下一次对应 `x1` 写入触发 Calibration Engine 时参与计算。
+> 单独更新 `m/c` 并不会使当前已加载的 `x2` 自动重新计算。新的 `m/c` 会在下一次对应 `x1` 写入时参与计算。
 
 ### 5.3 三阶段计算流水线
 
-数据手册说明 `x2` 的计算采用三阶段过程：
+数据手册给出的计算过程为：
 
 ```text
 Stage 1 : 600 ns
@@ -230,13 +227,9 @@ Stage 3 : 300 ns
 总计算路径约 1.5 us
 ```
 
-对应 SPI Timing Table 中，DAC `x1` write 的 `BUSY Low` 最大时间也是 **1.5 µs**。
-
-普通非 DAC-x1 寄存器写的 `BUSY Low` 最大值约为 **280 ns**，因此 FPGA 需要区分普通寄存器写和 DAC `x1` 写的内部处理时间。
+对应 DAC `x1` write 的 `BUSY Low` 最大时间约 **1.5 µs**；普通非 DAC-x1 寄存器写的 `BUSY Low` 最大值约 **280 ns**。
 
 ### 5.4 BUSY 与 Calibration Engine
-
-当 Calibration Engine 计算 `x2` 时：
 
 ```text
 x1 write complete
@@ -253,118 +246,55 @@ BUSY = 1
 DAC output update
 ```
 
-数据手册明确指出，DAC 输出在 `BUSY` 回到 High 后立即更新。
+`BUSY` 表示的不只是 SPI 是否收完，而是 AD5560 内部更新是否完成。
 
-因此对于 FPGA：
+### 5.5 流水处理
 
-> `BUSY` 不只是“SPI 收完了没有”，而是 AD5560 内部寄存器更新/Calibration Engine 是否已经完成的状态信号。
-
-### 5.5 Calibration Engine 支持流水处理
-
-Calibration Engine 是流水结构，不要求 FPGA 在每次 `x1` 写完后都空等完整 1.5 µs 才开始准备下一帧。
-
-数据手册给出的关键约束是：
-
-- 第一阶段计算需要 600 ns；
-- 前一个 `x1` 写操作完成后，在第一阶段结束之前，下一个相关写操作不能完成；
-- 也就是下一次写的 `SYNC` 上升沿不能早于上一笔 `x1` 写完成后的约 600 ns。
-
-因此存在两种 FPGA 实现方式：
+Calibration Engine 是流水结构。第一阶段需要约 600 ns，因此可以比 1.5 µs 更高频地调度连续 DAC 更新，但第一版 RTL 建议采用：
 
 ```text
-简单模式：
 write x1 -> wait BUSY high -> next write
-
-高吞吐模式：
-利用 600 ns pipeline update interval 调度连续 DAC 更新
 ```
 
-第一版 RTL 推荐采用简单模式，确认功能后再做流水优化。
+确认功能后再利用 pipeline interval 优化。
 
-### 5.6 BUSY Low 期间其他寄存器写的约束
+### 5.6 BUSY Low 期间其他写操作
 
-当 `BUSY=0` 时，串行接口并不是完全停止工作。
-
-对于 Control Register、`m`、`c` 等写操作，可以开始把数据移入串行接口，但数据手册要求：
-
-> 在 BUSY 回到 High 之前，不应通过 `SYNC` 上升沿完成这笔寄存器写入。
-
-因此 FPGA SPI transaction controller 最简单可靠的策略仍然是：
-
-```text
-需要完成新寄存器写
-        |
-        +--> BUSY = 1 ?
-                 |
-              Yes
-                 |
-                 v
-             完成写事务
-```
+当 `BUSY=0` 时可以开始移入下一帧数据，但不应在 BUSY 回到 High 之前通过 `SYNC` 上升沿完成新的相关寄存器写入。
 
 ### 5.7 x2 不可 Readback
 
-FPGA 可以读取：
-
-```text
-x1
-m
-c
-```
-
-但不能直接读取内部：
-
-```text
-x2
-```
-
-所以 Readback 能确认的是“输入寄存器配置”，不能直接用 SPI 检查 Calibration Engine 最终得到的 x2 code。
+FPGA 可以读取 `x1/m/c`，但不能直接读取内部 `x2`。
 
 ### 5.8 Calibration Engine 与 LOAD
 
-在使用 LOAD 功能时，Calibration Engine 可以先根据 `x1/m/c` 得到新的 `x2`，而实际 DAC 更新由 LOAD 机制控制。
-
-LOAD 能控制的对象包括：
-
-- FIN DAC x2；
-- CLL DAC x2；
-- CLH DAC x2；
-- Compensation；
-- Current Range。
-
-因此需要区分：
-
 ```text
 Calibration Engine
-    -> 负责算出 x2
+    -> 负责根据 x1/m/c 算出 x2
 
 LOAD
-    -> 负责什么时候把准备好的结果应用到输出/通道
+    -> 负责准备好的 x2 / Range / Compensation 何时真正生效
 ```
+
+LOAD 能控制的对象包括 FIN、CLL、CLH 的 DAC x2，以及 Compensation、Current Range。
 
 ### 5.9 Calibration Engine 与 Ramp
 
-Ramp Function 同样使用 Calibration Engine。
-
-Ramp 过程中：
+Ramp Function 同样经过 Calibration Engine：
 
 ```text
 当前 FIN x1
     |
-根据 Step Size 生成下一个 x1
+Step 生成下一个 x1
     |
 Calibration Engine
     |
-生成校正后的下一步 x2
+生成新的 x2
     |
-RCLK / Divider 控制更新时刻
+RCLK / Divider
     |
 FIN DAC 更新
 ```
-
-数据手册说明 Ramp 中使用 Calibration Engine，并存在约 **1.2 µs** 的 calibration delay；下一步的校正计算可以在当前模拟输出建立期间进行。
-
-这也是 Ramp 最大更新速率受到内部 Calibration Engine 限制的原因之一。
 
 ---
 
@@ -383,15 +313,13 @@ FIN DAC 更新
 
 纯写模式 SCLK 最高可到 **50 MHz**。
 
-Readback 时由于 `SDO` 驱动较弱，最大 SCLK 与 DVCC 有关：
+Readback 时最大 SCLK 与 DVCC 有关：
 
 | DVCC | Readback 最大 SCLK |
 |---|---:|
 | 2.3 V ~ 2.7 V | 12 MHz |
 | 2.7 V ~ 3.3 V | 15 MHz |
 | 4.5 V ~ 5.5 V | 20 MHz |
-
-FPGA 第一版建议先统一采用较低 SCLK，等读写时序稳定后再分别提高 write-only 事务速率。
 
 ### 6.2 24-bit 命令格式
 
@@ -404,15 +332,7 @@ Bit23       Bit22 ........ Bit16   Bit15 ........ Bit0
 +----+      +------------------+   +------------------+
 ```
 
-即：
-
-```text
-frame[23]    = R/W
-frame[22:16] = register address
-frame[15:0]  = register data
-```
-
-FPGA 内部可以直接形成：
+FPGA 内部可形成：
 
 ```text
 spi_tx_data[23:0] = {rw, addr[6:0], data[15:0]}
@@ -421,8 +341,6 @@ spi_tx_data[23:0] = {rw, addr[6:0], data[15:0]}
 ### 6.3 写寄存器流程
 
 ```text
-SYNC = 1
-   |
 SYNC = 0
    |
 发送 24 bit
@@ -432,38 +350,26 @@ SYNC = 1      <- 寄存器写入完成点
 等待 BUSY / 满足下一笔写时序
 ```
 
-重要规则：
-
-- `SYNC` 拉低开始一帧；
-- 至少发送 24 个 SCLK；
-- `SYNC` 上升沿完成输入寄存器更新；
-- Reserved bit 按数据手册规定写 0；
-- 涉及 DAC `x1` 时，需要考虑 Calibration Engine 的较长 BUSY。
-
 ### 6.4 BUSY
 
-`BUSY` 为 Open-Drain、Active-Low。
-
-典型含义：
+`BUSY` 为 Open-Drain、Active-Low：
 
 ```text
-BUSY = 0 -> AD5560 内部仍在处理
+BUSY = 0 -> 内部仍在处理
 BUSY = 1 -> 当前内部更新完成
 ```
 
 主要时序量级：
 
-- DAC `x1` write：BUSY Low 最大约 1.5 µs；
-- 其他寄存器 write：BUSY Low 最大约 280 ns；
-- RESET：Timing Table 给出的 BUSY Low 最大约 400 µs。
+- DAC `x1` write：最大约 1.5 µs；
+- 其他寄存器 write：最大约 280 ns；
+- RESET：Timing Table 最大约 400 µs。
 
-多颗 AD5560 的 BUSY 可以 wired-OR，但共享后只能知道“这一组中仍有器件忙”，不能直接知道是哪一颗。
+多颗 AD5560 的 BUSY 可以 wired-OR，但共享后只能知道组级 Busy。
 
 ### 6.5 RESET
 
-`RESET` 是低有效、level-sensitive 输入。
-
-典型 FPGA 控制流程：
+典型流程：
 
 ```text
 RESET = 0
@@ -477,38 +383,17 @@ RESET = 1
 开始 SPI 初始化
 ```
 
-Reset 过程中不要完成新的 SPI 写事务。
-
 ### 6.6 Readback 是两帧
 
-AD5560 读寄存器需要两次 SPI frame。
-
-第一帧：Read Request
+第一帧发送 Read Request，第二帧发送 NOP 并从 SDO 接收结果：
 
 ```text
-R/W     = 1
-Address = target register
-Data    = 0x0000
-```
-
-第二帧：NOP，同时从 SDO 移出前一帧指定的寄存器数据。
-
-```text
-Frame 1:
-SYNC low
-Read(addr)
-SYNC high
-
+Frame 1: Read(addr)
 SYNC high >= 250 ns
-
-Frame 2:
-SYNC low
-NOP
-SDO -> receive data
-SYNC high
+Frame 2: NOP + SDO readback
 ```
 
-因此 FPGA 读事务状态机至少要有：
+FPGA 读事务状态机至少需要：
 
 ```text
 READ_REQUEST
@@ -517,13 +402,7 @@ READBACK_NOP
 DONE
 ```
 
-注意：
-
-- Readback SCLK 低于 write-only 最高频率；
-- 两帧之间 `SYNC` High 至少 250 ns；
-- `SDO` 在 `SYNC` High 后进入 High-Z；
-- `0x43/0x44` 是只读状态寄存器；
-- DAC `x2` 不可读回。
+DAC `x2` 不支持 Readback。
 
 ---
 
@@ -538,7 +417,7 @@ DONE
 | `0x04` | Compensation Register 1 | Auto Compensation |
 | `0x05` | Compensation Register 2 | Manual Compensation |
 | `0x06` | Alarm Setup | Alarm latch / pin mask |
-| `0x07` | Diagnostic | 内部节点诊断 |
+| `0x07` | Diagnostic | 内部节点诊断、片上 Thermal Diode 选择 |
 | `0x08` | FIN DAC x1 | Force Voltage 目标码 |
 | `0x09` | FIN DAC m | FIN Gain Correction |
 | `0x0A` | FIN DAC c | FIN Offset Correction |
@@ -574,8 +453,6 @@ Bit `[15:14]`：
 | 2 | 110°C |
 | 3 | 100°C |
 
-这是 AD5560 自身结温保护，不是 DUT 温度。
-
 ### 8.2 GAIN[1:0]
 
 Bit `[13:12]`：
@@ -594,11 +471,9 @@ Bit 11：
 - `0`：Force Amplifier 输入来自 Force DAC；
 - `1`：Force Amplifier 正输入切到 GND。
 
-正常可编程输出通常保持 `FINGND=0`。
-
 ### 8.4 CPO
 
-Bit 10，用于选择 Comparator 输出组织方式，可减少返回 FPGA 的 Comparator 引脚数量。
+Bit 10，用于选择 Comparator 输出组织方式。
 
 ### 8.5 PD
 
@@ -609,7 +484,7 @@ PD = 0 -> Force Amplifier Block Power-Down，默认
 PD = 1 -> Force Amplifier Block Power-Up
 ```
 
-它不是普通的 DUT 输出 Enable。若只是希望 FORCE High-Z，通常使用 `SW_INH/HW_INH`。
+它不是普通 DUT 输出 Enable；输出 High-Z 通常由 `SW_INH/HW_INH` 实现。
 
 ### 8.6 LOAD[1:0]
 
@@ -622,14 +497,7 @@ Bit `[8:7]`：
 | 2 | `HW_INH` 引脚改作 LOAD |
 | 3 | 保留 CLEN/HW_INH 原功能，通过 BUSY 同步更新 |
 
-LOAD 可控制：
-
-- FIN DAC；
-- CLL / CLH；
-- Compensation；
-- Current Range。
-
-LOAD 不是 Ramp Start。
+LOAD 可控制 FIN、CLL/CLH、Compensation、Current Range 的实际更新。LOAD 不是 Ramp Start。
 
 ---
 
@@ -644,33 +512,11 @@ SW_INH = 0 -> Force Amplifier Disable
 SW_INH = 1 -> 允许 Force Amplifier 工作的一个条件
 ```
 
-与硬件 `HW_INH` 的关系：
-
-```text
-SW_INH = 1
-    AND
-HW_INH = 1
-      |
-      v
-Force Amplifier Enable
-```
-
-因此：
-
-- FIN DAC 写入和输出 Enable 是两个不同动作；
-- FPGA 可用 `HW_INH` 做硬件级快速禁止；
-- 也可通过 SPI 写 `SW_INH=0` 单独关闭器件。
+与 `HW_INH` 为 AND 关系。
 
 ### 9.2 I[2:0]：Current Range
 
-Bit `[13:11]`，量程定义见第 3.2 节。
-
-FPGA 改变量程后，要同步切换：
-
-- 电流换算参数；
-- Comparator Threshold 组；
-- Clamp 相关配置；
-- 必要的 Compensation。
+Bit `[13:11]`，定义见第 3.2 节。
 
 ### 9.3 CMP[1:0]
 
@@ -684,32 +530,15 @@ Bit `[10:9]`：
 
 ### 9.4 ME[3:0]
 
-Bit `[8:5]` 控制 MEASOUT。
-
-典型选择包括：
-
-```text
-High-Z
-ISENSE
-VSENSE
-KSENSE
-TSENSE
-DUTGND SENSE
-DIAG A
-DIAG B
-```
+Bit `[8:5]` 控制 MEASOUT，可选择 High-Z、ISENSE、VSENSE、KSENSE、TSENSE、DUTGND SENSE、DIAG A、DIAG B。
 
 ### 9.5 CLEN
 
-Bit 4，软件 Clamp Enable。
-
-与硬件 `CLEN` 引脚为 OR 关系：
+Bit 4，软件 Clamp Enable，与硬件 CLEN 为 OR 关系：
 
 ```text
 Clamp Enable = SW_CLEN OR HW_CLEN
 ```
-
-过流时 Clamp 是模拟级第一层保护。真正要把 DUT 隔离，应使用 `SW_INH/HW_INH`，而不是关闭 Clamp。
 
 ---
 
@@ -730,27 +559,160 @@ Bit `[14:12]`：
 | 6 | 0.35 V/µs |
 | 7 | 0.3125 V/µs |
 
-Slew Rate 是模拟输出变化速度控制，不是 DAC code 逐级变化的 Ramp Function。
+### 10.2 GPO：普通数字输出
 
-### 10.2 GPO
+Bit 11 是 `GPO` 控制位。
 
-GPO 可驱动外部辅助开关，例如 DUT 端电容切换等。
+在没有通过 Diagnostic Register 选择片上 Thermal Diode 时，GPO 可以作为普通的可控数字输出，例如控制 DUT 端模拟开关、去耦电容切换等外部功能。
 
-### 10.3 Gang Mode
+```text
+FPGA
+  |
+SPI 写 DPS Register 2.GPO
+  |
+  v
+GPO pin -> 外部开关/控制逻辑
+```
 
-用于多颗 AD5560 并联以获得更高电流，可配置 Master / Slave 等模式。单器件第一版建议保持默认。
+### 10.3 GPO：片上 Thermal Diode 输出
 
-### 10.4 INT10K
+GPO 还有一个与普通数字输出完全不同的复用功能：
 
-可在 FORCE 与 SENSE 之间接入片内约 10 kΩ 通路。正常 Kelvin 工作时不要无目的开启。
+> Diagnostic Register `0x07` 可以选择 AD5560 die 上不同位置的 Thermal Diode。选中后，该二极管的 **D+ / 阳极连接到 GPO pin，D− / 阴极连接到 AGND**。
 
-### 10.5 Guard High-Z
+因此可以连接外部 Remote Diode Temperature Monitor，例如 ADI 评估板使用的 ADT7461：
 
-用于将 Guard Amplifier 置 High-Z；当 `GUARD/SYS_DUTGND` 复用为 System DUTGND 时需要正确配置。
+```text
+AD5560                         ADT7461
+
+内部 Thermal Diode
+      anode ---- GPO --------> D+
+      cathode --- AGND ------> D-
+```
+
+此时 GPO 不再按 `DPS Register 2.GPO` bit 作为普通数字输出使用，而是作为模拟 PN 结温度传感器端口。
+
+Thermal Diode 的具体选择由 `Diagnostic Register 0x07` 的 `TSENSE Select` 字段完成，详见第 23 节。
+
+恢复普通 GPO 功能时，将 `TSENSE Select` 设回 `0~7` 中的正常 GPO 状态（通常使用 0），再由 `DPS Register 2` Bit11 控制 GPO。
+
+### 10.4 Gang Mode
+
+Bit `[10:9]` 用于多颗 AD5560 Gang，可配置 Master/Slave 以及 FV/FI 跟随方式。
+
+### 10.5 INT10K
+
+Bit 8 可以在 FORCE 与 SENSE 之间接入内部约 10 kΩ 通路。正常 Kelvin 测量时不要无目的开启。
+
+### 10.6 SF0 与 Guard High-Z：System Force/Sense 连接
+
+Bit15 `SF0` 和 Bit7 `Guard High-Z` 共同控制 `SYS_FORCE`、`SYS_SENSE`、`GUARD/SYS_DUTGND` 的内部开关：
+
+| Guard High-Z | SF0 | SYS_SENSE | SYS_FORCE | GUARD/SYS_DUTGND |
+|---:|---:|---|---|---|
+| 0 | 0 | Open | Open | Guard |
+| 0 | 1 | SENSE | FORCE | Guard |
+| 1 | 0 | Open | Open | Open |
+| 1 | 1 | SENSE | FORCE | DUTGND |
+
+这些 System 引脚主要用于把中央 PMU/SMU 接入本通道做系统级校准或额外测量。普通独立 DPS 运行不需要使用它们。
 
 ---
 
-## 11. Force Voltage：FIN DAC
+## 11. FORCE / EXTFORCE / SENSE / DUTGND 等引脚
+
+这几个引脚功能不同，不能简单理解成“只接 FORCE 和 SENSE 就够了”。
+
+### 11.1 FORCE
+
+`FORCE` 是 **片内五档电流量程**的 Force 输出：
+
+```text
+±5 µA
+±25 µA
+±250 µA
+±2.5 mA
+±25 mA
+      -> FORCE
+```
+
+因此如果实际 DUT 电流超过 25 mA，不使用 FORCE 作为主功率输出，而应使用 EXTFORCE1 / EXTFORCE2。
+
+### 11.2 EXTFORCE1 / EXTFORCE2
+
+两档外部高电流输出：
+
+```text
+EXTFORCE1 -> 最大约 ±1.2 A
+EXTFORCE2 -> 最大约 ±500 mA
+```
+
+高电流档需要配合外部 Sense Resistor 和对应的外部测流引脚。
+
+### 11.3 SENSE
+
+`SENSE` 是 DUT 电压 Kelvin Sense 输入。
+
+```text
+FORCE / EXTFORCE --------> DUT VDD
+                              |
+SENSE ------------------------+
+```
+
+Force 负责输送电流，SENSE 负责反馈 DUT 端实际电压，从而补偿 Force 路径上的线损。
+
+`SENSE` 对内部电流档和外部高电流档都是关键反馈节点。
+
+### 11.4 DUTGND
+
+`DUTGND` 表示 DUT 实际地电位，是 AD5560 的 DUT Ground Reference / Kelvin Ground 节点，而不是简单等同于板上的 AGND。
+
+对于远端 DUT、Probe Card、较大电流回路，应考虑 DUTGND 走线压降及 DUTGND Kelvin Alarm。
+
+### 11.5 SYS_FORCE / SYS_SENSE
+
+- `SYS_FORCE`：外部 System PMU 的 Force 信号输入；
+- `SYS_SENSE`：把本通道 SENSE 节点送给外部 System PMU。
+
+它们通过 `DPS Register 2.SF0` 控制内部开关，用于系统 PMU 校准和额外测量。普通 DUT 供电不需要它们。
+
+### 11.6 GUARD / SYS_DUTGND
+
+`GUARD/SYS_DUTGND` 为复用引脚：
+
+- Guard 模式：Guard Amplifier 输出，用于高阻/低电流测量时驱动线缆屏蔽层，减小绝缘漏电；
+- SYS_DUTGND 模式：把 DUTGND 节点送到 System PMU。
+
+使用 SYS_DUTGND 时必须把 Guard Amplifier 设置为 High-Z。
+
+### 11.7 MASTER_OUT / SLAVE_IN
+
+用于多颗 AD5560 Gang，不是普通单颗 DUT 供电必需信号。
+
+根据 Gang 模式，`MASTER_OUT` 可以输出 Master 的 Force Amplifier 控制信号，或者 Master 的 MI（测得电流）信号，供 Slave 的 `SLAVE_IN` 跟随。
+
+### 11.8 普通独立通道通常关注哪些引脚
+
+低电流档：
+
+```text
+FORCE + SENSE + DUTGND
+```
+
+高电流档：
+
+```text
+EXTFORCE1/2
++ SENSE
++ DUTGND
++ 外部 Rsense / EXTMEAS 引脚
+```
+
+`SYS_FORCE/SYS_SENSE/SYS_DUTGND` 和 `MASTER_OUT/SLAVE_IN` 属于系统校准或 Gang 扩展功能，可按项目需求决定是否使用。
+
+---
+
+## 12. Force Voltage：FIN DAC
 
 关键寄存器：
 
@@ -760,8 +722,6 @@ GPO 可驱动外部辅助开关，例如 DUT 端电容切换等。
 0x0A FIN DAC c
 0x0B Offset DAC
 ```
-
-正常运行时最频繁写的是 `0x08`。
 
 对于 5 V VREF，Force/Comparator DAC 总 span 约 25.625 V。默认 Offset DAC 为 `0x8000` 时，中码附近约对应 0 V：
 
@@ -775,166 +735,76 @@ FIN DAC = 0x8000 -> 约 0 V，相对于 DUTGND
 Vout ≈ 25.625 V * (code - 32768) / 65536 + DUTGND
 ```
 
-实际输出还与以下因素有关：
-
-- VREF；
-- Offset DAC；
-- m/c 与 Calibration Engine；
-- AVDD/AVSS、HCAVDD/HCAVSS headroom；
-- DUTGND；
-- 外部高电流 Rsense 和线路压降。
-
-FPGA 内部建议把“物理电压参数”和“FIN code”分开，不要让上层控制状态机直接散落裸 DAC code。
+实际输出还需考虑 VREF、Offset DAC、Calibration、供电 headroom、DUTGND、外部 Rsense 和线路压降。
 
 ---
 
-## 12. Current Clamp
+## 13. Current Clamp
 
 Clamp 用于限制 DUT source/sink 电流。
 
-### 12.1 寄存器
-
 ```text
-0x0D CLL DAC x1
-0x0E CLL DAC m
-0x0F CLL DAC c
-
-0x10 CLH DAC x1
-0x11 CLH DAC m
-0x12 CLH DAC c
+0x0D~0x0F -> CLL x1/m/c
+0x10~0x12 -> CLH x1/m/c
 ```
 
-- `CLL`：Low Clamp；
-- `CLH`：High Clamp。
-
-### 12.2 CLALM
-
-实际输出进入 Clamp 状态时会触发 `CLALM`。
+实际进入 Clamp 状态时会触发 `CLALM`：
 
 ```text
-DUT 电流试图超过 Clamp
+DUT 试图超过设定电流
         |
-        v
-AD5560 模拟 Clamp 介入
+AD5560 模拟 Clamp 先限流
         |
-        +--> 电流被限制
-        |
-        +--> CLALM
-                |
-                v
-              FPGA
-                |
-          读 0x43 定位
-                |
-      SW_INH/HW_INH 隔离
+        +--> CLALM -> FPGA
 ```
 
-Clamp 可以承担第一层快速保护，但不应把持续 Clamp 当作长期正常工作状态。
+持续故障最终应通过 `SW_INH/HW_INH` 隔离，而不是关闭 Clamp。
 
 ---
 
-## 13. Comparator
+## 14. Comparator
 
-AD5560 内置电流/电压 Comparator，可在不经过 ADC 的情况下做窗口判断。
+AD5560 内置电流/电压 Comparator，可不经过 ADC 做窗口判断。
 
-FPGA 配置逻辑包括：
+每个 Current Range 有独立 CPL / CPH DAC 组；电压 Comparator 使用 `0x45~0x4A`。
 
-1. `CMP[1:0]` 选择电流或电压；
-2. 写 Low Threshold；
-3. 写 High Threshold；
-4. 使用 `CPOL/CPOH` 硬件输出，或读取 `0x43/0x44` 中状态。
-
-### 13.1 电流 Comparator
-
-每个 Current Range 有独立的 CPL / CPH DAC 组。
-
-| Range | CPL x1 | CPH x1 |
-|---|---:|---:|
-| ±5 µA | `0x13` | `0x28` |
-| ±25 µA | `0x16` | `0x2B` |
-| ±250 µA | `0x19` | `0x2E` |
-| ±2.5 mA | `0x1C` | `0x31` |
-| ±25 mA | `0x1F` | `0x34` |
-| EXT Range 2 | `0x22` | `0x37` |
-| EXT Range 1 | `0x25` | `0x3A` |
-
-每个 `x1` 后都有对应独立 `m/c`。
-
-### 13.2 电压 Comparator
-
-```text
-0x45 CPL DAC x1
-0x46 CPL DAC m
-0x47 CPL DAC c
-
-0x48 CPH DAC x1
-0x49 CPH DAC m
-0x4A CPH DAC c
-```
-
-Comparator 更适合快速 Pass/Fail；精确数值测量仍走 `MEASOUT + ADC`。
+Comparator 适合快速 Pass/Fail；精确数值测量仍走 `MEASOUT + ADC`。
 
 ---
 
-## 14. MEASOUT 与外部 ADC
+## 15. MEASOUT 与外部 ADC
 
-AD5560 的实际测量结果主要从模拟 `MEASOUT` 输出。
+AD5560 实际测量结果主要从模拟 `MEASOUT` 输出，可选择 DUT Current、DUT Voltage、Kelvin Sense、Die Temperature、DUTGND Sense、Diagnostic Nodes。
 
-可以选择：
-
-- DUT Current；
-- DUT Voltage；
-- Kelvin Sense；
-- Die Temperature；
-- DUTGND Sense；
-- Diagnostic Nodes。
-
-### 14.1 电流测量链
+### 15.1 电流测量链
 
 ```text
 Current Range
       |
-      v
 Current Sense / MI Gain
       |
-      v
 MEASOUT Gain
       |
-      v
-MEASOUT
-      |
-      v
-External ADC
-      |
-      v
-FPGA
+MEASOUT -> External ADC -> FPGA
 ```
 
-换算依赖：
+换算依赖 Current Range、Rsense、MI Gain、MEASOUT Gain 和外部 ADC。
 
-- Current Range；
-- Rsense；
-- MI Gain = 10 / 20；
-- MEASOUT Gain = 1 / 0.2；
-- 外部 ADC 量程及系统参数。
-
-因此 FPGA 侧应根据当前量程选择对应的换算参数，而不是所有量程共用一个系数。
-
-### 14.2 电压测量链
+### 15.2 电压测量链
 
 ```text
 DPS1.ME -> VSENSE
        |
-等待 MEASOUT 建立
+等待建立
        |
-External ADC sample
+ADC sample
        |
-FPGA 换算实际电压
+FPGA 换算
 ```
 
 ---
 
-## 15. Alarm 系统
+## 16. Alarm 系统
 
 主要有三个 Open-Drain、Active-Low 告警引脚：
 
@@ -944,369 +814,301 @@ KELALM -> Kelvin 综合 Alarm
 TMPALM -> Temperature Alarm
 ```
 
-`KELALM` 内部可以由：
+`KELALM` 内部可以由 OSALM、DUTALM、GRDALM 共同产生。
 
-- `OSALM`：Open-Sense / FORCE-SENSE 异常；
-- `DUTALM`：DUTGND Kelvin 异常；
-- `GRDALM`：Guard Alarm；
-
-共同产生。
-
-多个 AD5560 的 Alarm 可以 wired-OR，再由 FPGA 通过独立 `SYNC` 扫描各器件 `0x43` 定位。
+多个 AD5560 的 Alarm 可以 wired-OR，再由 FPGA 扫描各器件 `0x43` 定位。
 
 ---
 
-## 16. Alarm Setup Register `0x06`
+## 17. Alarm Setup Register `0x06`
 
-可以控制各 Alarm：
+可以分别配置 TMPALM、OSALM、DUTALM、CLALM、GRDALM 是否映射到外部 pin，以及是否 Latched。
 
-- 是否映射到外部告警 pin；
-- 是否 Latched。
-
-| Bit | 功能 |
-|---:|---|
-| 15 | Latched TMPALM |
-| 14 | Disable TMPALM pin flag |
-| 13 | Latched OSALM |
-| 12 | Disable OSALM pin flag |
-| 11 | Latched DUTALM |
-| 10 | Disable DUTALM pin flag |
-| 9 | Latched CLALM |
-| 8 | Disable CLALM pin flag |
-| 7 | Latched GRDALM |
-| 6 | Disable GRDALM pin flag |
-
-即使某类 Alarm 不输出到硬件 pin，其状态仍可以从 `0x43/0x44` 读取。
-
-多通道系统通常适合关键告警使用 Latched 模式，以免窄脉冲在 FPGA 扫描之前消失。
+即使某类 Alarm 不输出到硬件 pin，其状态仍可从 `0x43/0x44` 读取。
 
 ---
 
-## 17. Alarm Status `0x43 / 0x44`
+## 18. Alarm Status `0x43 / 0x44`
 
-### 17.1 `0x43`
-
-读取状态，不清 Latched Alarm。
-
-| Bit | 名称 |
-|---:|---|
-| 15 | LTMPALM |
-| 14 | TMPALM |
-| 13 | LOSALM |
-| 12 | OSALM |
-| 11 | LDUTALM |
-| 10 | DUTALM |
-| 9 | LCLALM |
-| 8 | CLALM |
-| 7 | LGRDALM |
-| 6 | GRDALM |
-| 5 | CPOL |
-| 4 | CPOH |
+`0x43` 只读状态，不清 Latched Alarm；`0x44` 读取并清除 Latched Alarm。
 
 Alarm bit 是 Active-Low 语义：
 
 ```text
-LCLALM = 0 -> 曾发生 Clamp Alarm
-CLALM  = 0 -> 当前 Clamp Alarm 仍存在
+0 = Alarm
+1 = No Alarm
 ```
 
-### 17.2 `0x44`
-
-读取状态并清除 Latched Alarm。
-
-推荐 FPGA 故障流程：
+推荐：
 
 ```text
 ALARM_N low
-    |
-    v
-扫描器件并读取 0x43
-    |
-    v
-锁存 channel + fault type
-    |
-    v
-执行保护/隔离
-    |
-    v
-需要清故障时读取 0x44
+ -> 读 0x43 定位并记录
+ -> 执行保护
+ -> 需要清除时读 0x44
 ```
 
-不要一进入故障就先读 `0x44`，否则读取和清除动作会混在一起。
+---
+
+## 19. Kelvin / Open-Sense 保护
+
+### 19.1 OSD DAC `0x0C`
+
+当 FORCE 与 SENSE 偏差超过 OSD threshold 时，可能触发 `OSALM -> KELALM`。
+
+### 19.2 DGS DAC `0x3D`
+
+用于设置 DUTGND 与 AGND 的异常阈值，对应 `DUTALM/KELALM`。
 
 ---
 
-## 18. Kelvin / Open-Sense 保护
+## 20. 温度检测与 Thermal Shutdown
 
-### 18.1 OSD DAC `0x0C`
+AD5560 内部实际存在三类不同的温度传感机制，不应混在一起理解。
 
-OSD 用于设置 FORCE 与 SENSE 之间允许的差值。
+### 20.1 MEASOUT TSENSE
 
-当：
+DPS Register 1 的 MEASOUT MUX 可以选择 TSENSE。
+
+典型关系：
 
 ```text
-|FORCE - SENSE| > OSD threshold
+25°C -> 约 1.54 V
+温度系数 -> 约 4.7 mV/°C
 ```
 
-可能触发 `OSALM -> KELALM`。
+该 TSENSE 在 Power-Down 状态仍可工作，适合得到一个普通的 die temperature 模拟量。
 
-Sense 开路时 Force 闭环已经不可信，因此这是 Wafer Test 中很重要的接触/回路异常检测。
+### 20.2 Thermal Shutdown 功率级传感器
 
-### 18.2 DGS DAC `0x3D`
+AD5560 在活动功率级内部还有用于 Thermal Shutdown 的温度传感器。
 
-用于设置 DUTGND 与 AGND 之间的异常阈值，对应 `DUTALM/KELALM`。
+System Control `TMP[1:0]` 可选择约 100°C、110°C、120°C、130°C（默认）阈值。
 
----
-
-## 19. 温度检测与 Thermal Shutdown
-
-AD5560 内部同时具有：
-
-- Thermal Shutdown 温度检测；
-- 可通过 `MEASOUT` 读取的 TSENSE；
-- Diagnostic 中可选择的片上热二极管。
-
-Thermal Shutdown 触发后，AD5560 会自动禁止 Force Amplifier。
-
-因此 TMPALM 更接近最后一级器件自保护，而不是正常运行时的温度调节环路。
-
----
-
-## 20. Compensation
-
-Force Amplifier 为了适应不同 DUT 电容和 ESR，需要配置补偿。
-
-主要有：
-
-1. Safe Mode；
-2. Auto Compensation；
-3. Manual Compensation。
-
-### 20.1 Safe Mode
-
-Power-On 默认采用安全补偿状态，稳定性优先，但动态响应较慢。
-
-### 20.2 Auto Compensation `0x04`
-
-FPGA 配置 DUT 的大致：
+超过阈值后芯片会：
 
 ```text
-CDUT
-ESR
+Force Amplifier inhibit
+SW_INH 自动清 0
+TMPALM 拉低
 ```
 
-AD5560 根据寄存器选择内部补偿组合。
+Diagnostic Register 还可以把这些功率级相关的 `VPTAT low/high` 和对应参考电压送到 MEASOUT，用于诊断。
 
-数据手册特别提醒：
+### 20.3 GPO Thermal Diode Array
 
-- 高估 CDUT 可能造成不稳定；
-- 低估 ESR 可能造成不稳定；
-- 反方向误差通常更偏向响应变慢。
+第三类是散布在整个 die 上的片上 Thermal Diode Array，主要用于观察：
 
-### 20.3 Manual Compensation `0x05`
+- 芯片不同区域的温度；
+- 高电流输出级热点；
+- DAC / 测量电路附近温度；
+- die 上的温度梯度；
+- 多颗 AD5560 板级热分布。
 
-可以直接配置内部 gm、RP、RZ、CF、CC 等补偿参数。
+这组二极管不是通过 MEASOUT 输出，而是：
 
-这部分更适合环路调试阶段，正常业务状态机不应频繁修改。
+```text
+Selected Diode D+ -> GPO
+Selected Diode D- -> AGND
+```
+
+因此需要外部 Remote Diode Temperature Monitor，例如 ADT7461。ADI AD5560 Evaluation Board 也采用 ADT7461 读取这些温度点。
+
+这三套机制的定位可以简单记为：
+
+| 温度机制 | 输出路径 | 主要用途 |
+|---|---|---|
+| 普通 TSENSE | MEASOUT | 普通 die temperature 监测 |
+| Shutdown Sensor / VPTAT | 内部保护；诊断时可到 MEASOUT | 过温保护、功率级诊断 |
+| Thermal Diode Array | GPO + AGND | 多点热点/温度梯度测量 |
 
 ---
 
-## 21. Slew Rate 与 Ramp Function
+## 21. Compensation
 
-两者不能混淆。
+Force Amplifier 有 Safe Mode、Auto Compensation 和 Manual Compensation 三种补偿方式。
 
-### 21.1 Slew Rate
+Auto Compensation `0x04` 根据 CDUT / ESR 选择内部补偿组合；Manual Compensation `0x05` 可以直接配置 gm、RP、RZ、CF、CC 等参数。
 
-由 `DPS Register 2.SR[2:0]` 控制。
+补偿直接影响稳定性、过冲和建立时间。
 
-特点：
+---
 
-- FIN DAC 目标可以一步写到最终 code；
-- Force 路径以设定速度追目标；
-- 适合 µs 级输出边沿控制。
+## 22. Slew Rate 与 Ramp Function
 
-### 21.2 Ramp Function
+### 22.1 Slew Rate
 
-Ramp 是 FIN DAC `x1` 本身按步进变化。
+由 `DPS Register 2.SR[2:0]` 控制，是模拟输出路径的变化速度控制。
+
+### 22.2 Ramp Function
+
+Ramp 是 FIN DAC `x1` 本身按步进变化：
 
 ```text
-0x08 -> 当前 FIN x1，同时作为 Ramp Start
+0x08 -> 当前 FIN x1 / Ramp Start
 0x3E -> Ramp End Code
 0x3F -> Ramp Step Size
 0x40 -> RCLK Divider
-0x41 -> 0xFFFF，Enable Ramp
-0x42 -> 0x0000，Interrupt Ramp
+0x41 -> 0xFFFF Enable Ramp
+0x42 -> 0x0000 Interrupt Ramp
 ```
 
-Step Size 为 16 LSB 的整数倍。
+Ramp 期间普通 SPI 命令会被忽略，只接受 Interrupt Ramp，因此启动前要完成其他配置。
 
-RCLK Divider：
+详细上下电机理见 [`AD5560_CONTROL.md`](./AD5560_CONTROL.md)。
+
+---
+
+## 23. LOAD 与多器件同步
+
+AD5560 可以把 `CLEN` 或 `HW_INH` 复用为 LOAD。
+
+LOAD 可同步 FIN DAC x2、Clamp DAC x2、Current Range、Compensation 的实际更新。
+
+`LOAD=3` 可以利用共享 BUSY 释放实现多通道同步，而不占用 CLEN/HW_INH 的原功能。
+
+LOAD 不是 Ramp Start。
+
+---
+
+## 24. Diagnostic Register `0x07`
+
+Diagnostic Register 默认值 `0x0000`，主要分为三组字段：
 
 ```text
-/1 ... /255
+Bit[15:12]  DIAG Select
+Bit[11:7]   TSENSE Select
+Bit[6:5]    Test Force AMP
+Bit[4:0]    Reserved = 0
 ```
 
-Divider=1 时，数据手册给出的 RCLK 最大约 833 kHz。
+> Rev.F 表格中 TSENSE 字段文字标注存在容易混淆之处，但该字段实际需要表示 `0~31`，对应 Bit[11:7] 的 5-bit 选择值。
 
-Ramp 期间普通 SPI 命令会被忽略，接口只接受 Interrupt Ramp，因此 Ramp Start 前必须先完成其他配置。
+### 24.1 DIAG Select[3:0]
 
-更详细的上电顺序见 [`AD5560_CONTROL.md`](./AD5560_CONTROL.md)。
+用于选择内部 Diagnostic A / B 节点，再配合 DPS Register 1 的 MEASOUT `DIAG A/DIAG B` 选择输出到 MEASOUT。
+
+可访问 Force Amplifier、EXTFORCE、FINP/FINM、Measure Block、VPTAT、DAC、Clamp、Comparator、OSD、DGS 等内部节点。
+
+### 24.2 TSENSE Select[4:0]：GPO 热二极管选择
+
+`TSENSE Select = 0~7`：
+
+```text
+不连接片上 Thermal Diode
+GPO 保持普通 GPO 功能
+```
+
+`TSENSE Select = 8~31`：选择一个具体片上 Thermal Diode，并把其阳极送到 GPO。
+
+主要位置：
+
+| TSENSE Select | 位置 |
+|---:|---|
+| 8 | 高电流驱动冷端 / 数字区热端附近 |
+| 9 | 25 mA Output Stage |
+| 10 | 精密测量电路较热区域 / Force Amp 冷端 |
+| 11 | Force Amplifier 最冷端 |
+| 12 | DAC 最冷端 |
+| 13 | MEASOUT TSENSE 附近 |
+| 14 | DAC 最热端 |
+| 15 | 数字区冷端 |
+| 16~23 | Force Amplifier PNP 功率输出级不同位置 |
+| 24~31 | Force Amplifier NPN 功率输出级不同位置 |
+
+其中 16~23 和 24~31 对应 EXTFORCE1/2 的多个并联输出级位置，可用于观察 sourcing / sinking 功率级的热分布。
+
+FPGA 配置形式可理解为：
+
+```text
+Diagnostic[11:7] = thermal_diode_index
+Diagnostic[15:12] = 0       // 若本次不使用 MEASOUT diagnostic
+Diagnostic[6:0]   = 0       // 不做 Force Amp stage test
+```
+
+选定后二极管连接为：
+
+```text
+D+ -> GPO
+D- -> AGND
+```
+
+外部温度检测器通过测量 PN 结的 ΔVBE 得到温度。
+
+### 24.3 使用 GPO Thermal Diode 时的注意事项
+
+- GPO 此时是模拟 Thermal Diode 端口，不是普通数字输出；
+- 外部温度检测器的 D− 应参考 AD5560 的 AGND，布线按敏感模拟信号处理；
+- `TSENSE Select` 可以由 FPGA 轮流切换，从而扫描同一颗 AD5560 不同位置；
+- 该 Thermal Diode Array 与 `MEASOUT TSENSE`、`TMPALM/Thermal Shutdown` 是三套不同温度机制；
+- 恢复普通 GPO 时，将 `TSENSE Select` 设回正常值（通常 0）。
+
+### 24.4 Test Force AMP[1:0]
+
+Bit `[6:5]` 可以单独使能/测试 EXTFORCE1/2 的不同并联输出级，主要用于器件连接性和诊断测试，正常工作保持 0。
 
 ---
 
-## 22. LOAD 与多器件同步
-
-AD5560 没有独立 LOAD pin，可以把：
-
-- `CLEN`；或
-- `HW_INH`
-
-复用为 LOAD。
-
-LOAD 可同步：
-
-- FIN DAC x2；
-- Clamp DAC x2；
-- Current Range；
-- Compensation。
-
-如果系统还需要独立快速 `HW_INH`，通常更适合保留 `HW_INH` 原功能，将 `CLEN` 复用为 LOAD，Clamp Enable 由寄存器控制。
-
-`LOAD=3` 模式还可以通过共享 BUSY 实现多通道同步更新，而不占用 CLEN/HW_INH 的原功能。
-
----
-
-## 23. Diagnostic Register `0x07`
-
-Diagnostic 可以把许多内部节点送到 `MEASOUT`，包括：
-
-- Force Amplifier 内部节点；
-- EXTFORCE 输出级；
-- FINP / FINM；
-- Measure Block；
-- DAC 内部节点；
-- Clamp / Comparator DAC；
-- OSD / DGS DAC；
-- 多处片上温度二极管；
-- 高电流输出级分段诊断。
-
-FPGA 第一版可以暂时不用 Diagnostic，但底层寄存器驱动应允许读写 `0x07`，便于后续板卡自检和硬件调试。
-
----
-
-## 24. FPGA 推荐初始化流程
+## 25. FPGA 推荐初始化流程
 
 ```text
 POWER ON
    |
-   v
 等待 BUSY = 1
    |
-   v
-必要时 RESET
+RESET / WAIT BUSY
    |
-   v
-等待 BUSY = 1
+HW_INH = 0
    |
-   v
-保持 HW_INH = 0
-   |
-   v
 System Control
-  - PD = 1
-  - GAIN
-  - TMP threshold
-  - LOAD mode
-   |
-   v
 DPS Register 2
-  - Slew Rate
-  - Gang / System Force-Sense
-   |
-   v
 Compensation
-   |
-   v
 Alarm Setup
-   |
-   v
 OSD / DGS
-   |
-   v
 DPS Register 1
-  - Current Range
-  - Clamp Enable
-  - Measure mode
-  - SW_INH = 0
+Clamp / Comparator
+FIN DAC safe value
+Readback verify
    |
-   v
-CLL / CLH
-Comparator Threshold
-   |
-   v
-FIN DAC = safe start value
-   |
-   v
-可选 Readback 验证
-   |
-   v
 SW_INH = 1
    |
-   v
-根据系统时序释放 HW_INH
-或启动 Ramp
+按系统时序释放 HW_INH / 启动 Ramp
    |
-   v
 RUN
 ```
 
-第一版 FPGA 控制建议采用保守策略：
+第一版建议采用：
 
 ```text
-write transaction
-    -> wait BUSY high
-    -> next dependent transaction
+write -> wait BUSY high -> next dependent transaction
 ```
-
-后续再根据 Calibration Engine 的 600 ns pipeline interval 优化连续 DAC 更新。
 
 ---
 
-## 25. FPGA 推荐运行状态机
+## 26. FPGA 推荐运行状态机
 
 ```text
 IDLE / HIGH-Z
     |
     +--> CONFIG
-    |      +--> voltage
-    |      +--> current range
-    |      +--> clamp
-    |      +--> compensation
-    |      +--> alarm
     |
-    +--> ENABLE
-    |      +--> SW_INH/HW_INH
-    |      +--> optional Ramp
+    +--> ENABLE / RAMP
     |
     +--> RUN
-    |      +--> MEASOUT select
-    |      +--> external ADC sample
+    |      +--> MEASOUT / ADC
+    |      +--> temperature monitor
     |      +--> status monitor
     |
     +--> FAULT
            +--> scan 0x43
            +--> latch channel/type
-           +--> SW_INH=0 or HW_INH=0
-           +--> read 0x44 when clear is allowed
+           +--> SW_INH/HW_INH disable
+           +--> 0x44 clear when allowed
 ```
 
 ---
 
-## 26. 多颗 AD5560 的 FPGA 接口建议
-
-AD5560 SPI 命令中没有器件地址，因此多颗器件必须依赖外部 `SYNC` 选择，或使用 Daisy Chain。
-
-FPGA 多通道设计建议：
+## 27. 多颗 AD5560 的 FPGA 接口建议
 
 ```text
 SCLK  -> Shared
@@ -1320,92 +1122,38 @@ RCLK  -> Shared
 HW_INH-> 根据实际需要独立或分组
 ```
 
-其中：
-
-- `SYNC` 最重要的是“逻辑上能单颗寻址”，不要求 FPGA 必须直接占用 N 个 IO；
-- `SDO` 未选中时 High-Z，因此可以共享，但器件很多时要考虑总线电容和 SDO 驱动能力；
-- Alarm 共享后通过 SPI 扫描 `0x43` 定位器件；
-- BUSY 共享后只能得到组级 Busy 状态。
+如果每颗 AD5560 的 GPO Thermal Diode 都接外部温度检测器，则温度检测器的拓扑还需根据器件数量决定独立、复用或分组方案。
 
 ---
 
-## 27. FPGA 推荐模块划分
+## 28. FPGA 推荐模块划分
 
-不使用 MCU/DSP 风格的函数 API，建议在 RTL 中至少拆成以下几层。
+### 28.1 SPI Physical / Shift Engine
 
-### 27.1 SPI Physical / Shift Engine
+只负责 SCLK、SDI、SDO、SYNC、24-bit Shift。
 
-只负责引脚时序：
+### 28.2 AD5560 Transaction Controller
 
-```text
-SCLK
-SDI
-SDO
-SYNC
-24-bit shift
-```
+负责：
 
-对上提供类似事务接口：
-
-```text
-req_valid
-req_ready
-req_dev
-req_rw
-req_addr[6:0]
-req_wdata[15:0]
-
-rsp_valid
-rsp_rdata[15:0]
-rsp_error
-```
-
-具体信号命名可按项目规范调整，关键是上层不直接操作 SCLK bit timing。
-
-### 27.2 AD5560 Transaction Controller
-
-负责器件级事务：
-
-- 选择目标 `SYNC`；
-- 普通 Write；
+- 目标器件选择；
+- Write；
 - 两帧 Readback；
-- Readback 的 250 ns SYNC High；
 - BUSY 等待；
-- RESET 流程；
-- DAC `x1` 和普通寄存器的不同 update timing。
+- RESET；
+- DAC x1 / 普通寄存器不同时序。
 
-### 27.3 Register / Channel Configuration Layer
+### 28.3 Register / Channel Configuration Layer
 
-维护：
+维护 System、DPS1/2、Alarm、Compensation、FIN、Clamp、Comparator、Diagnostic 等寄存器 Shadow。
 
-- System Control；
-- DPS1 / DPS2；
-- Alarm；
-- Compensation；
-- 每通道 Current Range；
-- FIN / Clamp / Comparator 参数；
-- 必要的 Shadow Register。
+### 28.4 Function Sequencer
 
-使用 Shadow Register 可以避免修改某一 bit 时破坏同一寄存器的其他字段。
-
-### 27.4 Function Sequencer
-
-实现：
-
-- 初始化；
-- 设置电压；
-- 量程切换；
-- Clamp；
-- MEASOUT 选择；
-- 上下电；
-- Ramp；
-- Alarm 扫描与关断。
-
-上位机或项目应用模块只给出物理参数和动作请求，不直接关心 SPI bit timing。
+实现初始化、Voltage、Range、Clamp、MEASOUT、上下电、Ramp、Alarm 扫描、温度扫描等功能。
 
 ---
 
-## 28. 第一阶段建议实现的最小功能集
+## 29. 第一阶段建议实现的最小功能集
 
 ### SPI / Transaction
 
@@ -1422,6 +1170,7 @@ rsp_error
 - `0x03` DPS Register 2；
 - `0x04` Compensation 1；
 - `0x06` Alarm Setup；
+- `0x07` Diagnostic；
 - `0x08` FIN DAC；
 - `0x0C` OSD；
 - `0x0D/0x10` CLL/CLH；
@@ -1438,125 +1187,64 @@ rsp_error
 - Enable / Disable Output；
 - MEASOUT 选择；
 - Alarm Read/Clear；
-- Ramp。
-
-Comparator、Gang、Diagnostic、Manual Compensation 和复杂连续 DAC 更新可以第二阶段加入。
-
----
-
-## 29. FPGA 实现中特别容易踩坑的点
-
-### 29.1 `PD=0` 是 Power-Down
-
-不要按名字直觉把 `PD` 当 Enable。
-
-### 29.2 `SW_INH=1` 才是允许输出
-
-并且必须同时满足 `HW_INH=1`。
-
-### 29.3 Alarm Status 是 Active-Low
-
-```text
-0 = Alarm
-1 = No Alarm
-```
-
-建议 FPGA 状态解析层立即转换成内部正逻辑 fault flags。
-
-### 29.4 `0x44` 会清 Latched Alarm
-
-先用 `0x43` 诊断，再决定何时读 `0x44`。
-
-### 29.5 Readback 是两帧
-
-第一帧指定地址，第二帧 NOP 才得到数据。
-
-### 29.6 Readback SCLK 低于 Write SCLK
-
-不要把 50 MHz write-only 时钟直接当成 Readback 时钟。
-
-### 29.7 DAC `x1` 写会进入 Calibration Engine
-
-BUSY 最大时间约 1.5 µs，并且内部是 600 ns / 600 ns / 300 ns 三阶段流水。
-
-### 29.8 写 `m/c` 不会自动刷新当前 DAC 输出
-
-`m/c` 写本身不启动 Calibration Engine；新的系数要等下一次相应 `x1` 写触发 `x2` 重算后才进入实际 DAC 数据路径。
-
-### 29.9 MEASOUT 需要外部 ADC
-
-不能通过读 AD5560 寄存器直接得到实际 DUT 电压/电流数值。
-
-### 29.10 Current Range 改变后相关参数必须同步
-
-量程、测量换算、Comparator 和 Clamp 都有关联。
-
-### 29.11 Compensation 不能忽略
-
-高电流和大 DUT 电容下，补偿直接影响稳定性、过冲和建立时间。
+- Ramp；
+- Diagnostic / GPO Thermal Diode Select。
 
 ---
 
-## 30. Datasheet 推荐阅读顺序
+## 30. FPGA 实现中特别容易踩坑的点
+
+1. `PD=0` 是 Power-Down；
+2. `SW_INH=1` 且 `HW_INH=1` 才允许 Force Amplifier 工作；
+3. Alarm Status 是 Active-Low；
+4. `0x44` 会清 Latched Alarm；
+5. Readback 是两帧；
+6. Readback SCLK 低于 write-only SCLK；
+7. DAC `x1` 写会进入 Calibration Engine；
+8. 写 `m/c` 不会自动刷新当前 DAC 输出；
+9. MEASOUT 需要外部 ADC；
+10. Current Range 改变后测量、Comparator、Clamp 参数要同步；
+11. Compensation 不能忽略；
+12. `FORCE` 只用于内部电流档，>25 mA 要看 EXTFORCE1/2；
+13. `SYS_FORCE/SYS_SENSE` 是 System PMU 接口，不是普通 DUT 必接线；
+14. GPO 选择 Thermal Diode 后不能同时当普通数字 GPO 使用；
+15. GPO Thermal Diode 的负端是 AGND，外部 Remote Diode Monitor 的地参考要正确处理。
+
+---
+
+## 31. Datasheet 推荐阅读顺序
 
 如果主要做 FPGA 驱动和寄存器控制，可以按以下顺序阅读 Rev.F：
 
 1. Page 1 ~ 3：Features / Functional Block Diagram；
 2. Page 16 ~ 19：Pin Description；
-3. Page 29 ~ 35：Force、Measure、Clamp、Current Range、Temperature；
+3. Page 29 ~ 35：Force、Measure、Clamp、Current Range、GPO、System Force/Sense、Temperature；
 4. Page 36 ~ 39：Compensation；
-5. Page 40 ~ 42：DAC Levels、Offset/Gain Register、Calibration Engine 相关结构；
+5. Page 40 ~ 42：DAC Levels、Offset/Gain、Calibration Engine；
 6. Page 43 ~ 44：Slew Rate / Ramp；
-7. Page 45 ~ 46：Serial Interface、BUSY、LOAD、Register Update Rates；
-8. Page 47 ~ 57：寄存器定义；
+7. Page 45 ~ 46：Serial Interface、BUSY、LOAD；
+8. Page 47 ~ 57：寄存器定义，尤其 DPS Register 2 和 Diagnostic Register；
 9. Page 57 ~ 58：Readback / Power-On Default；
 10. Page 59 以后：Power Supply、外围、Layout、Thermal。
 
-对 FPGA 控制来说，**Page 41、45、46、47~58** 尤其重要。
+---
+
+## 32. 后续可继续拆分的文档
+
+后续正式 RTL 开发时可进一步拆分：
+
+1. `AD5560_REGISTER_MAP.md`：完整寄存器 bit / mask / reset / RW；
+2. `AD5560_CONVERSION.md`：Voltage、Current、Clamp、Comparator 换算；
+3. `AD5560_DRIVER_DESIGN.md`：SPI、BUSY、Readback、Alarm、Shadow；
+4. 项目级上下电方案见 [`AD5560_PROJECT_POWER_SEQUENCE.md`](./AD5560_PROJECT_POWER_SEQUENCE.md)。
 
 ---
 
-## 31. 后续可继续拆分的文档
-
-后续如果进入正式 RTL 开发，可进一步拆分：
-
-1. `AD5560_REGISTER_MAP.md`
-   - 完整寄存器 bit 定义；
-   - mask / shift；
-   - reset value；
-   - RW 属性。
-
-2. `AD5560_CONVERSION.md`
-   - Voltage ↔ FIN code；
-   - Current ↔ MEASOUT；
-   - Clamp ↔ DAC code；
-   - Comparator ↔ DAC code。
-
-3. `AD5560_DRIVER_DESIGN.md`
-   - FPGA SPI 状态机；
-   - 多通道 SYNC；
-   - BUSY 调度；
-   - Readback；
-   - Alarm 扫描；
-   - Register Shadow。
-
-4. `AD5560_POWER_SEQUENCE.md`
-   - DUT 上电；
-   - Ramp；
-   - 下电；
-   - Fault 关断。
-
-现有 `AD5560_CONTROL.md` 已覆盖第 4 项的一部分。
-
----
-
-## 32. 官方参考资料
+## 33. 官方参考资料
 
 ### AD5560 Rev.F Data Sheet
 
 https://www.analog.com/media/en/technical-documentation/data-sheets/AD5560.pdf
-
-本文的寄存器地址、位定义、SPI 时序、Calibration Engine 和主要器件行为均以该版本为主要依据。
 
 ### AD5560 Product Page
 
@@ -1572,9 +1260,9 @@ https://www.analog.com/en/resources/app-notes/an-2507.html
 
 ---
 
-## 33. 总结
+## 34. 总结
 
-从 FPGA 角度，AD5560 不是单纯的“SPI DAC”，而是一套完整 DPS：
+从 FPGA 角度，AD5560 是一套完整 DPS：
 
 ```text
 FPGA
@@ -1583,7 +1271,9 @@ FPGA
  |
  +-- FIN x1/m/c -----------> Calibration Engine -> x2 -> Force DAC
  |
- +-- Current Range --------> Output / Measure Path
+ +-- Current Range --------> FORCE / EXTFORCE + Measure Path
+ |
+ +-- SENSE / DUTGND -------> Kelvin Feedback / Protection
  |
  +-- CLL / CLH ------------> Current Clamp
  |
@@ -1591,26 +1281,15 @@ FPGA
  |
  +-- ME MUX ---------------> MEASOUT -> ADC -> FPGA
  |
- +-- OSD / DGS ------------> Kelvin Protection
+ +-- Diagnostic -----------> Internal Nodes / Thermal Diode Select
  |
- +-- Compensation ---------> Force Loop Stability
+ +-- GPO ------------------> Digital Output OR Thermal Diode D+
  |
  +-- Alarm ----------------> Fault Detect
  |
  +-- Slew / Ramp ----------> Power Sequence
 ```
 
-其中 Calibration Engine 是理解 DAC 寄存器行为的关键：
+其中需要特别区分三类温度信息：普通 `MEASOUT TSENSE`、功率级 Thermal Shutdown Sensor、以及通过 `GPO` 引出的多点 Thermal Diode Array。
 
-```text
-x1 写入
-  -> 使用当前 m/c 计算 x2
-  -> BUSY Low
-  -> 三阶段流水计算
-  -> BUSY High
-  -> DAC 更新
-```
-
-而 `m/c` 写入本身不触发这条计算链。
-
-第一版 RTL 建议先把 **SPI、BUSY、Readback、RESET、SW_INH、FIN DAC、Alarm** 跑通，再逐步加入 Measure、Clamp、Compensation、Ramp 和高吞吐 DAC 更新。
+对于输出连接，也需要区分：内部电流档使用 `FORCE`，外部高电流档使用 `EXTFORCE1/2`，`SENSE` 和 `DUTGND` 提供 Kelvin 反馈；`SYS_FORCE/SYS_SENSE/SYS_DUTGND` 属于 System PMU 扩展接口，`MASTER_OUT/SLAVE_IN` 属于 Gang 扩展接口。
