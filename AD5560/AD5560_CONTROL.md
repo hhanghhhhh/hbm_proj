@@ -8,7 +8,10 @@
 
 - `FIN DAC`、`SW_INH`、`HW_INH` 与 Force Amplifier 的关系；
 - `High-Z`、主动输出 `0 V`、正常输出之间的区别；
+- FIN DAC 的 `x1 -> Calibration Engine -> x2 -> DAC -> Force` 完整数据链路；
+- `VREF`、固定模拟增益 `5.125`、`m/c` 校准寄存器以及 Offset DAC 之间的关系；
 - Programmable Slew Rate 与 Ramp Function；
+- Ramp Step Size 在 `x1` 域中的作用位置，以及实际电压步长、Ramp 斜率的计算方法；
 - Ramp Function 的启动、结束和中断机制；
 - `LOAD` 的实际作用，以及它与 DAC `x1/x2`、`BUSY`、Ramp 的关系；
 - 从下电状态启动到目标电压，以及在线从一个电压变化到另一个电压时，可采用的不同控制方式；
@@ -181,38 +184,198 @@ ON
 
 ---
 
-## 5. FIN DAC 写入后的实际更新路径
+## 5. FIN DAC 的完整数据链路与计算关系
 
-AD5560 的 FIN DAC 不是简单的“SPI 写 0x08 后直接把该 16-bit 原码送到模拟 DAC”。
+AD5560 的 FIN DAC 不是简单地把 SPI 写入的 16-bit 原码直接送入模拟 DAC。
 
-内部可以理解为：
+### 5.1 完整链路
+
+对于 Force Voltage，可以按下面的链路理解：
 
 ```text
-FPGA SPI
-   |
-   v
-FIN x1 Register (0x08)
-   |
-   | 读取当前 m / c
-   v
+上位机目标电压
+      |
+      v
+FIN DAC x1 Register (0x08)
+      |
+      |  Ramp Function 直接修改的也是 x1
+      v
 Calibration Engine
-   |
-   v
-FIN x2
-   |
-   v
-Actual Resistor-String DAC
-   |
-   v
+      |  m: Gain Correction
+      |  c: Offset Correction
+      v
+FIN DAC x2
+      |
+      v
+16-bit Resistor-String DAC
+      |
+      |  固定模拟增益 = 5.125
+      |  VREF 通常 = 5 V
+      v
+Force DAC 模拟电压
+      |
+      |  Offset DAC 平移整个输出窗口
+      |  DUTGND 提供基准
+      v
 Force Amplifier
+      |
+      v
+FORCE / SENSE 闭环
+      |
+      v
+DUT
 ```
 
 其中：
 
-- `x1`：SPI 可写、可读的目标码；
+- `x1`：SPI 可写、可读的目标码，也是 Ramp Engine 操作的数字码；
 - `m/c`：Gain / Offset Correction 系数；
-- `x2`：Calibration Engine 计算后的实际 DAC 数据；
-- `x2` 不支持通过 SPI 直接 Readback。
+- `x2`：Calibration Engine 计算后真正加载到 resistor-string DAC 的数据字；
+- `x2` 不支持通过 SPI 直接 Readback；
+- `5.125` 是芯片内部固定的 DAC amplifier 模拟增益，不是可编程增益；
+- `Offset DAC` 与校准寄存器 `c` 是两个不同概念。
+
+### 5.2 VREF 与固定 5.125 增益
+
+AD5560 的 `VREF` 输入允许约 `2 V ~ 5 V`，通常采用 `5 V`。
+
+内部 DAC amplifier 的固定增益为：
+
+```text
+G_DAC = 5.125
+```
+
+因此当：
+
+```text
+VREF = 5 V
+```
+
+原始 DAC 模拟跨度为：
+
+```text
+5.125 x 5 V = 25.625 V
+```
+
+需要注意：
+
+> `25.625 V` 是 DAC 链路包含 overrange 的原始 span，不代表输出一定是 `0 ~ 25.625 V`，也不代表 AD5560 正常应用时定义了 25.625 V 的额定 Force span。
+
+AD5560 标称 Force Voltage span 为约 `25 V`，额外的模拟增益用于给系统 gain/offset correction 留出校准余量。Offset DAC 可以在器件 headroom 允许的范围内上下移动这个电压窗口。
+
+因此应区分：
+
+```text
+Raw DAC span          = 5.125 x VREF
+VREF = 5 V 时         = 25.625 V
+
+Nominal FV span       ~= 25 V
+Usable overall range  ~= -22 V ... +25 V
+```
+
+`5.125` 本身固定，不能通过寄存器关闭或修改；有效数字增益由 `m` register 另外控制。
+
+### 5.3 x1 -> x2：Calibration Engine
+
+DAC 数字校准公式为：
+
+```text
+x2 = x1 x (m + 1) / 2^16 + (c - 2^15)
+```
+
+即：
+
+```text
+x2 = x1 x (m + 1) / 65536 + (c - 32768)
+```
+
+其中：
+
+| 参数 | 含义 | 默认值 |
+|---|---|---:|
+| `x1` | 写入 FIN DAC input register 的 16-bit code | `0x8000` |
+| `m` | Gain Correction | `0xFFFF` |
+| `c` | Offset Correction | `0x8000` |
+| `x2` | Calibration Engine 计算后送入实际 DAC 的 code | 内部值 |
+
+默认：
+
+```text
+m = 0xFFFF -> (m + 1) / 65536 = 1
+c = 0x8000 -> c - 32768 = 0
+```
+
+因此默认情况下：
+
+```text
+x2 = x1
+```
+
+`m` 和 `c` 是数字校准参数：
+
+- `m` 改变 `x1 -> x2` 的斜率，即有效数字增益；
+- `c` 对 `x2` 增加固定偏移；
+- 二者都位于实际 resistor-string DAC 之前。
+
+### 5.4 x2 -> Force 电压
+
+Force DAC 的转换关系为：
+
+```text
+VFORCE = 5.125 x VREF x x2 / 65536
+       - 5.125 x VREF x OFFSET_DAC_CODE / 65536
+       + DUTGND
+```
+
+整理为：
+
+```text
+VFORCE = (5.125 x VREF / 65536) x (x2 - OFFSET_DAC_CODE)
+       + DUTGND
+```
+
+这里：
+
+- `x2` 是经过 `m/c` Calibration Engine 后的 FIN DAC code；
+- `OFFSET_DAC_CODE` 是独立 Offset DAC 的 code，用于平移 Force/Clamp/Comparator 等 DAC 的工作窗口；
+- `DUTGND` 是整个 DUT 电压的参考基准。
+
+将 `x2` 公式代入，可以得到从 `x1` 到 Force 电压的完整关系：
+
+```text
+VFORCE = (5.125 x VREF / 65536)
+         x [x1 x (m + 1) / 65536
+            + (c - 32768)
+            - OFFSET_DAC_CODE]
+         + DUTGND
+```
+
+这个公式是理解电压设置、校准和 Ramp 的基础。
+
+### 5.5 c register 与 Offset DAC 的区别
+
+两者名称都带 Offset，但作用位置不同：
+
+```text
+c register
+    -> Calibration Engine 内部的数字 offset correction
+    -> 直接修正 x1 -> x2
+
+Offset DAC
+    -> 独立的 16-bit DAC
+    -> 用于整体移动约 25 V 的 Force 输出窗口
+```
+
+软件和 RTL 中建议始终使用不同名称，例如：
+
+```text
+FIN_C_CAL
+OFFSET_DAC_CODE
+```
+
+避免把两者混淆。
+
+### 5.6 默认直接更新时序
 
 默认没有启用外部 LOAD 延迟更新时，写入新的 `x1` 后：
 
@@ -233,9 +396,7 @@ Actual DAC 更新
 
 因此“FIN DAC 写入后直接更新”更准确的说法是：
 
-> 在默认直接更新模式下，写 `x1` 会触发 Calibration Engine，计算完成后新的 `x2` 自动更新到实际 DAC；并不是 SPI 帧结束的瞬间模拟输出立即变化。
-
-DAC `x1` 写入涉及 Calibration Engine，`BUSY` Low 时间可达到约 1.5 us 量级。
+> 在默认直接更新模式下，写 `x1` 会触发 Calibration Engine；计算完成后新的 `x2` 自动更新到实际 DAC，并不是 SPI 帧结束瞬间模拟输出立即变化。
 
 ---
 
@@ -254,11 +415,11 @@ AD5560 有两套不同机制，不能混淆。
 | 0 | 1 V/us |
 | 1 | 0.875 V/us |
 | 2 | 0.75 V/us |
-| 3 | 0.62 V/us |
+| 3 | 0.625 V/us |
 | 4 | 0.5 V/us |
-| 5 | 0.43 V/us |
+| 5 | 0.4375 V/us |
 | 6 | 0.35 V/us |
-| 7 | 0.3125 V/us |
+| 7 | 0.313 V/us |
 
 该功能通过改变 Force DAC 输出放大器相关内部补偿，限制模拟输出追踪目标值的速度。
 
@@ -280,36 +441,341 @@ Force Amplifier 开始向已预设的 1.1 V 目标值变化，输出边沿受 Sl
 
 Slew Rate 适合较快的受控电压变化，但不能把 `DeltaV / Slew Rate` 当成高精度 Ramp 定时器。
 
-### 6.2 Ramp Function
+### 6.2 Ramp Function 的本质
 
-Ramp Function 的本质不同：
+Ramp Function 的本质是：
 
-> Ramp 过程中 FIN DAC `x1` code 本身按步进逐渐增加或减小。
+> **Ramp Engine 直接在 FIN DAC `x1` code 上做加减；每一步得到新的 `x1` 后，再经过 Calibration Engine 计算新的 `x2`，最后更新实际 DAC。**
+
+数据链路为：
+
+```text
+FIN x1 Start Code
+      |
+      | +/- Ramp Step Size
+      v
+new FIN x1
+      |
+      v
+Calibration Engine (m/c)
+      |
+      v
+new FIN x2
+      |
+      v
+Actual DAC
+      |
+      v
+Force Amplifier / DUT
+```
+
+因此 Ramp Step Size **不是直接加在 x2 上，也不是在 Calibration Engine 后对模拟电压直接增加一个固定值**。
 
 相关寄存器：
 
 | 地址 | 功能 |
 |---|---|
 | `0x08` | FIN DAC x1；Ramp 开始前的当前值就是 Start Code |
-| `0x3E` | Ramp End Code |
-| `0x3F` | Ramp Step Size |
+| `0x3E` | Ramp End Code，与 FIN x1 属于同一 code 域 |
+| `0x3F` | Ramp Step Size，定义 x1 每一步变化多少 |
 | `0x40` | RCLK Divider |
 | `0x41` | Enable Ramp，写 `0xFFFF` 启动 |
 | `0x42` | Interrupt Ramp，写 `0x0000` 中断 |
 
-Ramp Step Size 以 16 LSB 为基本步进单位，更新节拍由外部 `RCLK` 与 Divider 决定。
+### 6.3 Ramp Step Size 寄存器
 
-Divider = 1 时，数据手册给出的 RCLK 最大约 833 kHz。
+`0x3F` 的 `D6:D0` 定义 Step Size，以 `16 LSB` 为基本单位。
 
-Ramp 启动后通常需要约：
+数据手册给出的关系为：
+
+```text
+0000000 -> 16 LSB
+0000001 -> 16 LSB
+0000010 -> 32 LSB
+...
+1111111 -> 2032 LSB
+```
+
+因此可以写成：
+
+```text
+STEP_X1 = 16 x max(STEP_REG, 1)
+```
+
+其中：
+
+```text
+STEP_REG = 0 ... 127
+STEP_X1  = 16 ... 2032 x1-LSB
+```
+
+例如：
+
+```text
+STEP_REG = 1   -> STEP_X1 = 16
+STEP_REG = 10  -> STEP_X1 = 160
+STEP_REG = 127 -> STEP_X1 = 2032
+```
+
+这里的 LSB 首先应理解为 **FIN DAC x1 code 的 LSB**。
+
+### 6.4 Ramp 每一步的 x1 更新
+
+设：
+
+```text
+x1[k]     = 当前 FIN x1
+END       = Ramp End Code
+S         = STEP_X1
+```
+
+上升 Ramp：
+
+```text
+x1[k+1] = min(x1[k] + S, END)
+```
+
+下降 Ramp：
+
+```text
+x1[k+1] = max(x1[k] - S, END)
+```
+
+Ramp 的方向由当前 FIN `x1` 与 `Ramp End Code` 的大小关系决定。
+
+如果最后剩余的 code 差小于一个完整 Step，最后一步自动缩小，使 FIN x1 恰好到达 End Code。
+
+因此：
+
+> Ramp Start Code、Ramp End Code 和 Ramp Step Size 都在 `x1` code 域中定义。
+
+### 6.5 Ramp Step 经过 Calibration Engine 后的实际 code 变化
+
+因为：
+
+```text
+x2 = x1 x (m + 1) / 65536 + (c - 32768)
+```
+
+相邻两步做差：
+
+```text
+Delta_x2 = Delta_x1 x (m + 1) / 65536
+```
+
+对于一个正常的完整 Ramp Step：
+
+```text
+Delta_x1 = STEP_X1
+```
+
+因此：
+
+```text
+Delta_x2 = STEP_X1 x (m + 1) / 65536
+```
+
+忽略整数取整带来的小量化误差，可以得到实际单步 Force 电压变化：
+
+```text
+Delta_V_STEP
+    = (5.125 x VREF / 65536)
+      x STEP_X1
+      x (m + 1) / 65536
+```
+
+即：
+
+```text
+Delta_V_STEP
+    = 5.125 x VREF x STEP_X1 x (m + 1) / 65536^2
+```
+
+由这个差分公式可以直接看出：
+
+- `m` 会影响实际 Ramp 电压步长；
+- `VREF` 会影响实际 Ramp 电压步长；
+- `c` 是固定 offset，做差后消失，因此不影响 Ramp 步长；
+- `Offset DAC` 只平移整个输出窗口，做差后消失，因此不影响 Ramp 步长；
+- `DUTGND` 是公共基准，做差后也不影响 Ramp 步长。
+
+### 6.6 为什么数据手册写 16 LSB = 6.1 mV
+
+当 `VREF = 5 V` 时，AD5560 的 raw DAC span 为：
+
+```text
+5.125 x 5 V = 25.625 V
+```
+
+但数据手册 Ramp 表使用的是约 `25 V nominal Force span` 的口径，因此：
+
+```text
+1 LSB ~= 25 V / 65536
+      ~= 381.47 uV
+```
+
+于是：
+
+```text
+16 LSB ~= 6.1035 mV
+2032 LSB ~= 775.15 mV
+```
+
+这就是 Ramp Step Size 表中：
+
+```text
+16 LSB   ~= 6.1 mV
+2032 LSB ~= 775 mV
+```
+
+的来源。
+
+需要注意：如果直接使用 `25.625 V raw span` 且 `m = 0xFFFF`，则理论 raw code 换算会得到：
+
+```text
+1 raw DAC LSB ~= 25.625 V / 65536 ~= 391.0 uV
+16 LSB        ~= 6.256 mV
+```
+
+两种结果的区别来自：
+
+```text
+25.625 V = 包含 overrange 的 raw DAC span
+25 V     = datasheet 对正常 Force Voltage 使用的 nominal span
+```
+
+因此软件实现时不要一边使用 `25.625 V raw span`，另一边又直接把 `16 LSB = 6.1 mV` 当成同一套未经校准的换算关系。
+
+如果系统已经通过 `m/c` 做过校准，更适合使用系统实际有效的 `VSPAN_EFF` 进行换算。
+
+### 6.7 RCLK Divider 与理论 Ramp 更新周期
+
+`0x40` 的 `D7:D0` 定义 RCLK Divider：
+
+```text
+0   -> /1
+1   -> /1
+2   -> /2
+3   -> /3
+...
+255 -> /255
+```
+
+定义有效 Divider：
+
+```text
+D = max(RCLK_DIV_REG, 1)
+```
+
+则稳态 Ramp step 的更新频率可按：
+
+```text
+F_STEP = F_RCLK / D
+```
+
+更新周期：
+
+```text
+T_STEP = D / F_RCLK
+```
+
+Ramp 每一步都需要经过 Calibration Engine。数据手册说明 calibration delay 约为 `1.2 us`，并给出 Divider = 1 时外部 RCLK 最大约 `833 kHz`：
+
+```text
+1 / 833 kHz ~= 1.2 us
+```
+
+因此在最快工作条件下，下一步的计算与当前输出 settling 是流水进行的。
+
+### 6.8 理论 Ramp 斜率公式
+
+平均数字 Ramp 斜率可以按：
+
+```text
+SR = Delta_V_STEP / T_STEP
+```
+
+代入前述关系：
+
+```text
+SR
+ = (5.125 x VREF / 65536)
+   x STEP_X1
+   x (m + 1) / 65536
+   x F_RCLK / D
+```
+
+即：
+
+```text
+SR(V/s)
+ = 5.125 x VREF x STEP_X1 x (m + 1) x F_RCLK
+   / (65536^2 x D)
+```
+
+换成 `V/us`：
+
+```text
+SR(V/us)
+ = 5.125 x VREF x STEP_X1 x (m + 1) x F_RCLK
+   / (65536^2 x D x 10^6)
+```
+
+如果软件已经使用经过系统校准后的有效 Force span `VSPAN_EFF`，可以简化成更实用的形式：
+
+```text
+Delta_V_STEP ~= VSPAN_EFF x STEP_X1 / 65536
+```
+
+```text
+SR ~= VSPAN_EFF x STEP_X1 / 65536 x F_RCLK / D
+```
+
+这种写法更适合上位机根据“目标斜率”反算 Step Size 和 Divider。
+
+### 6.9 datasheet 的 0.775 V/us 与 833 kHz 说明
+
+数据手册给出：
+
+```text
+VREF = 5 V
+RCLK = 833 kHz
+STEP = 2032 LSB
+Divider = 1
+Fastest Ramp Rate = 0.775 V/us
+```
+
+但如果把表中的 `2032 LSB ~= 775 mV` 直接除以：
+
+```text
+1 / 833 kHz ~= 1.2 us
+```
+
+得到的算术结果约为：
+
+```text
+775 mV / 1.2 us ~= 0.646 V/us
+```
+
+ADI EngineerZone 对该问题的答复指出，datasheet 中的 `0.775 V/us` 应理解为器件设计/characterization 给出的能力值，而不是简单按 `Step Voltage x 833 kHz` 推导得到的公式值。
+
+因此项目中的寄存器选择算法建议：
+
+> **按实际 `x1 Step -> m 校准 -> 实际电压 Step -> RCLK/Divider` 的链路计算目标 Ramp；不要用 datasheet 的 `0.775 V/us` 反推寄存器。**
+
+同时，实际 DUT 节点电压还会受到 Force Amplifier slew、负载电容、电流限制、环路稳定性以及线路压降等模拟因素影响。
+
+### 6.10 Ramp 启动延迟
+
+Ramp Enable 后通常需要约：
 
 ```text
 (2 x Divider + 2) 个 RCLK
 ```
 
-才开始实际更新，并可能存在约 +/-1 个 RCLK 的启动不确定性。
+才开始实际更新，并可能存在约 `+/-1 RCLK` 的启动不确定性。
 
-Ramp 的每一步都会更新 FIN `x1`，并经过 Calibration Engine 生成新的 `x2` 后作用到实际 DAC。
+这部分属于 Ramp 启动 latency，不应混入稳态每一步的 `T_STEP` 斜率计算，但在计算整段 Ramp 总时间时需要计入。
 
 ---
 
@@ -427,6 +893,7 @@ Force Amplifier 禁止，DUT 为 High-Z。
 - Clamp / Current Limit；
 - Compensation；
 - Alarm；
+- FIN DAC `m/c` 校准参数；
 - Ramp Step Size；
 - RCLK Divider；
 - 其他本次工作模式需要的参数。
@@ -434,15 +901,19 @@ Force Amplifier 禁止，DUT 为 High-Z。
 ### 8.3 设置起点和终点
 
 ```text
-FIN DAC x1 = 0 V
-Ramp End Code = V_TARGET
+FIN DAC x1 = START_CODE
+Ramp End Code = END_CODE
 ```
 
 Ramp Start 没有独立寄存器，启动 Ramp 时当前 FIN `x1` 就是 Start Code。
 
+需要注意：
+
+> Start Code 和 End Code 都是 `x1` 域中的 code。若上位机输入的是实际电压，应依据当前 `m/c`、Offset DAC、VREF 和 DUTGND 的配置，将实际电压反算为对应的 `x1`。
+
 ### 8.4 先进入 ZERO_FORCE
 
-例如：
+如果采用从 0 V Ramp 到工作电压的上电方式，例如：
 
 ```text
 SW_INH = 1
@@ -462,7 +933,7 @@ HW_INH = 1
 ```text
 SW_INH = 1
 HW_INH = 1
-FIN DAC = 0 V
+FIN DAC = 0 V 对应 x1
 ```
 
 Force Amplifier 已经接管 DUT，DUT 被主动调节到 Ramp 起始电压。
@@ -486,7 +957,7 @@ RCLK
 RCLK Divider
 ```
 
-逐步更新 FIN x1，直到目标值。
+逐步更新 FIN x1；每一步新的 x1 都经过 Calibration Engine 转换成 x2 后再更新实际 DAC，直到目标值。
 
 完整过程：
 
@@ -497,18 +968,18 @@ OFF_HIZ
 配置静态参数
   |
   v
-FIN = 0 V
-Ramp End = V_TARGET
+FIN x1 = START
+Ramp End = TARGET
   |
   v
-ZERO_FORCE
+ZERO_FORCE / START_FORCE
   |
   v
 Ramp Enable
   |
   v
 RAMP_ACTIVE
-0 V -> ... -> V_TARGET
+START -> ... -> TARGET
   |
   v
 ON
@@ -520,7 +991,7 @@ ON
 
 ```text
 HW_INH = 0
-FIN: 0 -> V_TARGET 完成 Ramp
+FIN: START -> V_TARGET 完成 Ramp
 然后 HW_INH = 1
 ```
 
@@ -538,7 +1009,7 @@ Ramp 会在以下情况之一发生时退出：
 2. 控制器写 `0x42 = 0x0000` 执行 Interrupt Ramp；
 3. 已使能的 Alarm 触发，使 Ramp 被中断。
 
-被中断时，FIN DAC 停留在当时已经到达的值，并退出 Ramp Mode。
+被中断时，FIN DAC `x1` 停留在当时已经到达的值，并退出 Ramp Mode。
 
 ### 9.2 没有专用 RAMP_DONE 标志
 
@@ -562,15 +1033,21 @@ FPGA 已知：
 - Divider；
 - RCLK 频率。
 
-因此可以在 FPGA 中根据参数计算 Ramp 所需步数和预计时间，并加入必要 margin。
+因此可以计算 Ramp 所需步数和预计时间。
 
-概念上的步数为：
+完整步数近似为：
 
 ```text
-N ~= ceil(abs(END - START) / STEP)
+N_STEP = ceil(abs(END - START) / STEP_X1)
 ```
 
-还需要计入 Ramp 启动内部延迟以及 RCLK 相位不确定性。
+稳态 Step 时间近似为：
+
+```text
+T_STEP = Divider / F_RCLK
+```
+
+整段时间估算时还需要加入 Ramp 启动内部延迟以及 RCLK 相位不确定性。
 
 如果需要进一步确认，可在预计完成后读取：
 
@@ -650,7 +1127,7 @@ Calibration Engine
    v
 new FIN x2 ready
    |
-   |  是否立即更新由 LOAD 模式决定
+   | 是否立即更新由 LOAD 模式决定
    v
 Actual DAC
 ```
@@ -881,16 +1358,17 @@ CONFIG_STATIC
   Clamp
   Compensation
   Alarm
+  m / c
   Ramp Step
   RCLK Divider
   |
   v
 SET_RAMP
-  FIN = START
+  FIN x1 = START
   Ramp End = TARGET
   |
   v
-ZERO_FORCE
+START_FORCE
   SW_INH = 1
   HW_INH = 1
   |
@@ -941,29 +1419,89 @@ ON at V1
 
 ---
 
-## 15. 器件控制约束总结
+## 15. FPGA / 上位机计算建议
+
+如果上位机接口直接使用：
+
+```text
+START_VOLTAGE
+END_VOLTAGE
+RAMP_RATE (V/us 或 mV/us)
+```
+
+建议内部按以下顺序换算：
+
+```text
+1. 根据当前 VREF / m / c / Offset DAC / DUTGND
+   将 START_VOLTAGE、END_VOLTAGE 反算成 x1 code
+
+2. START_CODE 写入 FIN DAC x1 (0x08)
+
+3. END_CODE 写入 Ramp End Code (0x3E)
+
+4. 根据目标 RAMP_RATE、当前 m、VREF 和 RCLK
+   枚举/选择 STEP_X1 与 Divider
+
+5. 写 Ramp Step Size (0x3F)
+   写 RCLK Divider (0x40)
+
+6. Force Amplifier 已处于 Ramp 起始电压后
+   Write 0x41 = 0xFFFF 启动 Ramp
+```
+
+在已经完成系统标定的实现中，建议保存一个统一的有效电压换算关系，例如：
+
+```text
+VSPAN_EFF
+或
+x1_to_voltage_gain
+```
+
+上位机和 FPGA 都基于同一套校准参数计算，不要在不同模块中分别硬编码：
+
+```text
+16 LSB = 6.1 mV
+25.625 V span
+25 V span
+```
+
+这些不同口径，否则容易造成 Ramp 斜率和目标电压计算不一致。
+
+---
+
+## 16. 器件控制约束总结
 
 1. 复位完成后先等待 `BUSY = High`，再开始寄存器配置；
 2. FIN DAC 与 Force Amplifier Enable 是两个不同概念；
 3. `SW_INH = 1` 且 `HW_INH = 1` 时 Force Amplifier 才允许工作；
 4. `High-Z` 与主动输出 `0 V` 完全不同；
-5. 默认 `LOAD=0` 时，写 FIN x1 后经过 Calibration Engine，新的 x2 在内部处理完成后自动作用到实际 DAC；
-6. LOAD 控制的是“已经准备好的内部新值什么时候真正生效”，不是额外的 FIN x1 预写寄存器；
-7. LOAD 不负责 Power Enable，也不能启动 Ramp；
-8. Programmable Slew Rate 和 Ramp Function 是两种不同的输出变化机制；
-9. 使用 Ramp Function 给 DUT 上电时，Ramp 之前 Force Amplifier 必须已经作用于 DUT，通常先进入 Ramp Start 电压；
-10. Ramp 只能通过 `0x41 = 0xFFFF` 启动；
-11. Ramp 运行期间普通 SPI 操作受限，应在启动前完成相关配置；
-12. AD5560 没有专用 `RAMP_DONE` 标志，FPGA 可依据已知参数计时，并在需要时读回 FIN x1 确认是否达到 End Code；
-13. Ramp 期间 Alarm 可以导致 Ramp 中断；
-14. 直接 `HW_INH/SW_INH` 禁止输出会进入 High-Z，不等于受控 Ramp Down；
-15. 如果下电也要求受控斜率，应先 Ramp 到目标低电压（例如 0 V），再进入 High-Z；
-16. 多颗器件的 Ramp 启动需要考虑 SPI 顺序 skew 与 RCLK 不确定性；
-17. 多颗在线通道需要同步更新 DAC/Range/Compensation 时，LOAD 比单纯顺序 SPI 写更适合；
-18. 项目级设计应根据实际 DUT 需求，从上述机制中选择唯一或少量最终控制路径，避免同时维护多套无用流程。
+5. FIN DAC 的数字链路为 `x1 -> Calibration Engine(m/c) -> x2 -> actual DAC`；
+6. `5.125` 是固定模拟 DAC amplifier gain，不能关闭或通过寄存器修改；
+7. `VREF = 5 V` 时 raw DAC span 为 `25.625 V`，正常 Force 应区分 raw overrange span 与约 `25 V nominal span`；
+8. `m` 改变 `x1 -> x2` 的数字增益，`c` 提供数字 offset correction；
+9. `c register` 与独立的 `Offset DAC` 不是同一个 offset；
+10. 默认 `LOAD = 0` 时，写 FIN x1 后经过 Calibration Engine，新的 x2 在内部处理完成后自动作用到实际 DAC；
+11. LOAD 控制的是“已经准备好的内部新值什么时候真正生效”，不是额外的 FIN x1 预写寄存器；
+12. LOAD 不负责 Power Enable，也不能启动 Ramp；
+13. Programmable Slew Rate 和 Ramp Function 是两种不同的输出变化机制；
+14. Ramp Step Size 直接作用于 FIN DAC `x1`，不是作用于 `x2`；
+15. Ramp Start Code、End Code 和 Step Size 均属于 `x1` code 域；
+16. 每一个新的 Ramp x1 都经过 Calibration Engine 生成 x2，再加载到实际 DAC；
+17. `m` 和 `VREF` 会影响实际 Ramp 电压步长和斜率；`c`、Offset DAC、DUTGND 不影响相邻 Ramp Step 的电压差；
+18. 使用 Ramp Function 给 DUT 上电时，Ramp 之前 Force Amplifier 必须已经作用于 DUT，通常先进入 Ramp Start 电压；
+19. Ramp 只能通过 `0x41 = 0xFFFF` 启动；
+20. Ramp 运行期间普通 SPI 操作受限，应在启动前完成相关配置；
+21. AD5560 没有专用 `RAMP_DONE` 标志，FPGA 可依据已知参数计时，并在需要时读回 FIN x1 确认是否达到 End Code；
+22. Ramp 期间 Alarm 可以导致 Ramp 中断；
+23. 直接 `HW_INH/SW_INH` 禁止输出会进入 High-Z，不等于受控 Ramp Down；
+24. 如果下电也要求受控斜率，应先 Ramp 到目标低电压（例如 0 V），再进入 High-Z；
+25. 多颗器件的 Ramp 启动需要考虑 SPI 顺序 skew 与 RCLK 不确定性；
+26. 多颗在线通道需要同步更新 DAC/Range/Compensation 时，LOAD 比单纯顺序 SPI 写更适合；
+27. 项目级设计应根据实际 DUT 需求，从上述机制中选择唯一或少量最终控制路径，避免同时维护多套无用流程。
 
 ---
 
-## 16. 参考资料
+## 17. 参考资料
 
 - Analog Devices, **AD5560 Rev.F Data Sheet**: https://www.analog.com/media/en/technical-documentation/data-sheets/AD5560.pdf
+- Analog Devices EngineerZone, **Ramp control of AD5560**：关于 `833 kHz / 2032 LSB / 0.775 V/us` 的计算讨论。
