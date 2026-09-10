@@ -1290,6 +1290,54 @@ Ramp Enable
   -> 某一路开始执行内部 Ramp
 ```
 
+### 12.5 GANG 并联输出
+
+GANG 用于多颗 AD5560 并联提高输出电流。可采用 FV/FV 或 FV/FI；需要均流时优先采用 **Master FV + Slave FI**。
+
+`DPS Register 2` 的 `GANGMODE[10:9]` 与内部开关关系如下：
+
+| GANGMODE | 模式 | SW1 | SW2 | SW5 | SW6 |
+|---|---|---|---|---|---|
+| `00` | Master FV，电压复制 | b | a | a | OFF |
+| `01` | Master FV，电流复制 | b | a | b | OFF |
+| `10` | Slave FV | c | c | OFF | ON |
+| `11` | Slave FI | c | b | OFF | ON |
+
+`SW16` 不由 GANGMODE 控制。
+
+FV/FI 的典型连接为：
+
+```text
+Master  GANGMODE = 01
+MASTER_OUT = Master MI
+       |
+       v
+Slave1  SLAVE_IN   GANGMODE = 11
+         MASTER_OUT
+       |
+       v
+Slave2  SLAVE_IN   GANGMODE = 11
+         MASTER_OUT
+       |
+       v
+...
+```
+
+Slave 的 `SW6 = ON` 用于把前级 GANG reference 继续传到下一颗，**不是重新用本 Slave 的测量电流生成新的参考**。
+
+FV/FI GANG 需满足以下约束：
+
+- Master 与所有 Slave 使用相同 Current Range，并保持 Rsense 及测量链路匹配；
+- Master 与 Slave 的 MI Gain 必须一致，否则相同 `SLAVE_IN` 电压不再对应相同电流；
+- Slave 的 Current Clamp 必须关闭。若 `CLEN/LOAD` 仍作为 CLEN，实际 Clamp Enable 为软件 `CLEN` 与硬件 CLEN 的 OR，因此应同时保证软件 `CLEN = 0`、CLEN pin = Low；
+- Master Clamp 可以保留，但总 GANG 限流值只能近似理解为并联路数乘以 Master 电流，不应作为高精度总电流限制；
+- Master SENSE 应 Kelvin 接到实际 DUT 节点；各器件 DUTGND 使用同一 DUT ground reference；
+- Slave Compensation 使用最快响应设置，Master Compensation 按 DUT 负载条件配置；
+- GANG reference 链路应尽量短，最后一级 `MASTER_OUT` 可不连接；Master 的 `SLAVE_IN` 不使用；
+- `LOAD` 不能同步切换 `GANGMODE`。
+
+进入或退出 GANG 时，正在改变 GANG 配置的 Slave 应保持 High-Z。典型进入顺序为：先关闭 Slave 输出并完成 Range、MI Gain、Clamp、Compensation 配置，再设置 Master=`01`、Slave=`11`，最后使能 Slave；退出时采用相反顺序，必要时先将 Master 输出降到安全电压。
+
 ---
 
 ## 13. 下电控制
