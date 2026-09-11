@@ -4,22 +4,6 @@
 
 本文面向使用 FPGA 控制 AD5560 的开发人员，从“如何通过数字接口控制器件”的角度整理 AD5560 Rev.F 数据手册中的主要内容。
 
-重点包括：
-
-- AD5560 能完成哪些功能；
-- SPI 通信格式、寄存器写入和 Readback；
-- `RESET`、`BUSY`、`SYNC`、`SDO` 等数字接口；
-- 主要控制寄存器的作用；
-- Force Voltage、Current Range、Measure、Clamp、Comparator；
-- `FORCE/EXTFORCE`、`SENSE`、`DUTGND`、`SYS_FORCE/SYS_SENSE` 等引脚的区别；
-- `GPO` 普通输出功能以及通过 GPO 引出片上热二极管的测温功能；
-- `SW_INH` / `HW_INH` 与输出使能；
-- Alarm 配置、故障读取与清除；
-- Slew Rate 和 Ramp Function；
-- Calibration Engine 的内部工作机制；
-- Compensation、LOAD、Diagnostic 等功能；
-- FPGA 侧推荐的模块划分和控制流程。
-
 本文主要依据 Analog Devices **AD5560 Rev.F Data Sheet** 整理。模拟外围、电源轨、PCB、散热和外部补偿元件等仍应以原始数据手册为最终依据。
 
 > 本文重点是 AD5560 自身机理和 FPGA 控制接口。已有的 [`AD5560_CONTROL.md`](./AD5560_CONTROL.md) 更侧重 DUT 上下电、`SW_INH/HW_INH`、Slew Rate、Ramp 和 LOAD 时序。
@@ -29,28 +13,6 @@
 ## 2. AD5560 是什么
 
 AD5560 是一颗单通道可编程 DPS（Device Power Supply），主要用于 ATE 中给 DUT 供电和测量。
-
-从 FPGA 控制角度，可以把它理解为：
-
-```text
-                 +-------------------------+
-FPGA SPI ------> | Control Registers       |
-                 | DAC / Range / Alarm     |
-                 +------------+------------+
-                              |
-                              v
-VREF ---> FIN DAC ---> Force Amplifier ---> FORCE / EXTFORCE ---> DUT
-                           ^                         |
-                           |                         |
-                     SENSE / DUTGND <----------------+
-                           |
-                           +--> Current Measure
-                           +--> Voltage Measure
-                           +--> Comparator
-                           +--> Current Clamp
-                           +--> Kelvin Alarm
-                           +--> MEASOUT ---> 外部 ADC
-```
 
 主要功能包括：
 
@@ -1209,23 +1171,6 @@ HW_INH-> 根据实际需要独立或分组
 13. `SYS_FORCE/SYS_SENSE` 是 System PMU 接口，不是普通 DUT 必接线；
 14. GPO 选择 Thermal Diode 后不能同时当普通数字 GPO 使用；
 15. GPO Thermal Diode 的负端是 AGND，外部 Remote Diode Monitor 的地参考要正确处理。
-
----
-
-## 31. Datasheet 推荐阅读顺序
-
-如果主要做 FPGA 驱动和寄存器控制，可以按以下顺序阅读 Rev.F：
-
-1. Page 1 ~ 3：Features / Functional Block Diagram；
-2. Page 16 ~ 19：Pin Description；
-3. Page 29 ~ 35：Force、Measure、Clamp、Current Range、GPO、System Force/Sense、Temperature；
-4. Page 36 ~ 39：Compensation；
-5. Page 40 ~ 42：DAC Levels、Offset/Gain、Calibration Engine；
-6. Page 43 ~ 44：Slew Rate / Ramp；
-7. Page 45 ~ 46：Serial Interface、BUSY、LOAD；
-8. Page 47 ~ 57：寄存器定义，尤其 DPS Register 2 和 Diagnostic Register；
-9. Page 57 ~ 58：Readback / Power-On Default；
-10. Page 59 以后：Power Supply、外围、Layout、Thermal。
 
 ---
 
