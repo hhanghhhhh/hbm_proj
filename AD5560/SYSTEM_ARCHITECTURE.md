@@ -62,7 +62,7 @@ ad5560_controller
 上位机直接生成并下发 AD5560 配置记录，每条记录包含：
 
 ```text
-BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
+DEVICE_ID + REG_ADDR + REG_DATA
 ```
 
 FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和可靠执行配置表。
