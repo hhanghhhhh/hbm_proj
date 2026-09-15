@@ -77,29 +77,6 @@ BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
 
 FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和可靠执行配置表。
 
-基本流程：
-
-```text
-上位机生成 Config Table
-        │
-        ▼
-     Config RAM
-        │
-   CONFIG_START
-        │
-        ▼
-   Config Manager
-        │
-        ▼
-  Bus Worker × 8
-        │
-        ▼
-   SPI Master × 8
-        │
-        ▼
-   128 × AD5560
-```
-
 采用寄存器级配置表后，固定配置和通道可变配置使用同一种数据格式。固定寄存器可先由上位机保存为默认 Config Table 并下发，因此可以方便地查看、修改和调试具体寄存器值。
 
 后续如需要将固定配置固化到 FPGA，可增加内部 `Config Loader`，由内部固定表向同一 `Config RAM` 写入配置记录；后级 `Config Manager / Bus Worker / SPI Master` 不需要改变。
