@@ -47,14 +47,8 @@ ad5560_controller
 ├── power_sequence_ram
 │     └─ 单块全局 RAM，保存 128 路上下电时序
 │
-├── power_sequence_engine
-│     └─ 按全局时序控制上下电任务
-│
-├── fault_manager
-│     └─ 故障处理功能预留，具体策略后续讨论
-│
-└── status_manager
-      └─ 状态汇总与上位机查询功能预留
+└── power_sequence_engine
+      └─ 按全局时序控制上下电任务
 ```
 
 `Config Manager` 和 `Power Sequence Engine` 均通过下层 `Bus Worker` 访问 AD5560，但分别负责“配置阶段”和“运行时序阶段”。
@@ -135,9 +129,6 @@ flowchart TB
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine]
 
-        FM[Fault Manager\n预留]
-        SM[Status Manager\n预留]
-
         subgraph BUS[Bus Worker × 8]
             BW[BUS0 ~ BUS7 Worker\nDEVICE 选择 + SYNC + BUSY]
             SPI[SPI Master × 8]
@@ -149,9 +140,6 @@ flowchart TB
 
         PSRAM --> PSE
         PSE --> BW
-
-        BW --> SM
-        FM --> PSE
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
@@ -161,7 +149,6 @@ flowchart TB
     COMM --> CM
     COMM --> PSRAM
     COMM --> PSE
-    COMM --> SM
 
     SPI --> DEV
     BW -->|SYNC 128 路| DEV
