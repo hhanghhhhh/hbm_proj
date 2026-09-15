@@ -2,7 +2,7 @@
 
 ## 1. 系统定位
 
-本系统由一片 FPGA 控制 **128 颗 AD5560**。上位机负责下发各通道配置参数和运行任务，FPGA 负责参数缓存、AD5560 配置执行以及后续上下电时序控制。
+本系统由一片 FPGA 控制 **128 颗 AD5560**。上位机负责下发配置表和运行任务，FPGA 负责配置数据缓存、寄存器配置执行以及后续上下电时序控制。
 
 ---
 
@@ -13,7 +13,7 @@
 - 共 **8 组 SPI 总线**；
 - 每组 SPI 连接 16 颗 AD5560；
 - `SYNC` 每颗 AD5560 独立，共 **128 根 SYNC**；
-- 每条 BUS 对应一组 `BUSY`。
+- 每条 BUS 对应一组 `BUSY`；
 - FPGA 通过 BUS 和 SYNC 的组合选择具体 AD5560。
 
 ### 2.2 HW_INH
@@ -31,17 +31,11 @@
 ```text
 ad5560_controller
 │
-├── channel_config_ram
-│     └─ 保存 128 路通道配置参数
-│
-├── calibration_ram
-│     └─ 预留保存通道校准参数，具体组织后续确定
+├── config_ram
+│     └─ 保存 AD5560 寄存器配置表
 │
 ├── config_manager
-│     └─ 读取通道配置并组织 AD5560 配置任务
-│
-├── register_builder
-│     └─ 将通道参数及固定配置转换为 AD5560 寄存器写操作
+│     └─ 读取配置表并组织配置任务
 │
 ├── bus_worker[0..7]
 │     └─ 每个实例负责一组 16 颗 AD5560 的事务调度
@@ -71,18 +65,57 @@ ad5560_controller
 
 ---
 
+## 4. 配置数据组织
+
+配置采用**寄存器级配置表**方式。
+
+上位机直接生成并下发 AD5560 配置记录，每条记录包含：
+
+```text
+BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
+```
+
+FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和可靠执行配置表。
+
+基本流程：
+
+```text
+上位机生成 Config Table
+        │
+        ▼
+     Config RAM
+        │
+   CONFIG_START
+        │
+        ▼
+   Config Manager
+        │
+        ▼
+  Bus Worker × 8
+        │
+        ▼
+   SPI Master × 8
+        │
+        ▼
+   128 × AD5560
+```
+
+采用寄存器级配置表后，固定配置和通道可变配置使用同一种数据格式。固定寄存器可先由上位机保存为默认 Config Table 并下发，因此可以方便地查看、修改和调试具体寄存器值。
+
+后续如需要将固定配置固化到 FPGA，可增加内部 `Config Loader`，由内部固定表向同一 `Config RAM` 写入配置记录；后级 `Config Manager / Bus Worker / SPI Master` 不需要改变。
+
+---
+
 ## 5. 各模块连接关系
 
 ```mermaid
 flowchart TB
-    PC[上位机]
+    PC[上位机\n生成寄存器配置表]
     COMM[通信 / 命令分发]
 
     subgraph CTRL[ad5560_controller]
-        CRAM[Channel Config RAM\n128 路配置参数]
-        CALRAM[Calibration RAM\n校准参数预留]
+        CRAM[Config RAM\nBUS + DEVICE + ADDR + DATA]
         CM[Config Manager]
-        RB[Register Builder]
 
         PSRAM[Power Sequence RAM]
         PSE[Power Sequence Engine]
@@ -99,9 +132,7 @@ flowchart TB
         end
 
         CRAM --> CM
-        CALRAM --> RB
-        CM --> RB
-        RB --> BW
+        CM --> BW
 
         PSRAM --> PSE
         PSE --> BW
@@ -129,16 +160,4 @@ flowchart TB
     DEV --> GC
 ```
 
-当前图只表达功能连接关系：
-
-- 上位机配置数据先进入 `Channel Config RAM`；
-- `CONFIG_START` 触发 `Config Manager` 开始配置流程；
-- `Register Builder` 根据通道参数和固定配置形成具体 AD5560 寄存器操作；
-- 8 个 `Bus Worker` 分别服务 BUS0～BUS7，每个 BUS 内管理 16 颗 AD5560；
-- 每个 `Bus Worker` 下层使用一个 `SPI Master` 驱动物理 SPI 总线；
-- `SYNC Control` 根据 BUS / DEVICE 选择产生 128 路独立 SYNC；
-- `Group Control` 统一处理每组共享的 `BUSY`；
-- `Power Sequence Engine` 与配置流程分开，负责配置完成后的上下电时序和 Ramp 启停；
-- `Fault Manager`、`Status Manager` 目前仅保留系统级位置，详细职责暂不展开。
-
----
+当前图只表达已讨论的功能连接关系，具体 Config RAM 记录位宽、配置表执行规则以及各模块接口后续再确定。
