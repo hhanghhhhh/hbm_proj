@@ -8,7 +8,7 @@
 
 ## 2. 数字控制信号划分
 
-### 3.1 SPI 与 SYNC
+### 2.1 SPI 与 SYNC
 
 - 共 **8 组 SPI 总线**；
 - 每组 SPI 连接 16 颗 AD5560；
@@ -16,7 +16,7 @@
 - 每条 BUS 对应一组 `BUSY`。
 - FPGA 通过 BUS 和 SYNC 的组合选择具体 AD5560。
 
-### 3.3 HW_INH
+### 2.2 HW_INH
 
 系统当前只使用 **1 根全局 `HW_INH`**。
 
@@ -24,7 +24,7 @@
 
 ---
 
-## 4. FPGA 模块初步划分
+## 3. FPGA 模块初步划分
 
 当前先按以下模块划分组织 FPGA 内部功能，后续再逐个讨论模块接口和 RTL 细节。
 
@@ -55,7 +55,7 @@ ad5560_controller
 │     └─ 按时序启动 / 停止各通道 Ramp
 │
 ├── group_control
-│     └─ 管理组级 BUSY / RESET / RCLK
+│     └─ 管理组级 BUSY
 │
 ├── sync_control
 │     └─ 管理 128 路独立 SYNC
@@ -87,7 +87,7 @@ flowchart TB
         PSRAM[Power Sequence RAM]
         PSE[Power Sequence Engine]
 
-        GC[Group Control\nBUSY / RESET / RCLK]
+        GC[Group Control\nBUSY]
         SC[SYNC Control\nSYNC 128 路]
         FM[Fault Manager\n预留]
         SM[Status Manager\n预留]
@@ -137,7 +137,7 @@ flowchart TB
 - 8 个 `Bus Worker` 分别服务 BUS0～BUS7，每个 BUS 内管理 16 颗 AD5560；
 - 每个 `Bus Worker` 下层使用一个 `SPI Master` 驱动物理 SPI 总线；
 - `SYNC Control` 根据 BUS / DEVICE 选择产生 128 路独立 SYNC；
-- `Group Control` 统一处理每组共享的 `BUSY / RESET / RCLK`；
+- `Group Control` 统一处理每组共享的 `BUSY`；
 - `Power Sequence Engine` 与配置流程分开，负责配置完成后的上下电时序和 Ramp 启停；
 - `Fault Manager`、`Status Manager` 目前仅保留系统级位置，详细职责暂不展开。
 
