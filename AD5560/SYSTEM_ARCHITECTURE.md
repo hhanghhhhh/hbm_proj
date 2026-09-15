@@ -13,7 +13,7 @@
 - 共 **8 组 SPI 总线**；
 - 每组 SPI 连接 16 颗 AD5560；
 - `SYNC` 每颗 AD5560 独立，共 **128 根 SYNC**；
-- 每条 BUS 对应一组 `BUSY`；
+- 每条 BUS 对应一组共享 `BUSY`；
 - FPGA 通过 BUS 和 SYNC 的组合选择具体 AD5560。
 
 ### 2.2 HW_INH
@@ -38,7 +38,8 @@ ad5560_controller
 │     └─ 顺序读取配置表，并按 BUS_ID 分发给对应 Bus Worker
 │
 ├── bus_worker[0..7]
-│     └─ 每个实例负责一组 16 颗 AD5560 的事务执行
+│     └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
+│          ├─ 管理本组共享 BUSY，等待器件内部操作完成并处理 timeout
 │          └── spi_master
 │                └─ 产生对应 SPI BUS 的底层时序
 │
@@ -47,9 +48,6 @@ ad5560_controller
 │
 ├── power_sequence_engine
 │     └─ 按全局时序向对应 Bus Worker 下发 Ramp 控制任务
-│
-├── group_control
-│     └─ 管理组级 BUSY
 │
 ├── sync_control
 │     └─ 管理 128 路独立 SYNC
@@ -86,6 +84,32 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 所有 BUS、所有器件的配置记录按上位机生成的顺序连续存储。`Config Manager` 从头到尾顺序读取配置记录，根据其中的 `BUS_ID` 将当前事务发送给对应的 `Bus Worker`，等待该事务完成后继续读取下一条记录。
 
 当前配置时间不是系统瓶颈，因此第一版不要求 8 条 SPI BUS 并行执行配置，优先保证通信、RAM 管理和 `Config Manager` 逻辑简单。
+
+### 4.2 BUSY 处理
+
+每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理，不再单独设置 `Group Control` 模块。
+
+每次寄存器事务按以下方式执行：
+
+```text
+Bus Worker 接收一条事务
+        ↓
+确认本组 BUSY 已释放
+        ↓
+执行 SPI transaction
+        ↓
+SPI 发送完成 / SYNC 结束
+        ↓
+等待本组 BUSY 回到非 Busy 状态
+        ↓
+返回 worker_done
+```
+
+第一版采用保守策略：**每完成一笔 SPI transaction，都等待 AD5560 内部处理完成后再返回事务结束**，不使用 BUSY 期间的流水发送优化。
+
+`Bus Worker` 需要对 BUSY 等待设置超时，避免某颗器件或共享 BUSY 异常时整个配置流程永久阻塞。超时后向上层返回错误状态。
+
+`SPI Master` 只负责底层 SPI 时序，不负责解释或检测 AD5560 的 `BUSY`。
 
 ---
 
@@ -128,13 +152,12 @@ flowchart TB
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine]
 
-        GC[Group Control\nBUSY]
         SC[SYNC Control\nSYNC 128 路]
         FM[Fault Manager\n预留]
         SM[Status Manager\n预留]
 
         subgraph BUS[Bus Worker × 8]
-            BW[BUS0 ~ BUS7 Worker]
+            BW[BUS0 ~ BUS7 Worker\n事务执行 + BUSY 检测 / Timeout]
             SPI[SPI Master × 8]
             BW --> SPI
         end
@@ -145,12 +168,9 @@ flowchart TB
         PSRAM --> PSE
         PSE --> BW
 
-        GC --> BW
         SC --> BW
-
         BW --> SM
         FM --> PSE
-        FM --> GC
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
@@ -164,8 +184,7 @@ flowchart TB
 
     SPI --> DEV
     SC --> DEV
-    GC --> DEV
-    DEV --> GC
+    DEV -->|BUSY 8 路| BW
 ```
 
 当前图只表达已讨论并确认的功能连接关系。具体 Config RAM 记录位宽、Power Sequence RAM 数据格式、Bus Worker 接口及事务仲裁方式后续再确定。
