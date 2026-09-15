@@ -39,8 +39,7 @@ ad5560_controller
 │
 ├── bus_worker[0..7]
 │     └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
-│          ├─ 管理本组 16 路独立 SYNC
-│          ├─ 支持 device_mask[15:0] 同时选择多颗器件
+│          ├─ 管理本组 16 路独立 SYNC，一次事务只选择一颗器件
 │          ├─ 管理本组共享 BUSY，等待器件内部操作完成并处理 timeout
 │          └── spi_master
 │                └─ 产生对应 SPI BUS 的底层时序
@@ -49,7 +48,7 @@ ad5560_controller
 │     └─ 单块全局 RAM，保存 128 路上下电时序
 │
 ├── power_sequence_engine
-│     └─ 按全局时序并行向 8 个 Bus Worker 下发 Ramp 控制任务
+│     └─ 按全局时序控制上下电任务
 │
 ├── fault_manager
 │     └─ 故障处理功能预留，具体策略后续讨论
@@ -84,8 +83,6 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 当前配置时间不是系统瓶颈，因此第一版配置阶段采用串行执行，优先保证通信、RAM 管理和 `Config Manager` 逻辑简单。
 
-配置阶段的 `DEVICE_ID` 在进入 `Bus Worker` 时转换为 one-hot `device_mask[15:0]`，一次只选择一颗器件。
-
 ### 4.2 BUSY 处理
 
 每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理。
@@ -96,7 +93,7 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 `SYNC` 由各 `Bus Worker` 直接管理。
 
-每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`，并通过 `device_mask[15:0]` 决定本次 SPI transaction 作用于哪些器件。
+每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`。每次 SPI transaction 根据 `DEVICE_ID` 只选择一颗器件，不采用多个 `SYNC` 同时有效的广播方式。
 
 因此每个 `Bus Worker` 在物理上完整对应一组 AD5560 资源：
 
@@ -115,42 +112,14 @@ Bus Worker n
 
 128 路上下电时序属于同一个全局时间轴，不按 BUS 分成 8 套独立时序。
 
-与配置阶段不同，上下电时序必须支持并行执行：
+与配置阶段不同，上下电时序需要考虑多通道并行启动：
 
-- `Power Sequence Engine` 在同一时刻可以同时向 8 个 `Bus Worker` 下发任务；
-- 不同 BUS 的 SPI transaction 可并行执行；
-- 同一 BUS 内，如果多颗 AD5560 需要执行完全相同的 Ramp 控制命令，可通过 `device_mask[15:0]` 同时选择多颗器件，使多路 `SYNC` 同时动作；
-- 因此同一时刻需要启动的多个通道不需要逐通道串行发送。
+- 不同 BUS 之间具备独立 `Bus Worker / SPI Master`，可以并行执行；
+- 同一 BUS 内仍保持一次只选择一颗 AD5560，不使用多个 `SYNC` 同时拉低的方式；
+- 共享 `RCLK` 也不作为整条 BUS 的统一上电触发手段，因为同一 BUS 内可能存在多个独立上电分组；
+- 同一 BUS 内多个通道如何满足同步上下电要求，后续单独设计，不在当前架构中提前固定方案。
 
-典型关系为：
-
-```text
-128 bit channel mask
-        │
-        ├─ [15:0]    -> Bus Worker 0
-        ├─ [31:16]   -> Bus Worker 1
-        ├─ ...
-        └─ [127:112] -> Bus Worker 7
-```
-
-例如同一 BUS 内多个器件同时执行 `Enable Ramp` 时，对应 `Bus Worker` 同时拉低这些器件的 `SYNC`，SPI 只发送一次相同命令，从而实现组内同步启动。
-
-`device_mask` 多选仅用于多个器件需要接收**完全相同 SPI 数据**的场景。各通道目标电压、限流、Ramp 参数等个性化数据仍在配置阶段分别写入。
-
-因此系统采用：
-
-```text
-配置阶段：串行配置各通道参数
-
-运行阶段：
-所有参数已预置
-    ↓
-Power Sequence Engine 到达目标时刻
-    ↓
-8 个 Bus Worker 可同时执行
-    ↓
-同一 BUS 内可通过多个 SYNC 同时触发相同 Ramp 命令
-```
+因此当前只确定：**配置阶段串行执行；运行阶段允许 8 条独立 BUS 并行工作；同 BUS 内的多通道同步方案后续讨论。**
 
 ---
 
@@ -166,13 +135,13 @@ flowchart TB
         CM[Config Manager\n串行读取 / BUS 分发]
 
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
-        PSE[Power Sequence Engine\n8 BUS 并行控制]
+        PSE[Power Sequence Engine]
 
         FM[Fault Manager\n预留]
         SM[Status Manager\n预留]
 
         subgraph BUS[Bus Worker × 8]
-            BW[BUS0 ~ BUS7 Worker\nDevice Mask + SYNC + BUSY]
+            BW[BUS0 ~ BUS7 Worker\nDEVICE 选择 + SYNC + BUSY]
             SPI[SPI Master × 8]
             BW --> SPI
         end
@@ -201,4 +170,4 @@ flowchart TB
     DEV -->|BUSY 8 路| BW
 ```
 
-当前图只表达已讨论并确认的功能连接关系。具体 Config RAM 记录位宽、Power Sequence RAM 数据格式、Bus Worker 接口及事务仲裁方式后续再确定。
+当前图只表达已讨论并确认的功能连接关系。具体 Config RAM 记录位宽、Power Sequence RAM 数据格式、Bus Worker 接口以及同 BUS 内多通道同步上下电方案后续再确定。
