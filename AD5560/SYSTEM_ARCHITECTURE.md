@@ -32,21 +32,21 @@
 ad5560_controller
 │
 ├── config_ram
-│     └─ 保存 AD5560 寄存器配置表
+│     └─ 单块全局 RAM，保存全部 AD5560 寄存器配置表
 │
 ├── config_manager
-│     └─ 读取配置表并组织配置任务
+│     └─ 顺序读取配置表，并按 BUS_ID 分发给对应 Bus Worker
 │
 ├── bus_worker[0..7]
-│     └─ 每个实例负责一组 16 颗 AD5560 的事务调度
+│     └─ 每个实例负责一组 16 颗 AD5560 的事务执行
 │          └── spi_master
 │                └─ 产生对应 SPI BUS 的底层时序
 │
 ├── power_sequence_ram
-│     └─ 保存上下电时序任务
+│     └─ 单块全局 RAM，保存 128 路上下电时序
 │
 ├── power_sequence_engine
-│     └─ 按时序启动 / 停止各通道 Ramp
+│     └─ 按全局时序向对应 Bus Worker 下发 Ramp 控制任务
 │
 ├── group_control
 │     └─ 管理组级 BUSY
@@ -61,7 +61,7 @@ ad5560_controller
       └─ 状态汇总与上位机查询功能预留
 ```
 
-`Config Manager` 和 `Power Sequence Engine` 均需要通过下层 BUS 执行模块访问 AD5560，但两者分别负责“配置阶段”和“运行时序阶段”，功能上保持分离。
+`Config Manager` 和 `Power Sequence Engine` 均通过下层 `Bus Worker` 访问 AD5560，但分别负责“配置阶段”和“运行时序阶段”。
 
 ---
 
@@ -77,24 +77,55 @@ BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
 
 FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和可靠执行配置表。
 
-采用寄存器级配置表后，固定配置和通道可变配置使用同一种数据格式。固定寄存器可先由上位机保存为默认 Config Table 并下发，因此可以方便地查看、修改和调试具体寄存器值。
+固定配置和通道可变配置使用同一种数据格式。固定寄存器可由上位机保存为默认 Config Table 并下发；后续如需固化到 FPGA，也可增加内部 `Config Loader`，向同一 `Config RAM` 写入配置记录，后级执行模块无需改变。
 
-后续如需要将固定配置固化到 FPGA，可增加内部 `Config Loader`，由内部固定表向同一 `Config RAM` 写入配置记录；后级 `Config Manager / Bus Worker / SPI Master` 不需要改变。
+### 4.1 Config RAM 组织
+
+当前确定采用 **单块全局 `Config RAM`**，不按 8 条 SPI BUS 分成 8 块 RAM。
+
+所有 BUS、所有器件的配置记录按上位机生成的顺序连续存储。`Config Manager` 从头到尾顺序读取配置记录，根据其中的 `BUS_ID` 将当前事务发送给对应的 `Bus Worker`，等待该事务完成后继续读取下一条记录。
+
+当前配置时间不是系统瓶颈，因此第一版不要求 8 条 SPI BUS 并行执行配置，优先保证通信、RAM 管理和 `Config Manager` 逻辑简单。
 
 ---
 
-## 5. 各模块连接关系
+## 5. 上下电时序组织
+
+上下电时序同样采用 **单块全局 `Power Sequence RAM` + 单个 `Power Sequence Engine`**。
+
+128 路上下电时序属于同一个全局时间轴，不按 BUS 分成 8 套独立时序。`Power Sequence Engine` 根据时序记录确定目标通道，再映射到对应的 `BUS_ID / DEVICE_ID`，通过对应 `Bus Worker` 执行 Ramp 启动、停止等运行时事务。
+
+这样配置阶段和运行阶段采用一致的下层结构：
+
+```text
+Config RAM                Power Sequence RAM
+    │                           │
+    ▼                           ▼
+Config Manager          Power Sequence Engine
+    │                           │
+    └────────────┬──────────────┘
+                 ▼
+          Bus Worker × 8
+                 │
+          SPI Master × 8
+                 │
+          128 × AD5560
+```
+
+---
+
+## 6. 各模块连接关系
 
 ```mermaid
 flowchart TB
-    PC[上位机\n生成寄存器配置表]
+    PC[上位机]
     COMM[通信 / 命令分发]
 
     subgraph CTRL[ad5560_controller]
-        CRAM[Config RAM\nBUS + DEVICE + ADDR + DATA]
-        CM[Config Manager]
+        CRAM[单块 Config RAM\n全部 BUS 配置记录]
+        CM[Config Manager\n顺序读取 / BUS 分发]
 
-        PSRAM[Power Sequence RAM]
+        PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine]
 
         GC[Group Control\nBUSY]
@@ -137,4 +168,4 @@ flowchart TB
     DEV --> GC
 ```
 
-当前图只表达已讨论的功能连接关系，具体 Config RAM 记录位宽、配置表执行规则以及各模块接口后续再确定。
+当前图只表达已讨论并确认的功能连接关系。具体 Config RAM 记录位宽、Power Sequence RAM 数据格式、Bus Worker 接口及事务仲裁方式后续再确定。
