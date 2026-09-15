@@ -20,7 +20,7 @@ FPGA
      128 × AD5560
 ```
 
-目前仅确定系统级功能划分和硬件连接关系，具体配置 RAM 字段、寄存器配置顺序、校准数据组织及故障处理细节后续再确定。
+目前仅确定系统级功能划分和硬件连接关系。本文中的模块名称和边界作为后续 RTL 讨论的初版骨架，具体配置 RAM 字段、寄存器配置顺序、校准数据组织、状态反馈及故障处理细节后续再确定。
 
 ---
 
@@ -85,7 +85,156 @@ DEVICE_ID = CHANNEL_ID % 16
 
 ---
 
-## 4. 配置功能框架
+## 4. FPGA 模块初步划分
+
+当前先按以下模块划分组织 FPGA 内部功能，后续再逐个讨论模块接口和 RTL 细节。
+
+```text
+ad5560_controller
+│
+├── channel_config_ram
+│     └─ 保存 128 路通道配置参数
+│
+├── calibration_ram
+│     └─ 预留保存通道校准参数，具体组织后续确定
+│
+├── config_manager
+│     └─ 读取通道配置并组织 AD5560 配置任务
+│
+├── register_builder
+│     └─ 将通道参数及固定配置转换为 AD5560 寄存器写操作
+│
+├── bus_worker[0..7]
+│     └─ 每个实例负责一组 16 颗 AD5560 的事务调度
+│          └── spi_master
+│                └─ 产生对应 SPI BUS 的底层时序
+│
+├── power_sequence_ram
+│     └─ 保存上下电时序任务
+│
+├── power_sequence_engine
+│     └─ 按时序启动 / 停止各通道 Ramp
+│
+├── group_control
+│     └─ 管理组级 BUSY / RESET / RCLK
+│
+├── sync_control
+│     └─ 管理 128 路独立 SYNC
+│
+├── fault_manager
+│     └─ 故障处理功能预留，具体策略后续讨论
+│
+└── status_manager
+      └─ 状态汇总与上位机查询功能预留
+```
+
+其中当前配置主链路重点为：
+
+```text
+Channel Config RAM
+        ↓
+   Config Manager
+        ↓
+  Register Builder
+        ↓
+  Bus Worker × 8
+        ↓
+   SPI Master × 8
+        ↓
+   128 × AD5560
+```
+
+上下电运行链路重点为：
+
+```text
+Power Sequence RAM
+        ↓
+Power Sequence Engine
+        ↓
+   Bus Worker × 8
+        ↓
+   SPI Master × 8
+        ↓
+ AD5560 Ramp Control
+```
+
+`Config Manager` 和 `Power Sequence Engine` 均需要通过下层 BUS 执行模块访问 AD5560，但两者分别负责“配置阶段”和“运行时序阶段”，功能上保持分离。
+
+---
+
+## 5. 各模块连接关系
+
+```mermaid
+flowchart TB
+    PC[上位机]
+    COMM[通信 / 命令分发]
+
+    subgraph CTRL[ad5560_controller]
+        CRAM[Channel Config RAM\n128 路配置参数]
+        CALRAM[Calibration RAM\n校准参数预留]
+        CM[Config Manager]
+        RB[Register Builder]
+
+        PSRAM[Power Sequence RAM]
+        PSE[Power Sequence Engine]
+
+        GC[Group Control\nBUSY / RESET / RCLK]
+        SC[SYNC Control\nSYNC 128 路]
+        FM[Fault Manager\n预留]
+        SM[Status Manager\n预留]
+
+        subgraph BUS[Bus Worker × 8]
+            BW[BUS0 ~ BUS7 Worker]
+            SPI[SPI Master × 8]
+            BW --> SPI
+        end
+
+        CRAM --> CM
+        CALRAM --> RB
+        CM --> RB
+        RB --> BW
+
+        PSRAM --> PSE
+        PSE --> BW
+
+        GC --> BW
+        SC --> BW
+
+        BW --> SM
+        FM --> PSE
+        FM --> GC
+    end
+
+    DEV[128 × AD5560\n8 BUS × 16 Device]
+
+    PC --> COMM
+    COMM --> CRAM
+    COMM --> CM
+    COMM --> PSRAM
+    COMM --> PSE
+    COMM --> SM
+
+    SPI --> DEV
+    SC --> DEV
+    GC --> DEV
+    DEV --> GC
+```
+
+当前图只表达功能连接关系：
+
+- 上位机配置数据先进入 `Channel Config RAM`；
+- `CONFIG_START` 触发 `Config Manager` 开始配置流程；
+- `Register Builder` 根据通道参数和固定配置形成具体 AD5560 寄存器操作；
+- 8 个 `Bus Worker` 分别服务 BUS0～BUS7，每个 BUS 内管理 16 颗 AD5560；
+- 每个 `Bus Worker` 下层使用一个 `SPI Master` 驱动物理 SPI 总线；
+- `SYNC Control` 根据 BUS / DEVICE 选择产生 128 路独立 SYNC；
+- `Group Control` 统一处理每组共享的 `BUSY / RESET / RCLK`；
+- `Power Sequence Engine` 与配置流程分开，负责配置完成后的上下电时序和 Ramp 启停；
+- `Fault Manager`、`Status Manager` 目前仅保留系统级位置，详细职责暂不展开。
+
+---
+
+## 6. 配置功能框架
 
 配置采用“**先缓存参数，再统一执行配置**”的方式。
 
@@ -95,17 +244,20 @@ DEVICE_ID = CHANNEL_ID % 16
 上位机下发 128 路配置参数
           │
           ▼
-     配置参数 RAM
+   Channel Config RAM
           │
 上位机发送 CONFIG_START
           │
           ▼
      Config Manager
           │
-          ├─ BUS0 Config Worker
-          ├─ BUS1 Config Worker
+          ▼
+    Register Builder
+          │
+          ├─ BUS0 Worker
+          ├─ BUS1 Worker
           ├─ ...
-          └─ BUS7 Config Worker
+          └─ BUS7 Worker
                     │
                     ▼
                8 路 SPI
@@ -122,7 +274,7 @@ DEVICE_ID = CHANNEL_ID % 16
 
 ---
 
-## 5. 配置参数与固定配置的职责划分
+## 7. 配置参数与固定配置的职责划分
 
 上位机主要下发会随通道或测试任务变化的参数，例如：
 
@@ -137,7 +289,7 @@ AD5560 中长期固定、与具体 DUT Recipe 无关的寄存器配置，不要�
 
 ---
 
-## 6. 上下电时序功能
+## 8. 上下电时序功能
 
 AD5560 各通道完成基础配置后，上位机再下发上下电时序任务，由 FPGA 本地执行。
 
@@ -161,7 +313,7 @@ FPGA 按时序控制各通道 Ramp
 
 ---
 
-## 7. 当前确定的系统边界
+## 9. 当前确定的系统边界
 
 当前已确定：
 
