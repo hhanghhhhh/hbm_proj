@@ -14,7 +14,7 @@
 - 每组 SPI 连接 16 颗 AD5560；
 - `SYNC` 每颗 AD5560 独立，共 **128 根 SYNC**；
 - 每条 BUS 对应一组共享 `BUSY`；
-- FPGA 通过 BUS 和 SYNC 的组合选择具体 AD5560。
+- 每个 `Bus Worker` 负责本组 SPI、16 路 `SYNC` 和 1 路共享 `BUSY`。
 
 ### 2.2 HW_INH
 
@@ -39,6 +39,7 @@ ad5560_controller
 │
 ├── bus_worker[0..7]
 │     └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
+│          ├─ 管理本组 16 路独立 SYNC
 │          ├─ 管理本组共享 BUSY，等待器件内部操作完成并处理 timeout
 │          └── spi_master
 │                └─ 产生对应 SPI BUS 的底层时序
@@ -48,9 +49,6 @@ ad5560_controller
 │
 ├── power_sequence_engine
 │     └─ 按全局时序向对应 Bus Worker 下发 Ramp 控制任务
-│
-├── sync_control
-│     └─ 管理 128 路独立 SYNC
 │
 ├── fault_manager
 │     └─ 故障处理功能预留，具体策略后续讨论
@@ -87,7 +85,7 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 ### 4.2 BUSY 处理
 
-每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理，不再单独设置 `Group Control` 模块。
+每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理。
 
 每次寄存器事务按以下方式执行：
 
@@ -96,9 +94,11 @@ Bus Worker 接收一条事务
         ↓
 确认本组 BUSY 已释放
         ↓
+选择目标 DEVICE，对应 SYNC 拉低
+        ↓
 执行 SPI transaction
         ↓
-SPI 发送完成 / SYNC 结束
+SPI 发送完成，对应 SYNC 拉高
         ↓
 等待本组 BUSY 回到非 Busy 状态
         ↓
@@ -109,7 +109,22 @@ SPI 发送完成 / SYNC 结束
 
 `Bus Worker` 需要对 BUSY 等待设置超时，避免某颗器件或共享 BUSY 异常时整个配置流程永久阻塞。超时后向上层返回错误状态。
 
-`SPI Master` 只负责底层 SPI 时序，不负责解释或检测 AD5560 的 `BUSY`。
+`SPI Master` 只负责底层 SPI 时序，不负责器件选择，也不负责解释或检测 AD5560 的 `BUSY`。
+
+### 4.3 SYNC 处理
+
+`SYNC` 不再设置独立的 `Sync Control` 模块，而是由各 `Bus Worker` 直接管理。
+
+每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`。收到事务后，根据 `DEVICE_ID` 选择对应的 `SYNC`，并与本组 `SPI Master` 配合完成完整 SPI 帧。
+
+因此每个 `Bus Worker` 在物理上完整对应一组 AD5560 资源：
+
+```text
+Bus Worker n
+├─ SPI BUS n
+├─ SYNC[16*n +: 16]
+└─ BUSY[n]
+```
 
 ---
 
@@ -152,12 +167,11 @@ flowchart TB
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine]
 
-        SC[SYNC Control\nSYNC 128 路]
         FM[Fault Manager\n预留]
         SM[Status Manager\n预留]
 
         subgraph BUS[Bus Worker × 8]
-            BW[BUS0 ~ BUS7 Worker\n事务执行 + BUSY 检测 / Timeout]
+            BW[BUS0 ~ BUS7 Worker\n事务执行 + SYNC 选择 + BUSY 检测 / Timeout]
             SPI[SPI Master × 8]
             BW --> SPI
         end
@@ -168,7 +182,6 @@ flowchart TB
         PSRAM --> PSE
         PSE --> BW
 
-        SC --> BW
         BW --> SM
         FM --> PSE
     end
@@ -183,7 +196,7 @@ flowchart TB
     COMM --> SM
 
     SPI --> DEV
-    SC --> DEV
+    BW -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| BW
 ```
 
