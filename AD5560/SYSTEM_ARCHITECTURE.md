@@ -87,29 +87,7 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理。
 
-每次寄存器事务按以下方式执行：
-
-```text
-Bus Worker 接收一条事务
-        ↓
-确认本组 BUSY 已释放
-        ↓
-选择目标 DEVICE，对应 SYNC 拉低
-        ↓
-执行 SPI transaction
-        ↓
-SPI 发送完成，对应 SYNC 拉高
-        ↓
-等待本组 BUSY 回到非 Busy 状态
-        ↓
-返回 worker_done
-```
-
 第一版采用保守策略：**每完成一笔 SPI transaction，都等待 AD5560 内部处理完成后再返回事务结束**，不使用 BUSY 期间的流水发送优化。
-
-`Bus Worker` 需要对 BUSY 等待设置超时，避免某颗器件或共享 BUSY 异常时整个配置流程永久阻塞。超时后向上层返回错误状态。
-
-`SPI Master` 只负责底层 SPI 时序，不负责器件选择，也不负责解释或检测 AD5560 的 `BUSY`。
 
 ### 4.3 SYNC 处理
 
