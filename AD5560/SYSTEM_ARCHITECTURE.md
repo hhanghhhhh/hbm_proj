@@ -93,7 +93,7 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 `SYNC` 由各 `Bus Worker` 直接管理。
 
-每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`。每次 SPI transaction 根据 `DEVICE_ID` 只选择一颗器件，不采用多个 `SYNC` 同时有效的广播方式。
+每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`。每次 SPI transaction 根据 `DEVICE_ID` 只选择一颗器件。
 
 因此每个 `Bus Worker` 在物理上完整对应一组 AD5560 资源：
 
@@ -115,11 +115,9 @@ Bus Worker n
 与配置阶段不同，上下电时序需要考虑多通道并行启动：
 
 - 不同 BUS 之间具备独立 `Bus Worker / SPI Master`，可以并行执行；
-- 同一 BUS 内仍保持一次只选择一颗 AD5560，不使用多个 `SYNC` 同时拉低的方式；
-- 共享 `RCLK` 也不作为整条 BUS 的统一上电触发手段，因为同一 BUS 内可能存在多个独立上电分组；
-- 同一 BUS 内多个通道如何满足同步上下电要求，后续单独设计，不在当前架构中提前固定方案。
+- 同一 BUS 内仍保持一次只选择一颗 AD5560；
 
-因此当前只确定：**配置阶段串行执行；运行阶段允许 8 条独立 BUS 并行工作；同 BUS 内的多通道同步方案后续讨论。**
+因此当前只确定：**配置阶段串行执行；运行阶段允许 8 条独立 BUS 并行工作。**
 
 ---
 
@@ -169,5 +167,3 @@ flowchart TB
     BW -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| BW
 ```
-
-当前图只表达已讨论并确认的功能连接关系。具体 Config RAM 记录位宽、Power Sequence RAM 数据格式、Bus Worker 接口以及同 BUS 内多通道同步上下电方案后续再确定。
