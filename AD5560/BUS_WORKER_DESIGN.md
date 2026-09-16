@@ -103,3 +103,126 @@ rsp_error
 - 写操作使用 `cmd_wr_data`；
 - 读操作完成后通过 `rsp_rd_data` 返回结果；
 - `rsp_error` 用于返回 BUSY timeout 等事务异常。
+
+---
+
+## 5. 多 BUS 选择与握手
+
+8 个 `Bus Worker` 在顶层通过 `generate` 循环例化，每个实例具有固定的 `BUS_ID`。上层请求只需要输出一个 `bus_sel / BUS_ID`，顶层直接判断当前请求是否属于本实例，不再设置独立的 `Bus Command MUX` 模块。
+
+典型选择逻辑：
+
+```verilog
+genvar bus_index;
+generate
+    for (bus_index = 0; bus_index < BUS_COUNT;
+         bus_index = bus_index + 1) begin : g_ad5560_bus
+
+        localparam [2:0] BUS_ID = bus_index;
+        wire bus_selected;
+
+        assign bus_selected = (bus_sel == BUS_ID);
+
+        // 当前请求只有目标 BUS 的 Worker 能看到 valid
+        assign worker_cmd_valid[bus_index] = cmd_valid && bus_selected;
+
+        ...
+    end
+endgenerate
+```
+
+目标 BUS 的 `ready` 直接按 `bus_sel` 选择后回送给上层：
+
+```verilog
+assign selected_ready = worker_ready[bus_sel];
+```
+
+该方式与现有 `hbm_comm_top.v` 中多 BUS 实例的选择方式一致。
+
+### 5.1 valid / ready 含义
+
+`Bus Worker` 空闲、可以接收新事务时：
+
+```text
+cmd_ready = 1
+```
+
+事务已经被接受并正在执行 SPI / BUSY 等流程时：
+
+```text
+cmd_ready = 0
+```
+
+当：
+
+```text
+cmd_valid && cmd_ready
+```
+
+同时为 1 时，本次命令完成握手，`Bus Worker` 锁存命令参数并开始执行。握手完成后，上层不需要继续保持本条命令。
+
+`rsp_valid` 表示已经接受的事务真正执行完成，与 `cmd_ready` 的含义分开：
+
+```text
+cmd_ready / valid  → 命令是否已经交给 Worker
+rsp_valid          → 该命令是否已经真正执行完成
+```
+
+### 5.2 Power Sequence Engine 的并行工作方式
+
+`Power Sequence Engine` 仍采用一套串行命令输出接口：
+
+```text
+seq_valid
+seq_bus_id
+seq_device_id
+seq_rw
+seq_reg_addr
+seq_wr_data
+```
+
+当前命令根据 `seq_bus_id` 选择目标 `Bus Worker`，并从该 Worker 取得 `seq_ready`。
+
+只要当前命令完成 `valid / ready` 握手，`Power Sequence Engine` 就可以继续读取下一条时序命令，**不需要等待当前 Worker 的 `rsp_valid / done`**。
+
+例如：
+
+```text
+Command 0 -> BUS0
+Command 1 -> BUS3
+Command 2 -> BUS5
+```
+
+执行关系可以是：
+
+```text
+BUS0 完成握手 -> Worker0 开始工作
+        ↓
+立即读取下一条
+        ↓
+BUS3 完成握手 -> Worker3 开始工作
+        ↓
+立即读取下一条
+        ↓
+BUS5 完成握手 -> Worker5 开始工作
+```
+
+此时 Worker0、Worker3、Worker5 可以同时处于工作状态，各自独立执行 SPI 事务，因此实现多 BUS 并行工作。
+
+如果下一条命令仍然属于当前正在工作的 BUS，例如：
+
+```text
+Command 0 -> BUS0
+Command 1 -> BUS0
+```
+
+第一条握手后 Worker0 的 `cmd_ready` 会拉低，第二条命令保持等待，直到 Worker0 再次空闲并重新拉高 `cmd_ready`。
+
+因此该结构的基本原则是：
+
+```text
+不同 BUS：事务可以重叠执行
+同一 BUS：事务自动串行执行
+```
+
+这种方式不要求 `Power Sequence Engine` 提供 8 套独立命令接口，只需要单路 `BUS_ID + valid/ready` 接口即可。
