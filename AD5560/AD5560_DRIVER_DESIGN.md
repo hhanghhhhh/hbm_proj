@@ -12,8 +12,6 @@ SPI 底层移位、时钟以及单路片选时序由通用 `SPI Master` 实现�
 
 `AD5560 Driver` 还负责 AD5560 特有的寄存器帧组织、readback 两帧流程、SPI transaction 之间的等待时间、读回时钟选择以及写事务的 `BUSY` 处理。
 
-`AD5560 Driver` 不负责配置表管理、上下电时序调度、BUS 选择或后台遥测轮询。
-
 ---
 
 ## 2. 每个 AD5560 Driver 对应的硬件资源
@@ -32,18 +30,9 @@ AD5560 Driver n
       └─ CS_n
 ```
 
-Driver 根据当前 `DEVICE_ID` 选择一颗 AD5560，并将 SPI Master 输出的单路 `CS_n` 接到对应 `SYNC`：
-
-```text
-SPI Master CS_n
-      ↓
-AD5560 Driver DEVICE_ID 选择
-      ↓
-SYNC[0..15] 中仅一路跟随 CS_n
-其余 SYNC 保持高电平
-```
-
 每次 SPI transaction 只允许选择一颗 AD5560。
+
+为简化第一版设计，可统一采用 **10 MHz SCLK**。。
 
 ---
 
@@ -53,26 +42,17 @@ SYNC[0..15] 中仅一路跟随 CS_n
 
 上层提供 `DEVICE_ID`，Driver 在本次事务开始前锁存目标器件编号。
 
-SPI Master 只产生通用单路 `CS_n`：
-
-```text
-CS_n 拉低
-    ↓
-完成 SPI 移位
-    ↓
-CS_n 拉高
-```
-
 Driver 根据锁存的 `DEVICE_ID` 将该 `CS_n` 映射为对应 AD5560 的 `SYNC`。
 
-概念上可理解为：
-
-```verilog
-SYNC[0..15] = 全部保持 1
-SYNC[device_id] = spi_cs_n
-```
-
 实际 RTL 需保证任何时刻最多只有一路 `SYNC` 为低。
+
+### 3.4 BUSY 处理
+
+每条 BUS 的 16 颗 AD5560 共用一根开漏 `BUSY`，由对应 `AD5560 Driver` 直接检测。
+
+`BUSY` 主要用于写事务以及 RESET / 上电等内部处理状态。Datasheet 的 BUSY Function 明确说明寄存器写会使 BUSY 拉低；readback 时序图不要求在两帧之间等待 BUSY。
+
+为避免在前一笔写操作尚未完成时启动新的访问，**任何新事务开始前仍应先确认共享 `BUSY` 已释放。**
 
 ### 3.2 AD5560 寄存器写
 
@@ -86,7 +66,15 @@ REG_DATA
 
 `AD5560 Driver` 负责组织 AD5560 的 24 bit SPI 写帧，并调用 `SPI Master` 完成一次完整 SPI transaction。
 
-写事务结束后需要执行 `BUSY` 处理：先经过 BUSY 检测保护时间，再判断 `BUSY` 是否已经释放；只有写事务真正完成后才向上层返回 `rsp_valid`。
+对于写事务，Driver 不能在 SPI 完成的同一时刻立即判断 `BUSY`，而应先经过固定保护时间，再判断器件是否仍处于 BUSY。
+
+对于写事务，不要求必须观察到一次 `BUSY=0`。如果 BUSY 低脉冲较短，在保护时间结束前已经恢复为高，可直接认为器件内部处理已经结束。
+
+`BUSY` 等待需要设置 timeout，避免器件异常导致上层流程永久阻塞。
+
+AD5560 的 DAC x1 写入 BUSY low 最长约 1.5 µs，其他寄存器写入最长约 280 ns，因此正常写事务的 BUSY timeout 应明显大于 1.5 µs，并留有板级和时钟裕量。
+
+写结束已经等待 busy 固定时长了，且大于 `SYNC↑` 到 SDO high-Z，无需重复等待。
 
 ### 3.3 AD5560 寄存器读
 
@@ -94,85 +82,17 @@ REG_DATA
 
 AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction：
 
-```text
-第 1 次 SPI：发送 Read Request
-    ↓
-等待 readback 的 SYNC high 间隔
-    ↓
-第 2 次 SPI：发送 NOP，同时从 SDO 接收返回数据
-    ↓
-向上层返回 REG_DATA
-```
-
-两次 SPI transaction 均使用同一个 `DEVICE_ID`。SPI Master 每次 transaction 自己产生一轮 `CS_n`，Driver 将该 `CS_n` 映射到同一路 `SYNC`。
-
 依据 AD5560 Rev.F 的 SPI Read Timing，readback 两帧之间只要求满足最小 `SYNC` high time；**读事务两帧之间不等待 BUSY，也不执行写事务的 BUSY 检测流程。**
 
 因此 readback 要求的 `SYNC` high time，本质上就是两次 SPI transaction 之间的间隔。
 
 第 2 帧使用 NOP，避免为了移出 readback 数据而修改其他寄存器。
 
-### 3.4 BUSY 处理
-
-每条 BUS 的 16 颗 AD5560 共用一根开漏 `BUSY`，由对应 `AD5560 Driver` 直接检测。
-
-`BUSY` 主要用于写事务以及 RESET / 上电等内部处理状态。Datasheet 的 BUSY Function 明确说明寄存器写会使 BUSY 拉低；readback 时序图不要求在两帧之间等待 BUSY。
-
-为避免在前一笔写操作尚未完成时启动新的访问，**任何新事务开始前仍应先确认共享 `BUSY` 已释放。**
-
-对于写事务，SPI transaction 完成后，SPI Master 已经将其通用 `CS_n` 拉高，因此 Driver 映射出的目标 `SYNC` 也已拉高。Driver 不能在 SPI 完成的同一时刻立即判断 `BUSY`，而应先经过固定保护时间，再判断器件是否仍处于 BUSY。
-
-写事务基本流程：
-
-```text
-接收写事务
-    ↓
-确认 BUSY 已释放
-    ↓
-锁存 DEVICE_ID
-    ↓
-调用 SPI Master 执行 write transaction
-    ↓
-SPI Master 拉高 CS_n
-Driver 对应 SYNC 同步拉高
-    ↓
-固定 BUSY 检测保护时间
-    ↓
-BUSY 已高：写事务完成
-BUSY 为低：继续等待 BUSY 拉高
-    ↓
-返回事务完成
-```
-
-读事务基本流程：
-
-```text
-接收读事务
-    ↓
-确认 BUSY 已释放
-    ↓
-发送 Read Request
-    ↓
-等待 readback SYNC high 间隔
-    ↓
-发送 NOP 并接收 SDO
-    ↓
-直接返回读数据
-```
-
-读事务的第一帧与第二帧之间不等待 BUSY，第二帧结束后也不进入写事务的 BUSY 等待流程。
-
-这里要求 SPI Master 的 `done` 表示：**本次 SPI transaction 已完全结束，并且通用 `CS_n` 已经拉高。**
-
-对于写事务，不要求必须观察到一次 `BUSY=0`。如果 BUSY 低脉冲较短，在保护时间结束前已经恢复为高，可直接认为器件内部处理已经结束。
-
-`BUSY` 等待需要设置 timeout，避免器件异常导致上层流程永久阻塞。
+读后，注意 `SYNC` 拉高后，SDO 最迟约 30 ns 回到 high-Z。这个等待时间需放在读取后，然后再回复 resp_valid。
 
 ---
 
 ## 4. SPI / AD5560 时序边界
-
-单次 SPI transaction 内的 SCLK、MOSI/MISO 和通用 `CS_n` 时序由 `SPI Master` 保证；Driver 负责把 `CS_n` 映射为目标器件 `SYNC`，并负责 AD5560 特有的 transaction 间等待与写事务 BUSY 检测等待。
 
 依据 AD5560 Rev.F datasheet Table 2，建议第一版按以下方式预留：
 
@@ -186,125 +106,6 @@ BUSY 为低：继续等待 BUSY 拉高
 | `SYNC↑` 到 SDO high-Z | 最大 30 ns | 下一次 SPI transaction 不早于普通 CS high guard | SPI Master / Driver |
 
 上述建议值以逻辑简单和留有裕量为优先，不追求极限 SPI 吞吐率。
-
-### 4.1 SPI Master 与 SYNC 的职责边界
-
-`SPI Master` 是通用模块，仅提供一根 `CS_n`，不直接输出 16 路 AD5560 `SYNC`，也不接收 `DEVICE_ID`。
-
-SPI Master 至少需要支持：
-
-```text
-发送数据
-传输长度
-SPI 时钟配置
-start / valid
-ready / done
-接收数据
-CS_n
-```
-
-一次 transaction 内 SPI Master 完成：
-
-```text
-CS_n 拉低
-→ SPI 移位
-→ 保持必要 CS hold time
-→ CS_n 拉高
-→ done
-```
-
-Driver 负责：
-
-```text
-DEVICE_ID 锁存
-→ 将 spi_cs_n 映射到对应 SYNC
-→ 其余 SYNC 保持高
-```
-
-因此 Driver 可以把 `spi_done` 作为目标 `SYNC↑` 已发生的时间基准。
-
-### 4.2 写事务 BUSY 检测保护时间
-
-AD5560 在 `SYNC` 拉高、完成一笔写事务后，`BUSY` 不一定立即拉低。Datasheet 给出的最坏条件为 `SYNC↑` 后最多约 40 ns 才出现 `BUSY↓`。
-
-因此写事务禁止以下实现：
-
-```text
-spi_done / SYNC↑
-下一拍立即发现 BUSY=1
-→ 判定写事务完成
-```
-
-Driver 应先等待固定保护时间，例如 **100 ns**，再读取 `BUSY`：
-
-```text
-spi_done
-    ↓
-等待 100 ns
-    ↓
-BUSY = 0 → 等待 BUSY 回到 1
-BUSY = 1 → 当前写事务完成
-```
-
-AD5560 的 DAC x1 写入 BUSY low 最长约 1.5 µs，其他寄存器写入最长约 280 ns，因此正常写事务的 BUSY timeout 应明显大于 1.5 µs，并留有板级和时钟裕量。
-
-该 BUSY 检测流程**只用于写事务**，不插入 readback 两帧之间。
-
-### 4.3 Readback 两次 SPI transaction 间隔
-
-Readback 模式要求两帧之间的 `SYNC` high time至少为 **250 ns**。
-
-因为目标 `SYNC` 只是 SPI Master `CS_n` 经 Driver 选择后的映射，所以 Driver 只需要控制两次 SPI transaction 的启动间隔。
-
-第一版按 **≥ 500 ns** 处理：
-
-```text
-第 1 次 SPI transaction done
-spi_cs_n 已拉高
-对应目标 SYNC 也已拉高
-    ↓
-等待 ≥ 500 ns
-    ↓
-启动第 2 次 SPI transaction
-spi_cs_n 再次拉低
-Driver 将其映射到同一路 SYNC
-```
-
-**这 500 ns 等待本身就是 readback 两帧之间的完整等待条件，不需要在中间额外等待 BUSY。**
-
-第 2 次 SPI transaction 完成并取得 SDO 数据后即可结束本次读事务，不再执行写事务的 BUSY guard / BUSY wait。
-
-因此不需要在 Driver 中额外产生 `SYNC` 波形，只需要完成选择映射和 transaction 间隔控制。
-
-### 4.4 Readback SCLK
-
-AD5560 的 SDO 驱动较弱，readback 时不能直接按最高写入 SCLK 工作。Datasheet 给出的典型上限为：
-
-```text
-DVCC = 2.3 ~ 2.7 V：Readback SCLK ≤ 12 MHz
-DVCC = 2.7 ~ 3.3 V：Readback SCLK ≤ 15 MHz
-DVCC = 4.5 ~ 5.5 V：Readback SCLK ≤ 20 MHz
-```
-
-为简化第一版设计，可统一采用 **10 MHz readback SCLK**。写事务仍可使用独立的正常 SPI 时钟配置。
-
-通用 `SPI Master` 提供可配置时钟能力，具体在读事务中选择较低 SCLK 的策略由 `AD5560 Driver` 决定。
-
-### 4.5 器件切换
-
-`SYNC` 拉高后，SDO 最迟约 30 ns 回到 high-Z。
-
-由于同一 BUS 上 16 颗 AD5560 共用 SDO，Driver 在切换 `DEVICE_ID` 前必须保证上一笔 SPI transaction 已结束，并满足最小 transaction 间隔。
-
-只要：
-
-```text
-SPI Master 保证单路 CS_n 的 setup / hold / high time
-Driver 保证任意时刻仅一路 SYNC 跟随 CS_n
-Driver 在下一笔 transaction 前才允许改变 DEVICE_ID
-```
-
-即可避免两个 AD5560 的 SDO 同时驱动共享总线。
 
 ---
 
