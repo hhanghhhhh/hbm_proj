@@ -35,23 +35,26 @@ ad5560_controller
 │     └─ 单块全局 RAM，保存全部 AD5560 寄存器配置表
 │
 ├── config_manager
-│     └─ 顺序读取配置表，并按 BUS_ID 分发给对应 Bus Worker
-│
-├── bus_worker[0..7]
-│     └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
-│          ├─ 管理本组 16 路独立 SYNC，一次事务只选择一颗器件
-│          ├─ 管理本组共享 BUSY，等待器件内部操作完成并处理 timeout
-│          └── spi_master
-│                └─ 产生对应 SPI BUS 的底层时序
+│     └─ 顺序读取配置表，并产生寄存器事务请求
 │
 ├── power_sequence_ram
 │     └─ 单块全局 RAM，保存 128 路上下电时序
 │
-└── power_sequence_engine
-      └─ 按全局时序控制上下电任务
+├── power_sequence_engine
+│     └─ 按全局时序产生运行阶段寄存器事务请求
+│
+├── bus_command_mux_arbiter
+│     └─ 对不同上层请求源进行选择 / 仲裁，并按 BUS_ID 路由到对应 Bus Worker
+│
+└── bus_worker[0..7]
+      └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
+           ├─ 管理本组 16 路独立 SYNC，一次事务只选择一颗器件
+           ├─ 管理本组共享 BUSY，等待器件内部操作完成并处理 timeout
+           └── spi_master
+                 └─ 产生对应 SPI BUS 的底层时序
 ```
 
-`Config Manager` 和 `Power Sequence Engine` 均通过下层 `Bus Worker` 访问 AD5560，但分别负责“配置阶段”和“运行时序阶段”。
+`Config Manager` 和 `Power Sequence Engine` 分别负责配置阶段和运行时序阶段，均通过 `Bus Command MUX / Arbiter` 使用下层 `Bus Worker`。
 
 ---
 
@@ -124,22 +127,25 @@ flowchart TB
 
     subgraph CTRL[ad5560_controller]
         CRAM[单块 Config RAM\n全部 BUS 配置记录]
-        CM[Config Manager\n串行读取 / BUS 分发]
+        CM[Config Manager\n串行读取 / 产生配置事务]
 
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
-        PSE[Power Sequence Engine]
+        PSE[Power Sequence Engine\n产生运行事务]
+
+        ARB[Bus Command MUX / Arbiter\n请求选择 / 仲裁 / BUS 路由]
 
         subgraph BUS[Bus Worker × 8]
-            BW[BUS0 ~ BUS7 Worker\nDEVICE 选择 + SYNC + BUSY]
+            BW[BUS0 ~ BUS7 Worker\n寄存器事务 + DEVICE 选择 + SYNC + BUSY]
             SPI[SPI Master × 8]
             BW --> SPI
         end
 
         CRAM --> CM
-        CM --> BW
-
         PSRAM --> PSE
-        PSE --> BW
+
+        CM --> ARB
+        PSE --> ARB
+        ARB --> BW
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
@@ -154,3 +160,5 @@ flowchart TB
     BW -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| BW
 ```
+
+`Bus Command MUX / Arbiter` 位于上层事务产生模块与 `Bus Worker` 之间。`Bus Worker` 不区分事务来源，只负责执行统一格式的 AD5560 寄存器读写事务；具体仲裁优先级和接口时序后续再确定。
