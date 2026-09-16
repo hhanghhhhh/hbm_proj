@@ -53,15 +53,10 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 - 接收 `Config Manager`、`Power Sequence Engine` 等上层产生的前台寄存器事务；
 - 在总线空闲时执行本 BUS 的后台遥测轮询；
-- 前台事务优先于后台遥测；
 - 调用本 BUS 的 `AD5560 Driver` 完成实际寄存器读写；
 - 保存本 BUS 的最新遥测结果。
 
-遥测功能按 BUS 独立运行，因此采用 **每 BUS 一块 Telemetry RAM**。各 BUS 可以同时进行遥测，不需要对遥测 RAM 的写入做跨 BUS 仲裁。
-
-当前遥测内容可包括 AD5560 电压、电流、故障状态等，具体轮询寄存器和数据格式后续再确定。
-
-`Bus Service` 不保存 Config RAM。配置表仍由全局 `Config Manager` 顺序读取并按 `BUS_ID` 分发。
+遥测功能按 BUS 独立运行，因此采用 **每 BUS 一块 Telemetry RAM**。
 
 ---
 
