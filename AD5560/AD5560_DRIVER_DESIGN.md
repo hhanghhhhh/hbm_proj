@@ -32,7 +32,7 @@ AD5560 Driver n
 
 每次 SPI transaction 只允许选择一颗 AD5560。
 
-为简化第一版设计，可统一采用 **10 MHz SCLK**。。
+为简化第一版设计，可统一采用 **10 MHz SCLK**。
 
 ---
 
@@ -40,25 +40,18 @@ AD5560 Driver n
 
 ### 3.1 器件选择与 SYNC 映射
 
-上层提供 `DEVICE_ID`，Driver 在本次事务开始前锁存目标器件编号。
+上层提供 `DEVICE_ID`。Driver 执行期间不再额外锁存 `DEVICE_ID`，由上层 `Bus Service` 保证从 `drv_start` 发出到 `drv_done` 返回期间，所有 Driver 命令参数保持不变。
 
-Driver 根据锁存的 `DEVICE_ID` 将该 `CS_n` 映射为对应 AD5560 的 `SYNC`。
+Driver 根据当前 `DEVICE_ID` 将 SPI Master 的 `CS_n` 映射为对应 AD5560 的 `SYNC`。
 
 实际 RTL 需保证任何时刻最多只有一路 `SYNC` 为低。
-
-### 3.4 BUSY 处理
-
-每条 BUS 的 16 颗 AD5560 共用一根开漏 `BUSY`，由对应 `AD5560 Driver` 直接检测。
-
-`BUSY` 主要用于写事务以及 RESET / 上电等内部处理状态。Datasheet 的 BUSY Function 明确说明寄存器写会使 BUSY 拉低；readback 时序图不要求在两帧之间等待 BUSY。
-
-为避免在前一笔写操作尚未完成时启动新的访问，**任何新事务开始前仍应先确认共享 `BUSY` 已释放。**
 
 ### 3.2 AD5560 寄存器写
 
 上层提供：
 
 ```text
+RW
 DEVICE_ID
 REG_ADDR
 REG_DATA
@@ -74,13 +67,13 @@ REG_DATA
 
 AD5560 的 DAC x1 写入 BUSY low 最长约 1.5 µs，其他寄存器写入最长约 280 ns，因此正常写事务的 BUSY timeout 应明显大于 1.5 µs，并留有板级和时钟裕量。
 
-写结束已经等待 busy 固定时长了，且大于 `SYNC↑` 到 SDO high-Z，无需重复等待。
+写结束已经等待 BUSY 固定时长，且大于 `SYNC↑` 到 SDO high-Z，无需重复等待。
 
 ### 3.3 AD5560 寄存器读
 
 上层只发起一次寄存器读请求。
 
-AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction：
+AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction。
 
 依据 AD5560 Rev.F 的 SPI Read Timing，readback 两帧之间只要求满足最小 `SYNC` high time；**读事务两帧之间不等待 BUSY，也不执行写事务的 BUSY 检测流程。**
 
@@ -88,7 +81,15 @@ AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction：
 
 第 2 帧使用 NOP，避免为了移出 readback 数据而修改其他寄存器。
 
-读后，注意 `SYNC` 拉高后，SDO 最迟约 30 ns 回到 high-Z。这个等待时间需放在读取后，然后再回复 resp_valid。
+读后注意 `SYNC` 拉高后，SDO 最迟约 30 ns 回到 high-Z。完成该保护时间后再返回 `drv_done`。
+
+### 3.4 BUSY 处理
+
+每条 BUS 的 16 颗 AD5560 共用一根开漏 `BUSY`，由对应 `AD5560 Driver` 直接检测。
+
+`BUSY` 主要用于写事务以及 RESET / 上电等内部处理状态。Datasheet 的 BUSY Function 明确说明寄存器写会使 BUSY 拉低；readback 时序图不要求在两帧之间等待 BUSY。
+
+为避免在前一笔写操作尚未完成时启动新的访问，**任何新事务开始前仍应先确认共享 `BUSY` 已释放。**
 
 ---
 
@@ -109,76 +110,47 @@ AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction：
 
 ---
 
-## 5. 初步接口
+## 5. 与 Bus Service 的接口
 
-`Bus Service` 到 `AD5560 Driver` 的事务接口暂按以下信息组织：
+`Bus Service` 与 `AD5560 Driver` 为一对一关系，第一版不在内部继续使用 `valid / ready` 握手，采用简单的 `start / done` 脉冲接口。
 
-```text
-cmd_valid
-cmd_ready
-cmd_rw
-cmd_device_id[3:0]
-cmd_reg_addr[6:0]
-cmd_wr_data[15:0]
-```
-
-返回接口暂按：
+Service 到 Driver：
 
 ```text
-rsp_valid
-rsp_rd_data[15:0]
-rsp_error
+drv_start              // 单 clk 脉冲
+drv_rw
+drv_device_id[3:0]
+drv_reg_addr[6:0]
+drv_wr_data[15:0]
 ```
 
-其中：
-
-- `cmd_rw` 区分寄存器读 / 写；
-- 写操作使用 `cmd_wr_data`；
-- 读操作完成后通过 `rsp_rd_data` 返回结果；
-- `rsp_error` 用于返回 BUSY timeout 等事务异常。
-
-当：
+Driver 返回：
 
 ```text
-cmd_valid && cmd_ready
+drv_done               // 单 clk 脉冲
+drv_rd_data[15:0]
+drv_error
 ```
 
-同时为 1 时，本次事务完成握手，Driver 锁存命令参数并开始执行。握手后上层不需要继续保持本条命令。
+接口约束：
 
-`rsp_valid` 表示已经接受的寄存器事务真正执行完成。
+- `drv_start` 仅在 Driver 空闲时拉高 1 clk；
+- Driver 收到 `drv_start` 后立即开始执行当前输入参数描述的寄存器事务；
+- Driver 内部不再重复锁存 `drv_rw / drv_device_id / drv_reg_addr / drv_wr_data`；
+- `Bus Service` 必须保证从 `drv_start` 发出开始，到 `drv_done` 返回之前，上述参数保持不变；
+- `drv_done` 为单 clk 脉冲，表示本次寄存器事务已经完全结束；
+- 读事务在 `drv_done` 有效时，`drv_rd_data` 有效；
+- `drv_error` 在 `drv_done` 有效时表示本次事务是否异常。
+
+Driver 不需要额外提供 `ready / busy`。Service 通过自身状态机记录“已经发出 `drv_start` 且尚未收到 `drv_done`”，即可知道 Driver 当前是否忙。
 
 ---
 
-## 7. 多 BUS 选择与并行工作
+## 6. 多 BUS 选择与并行工作
 
 BUS 选择不在 `AD5560 Driver` 内实现。8 个 `Bus Service` 在顶层通过 `generate` 循环例化，每个实例具有固定 `BUS_ID`。
 
-典型选择逻辑：
-
-```verilog
-genvar bus_index;
-generate
-    for (bus_index = 0; bus_index < BUS_COUNT;
-         bus_index = bus_index + 1) begin : g_ad5560_bus
-
-        localparam [2:0] BUS_ID = bus_index;
-        wire bus_selected;
-
-        assign bus_selected = (bus_sel == BUS_ID);
-        assign service_cmd_valid[bus_index] = cmd_valid && bus_selected;
-
-        ...
-    end
-endgenerate
-```
-
-目标 BUS 的 `ready` 按 `bus_sel` 选择后回送给上层：
-
-```verilog
-assign selected_ready = service_ready[bus_sel];
-```
-
-对于 `Power Sequence Engine`，当前记录与目标 `Bus Service` 完成 `valid / ready` 握手后即可继续读取下一条记录，不等待本条事务对应的 Driver `rsp_valid`。
+对于 `Power Sequence Engine`，当前记录与目标 `Bus Service` 完成外层 `valid / ready` 握手后即可继续读取下一条记录，不等待本条事务对应的 Driver `drv_done`。
 
 因此：
 
@@ -186,5 +158,3 @@ assign selected_ready = service_ready[bus_sel];
 不同 BUS：事务可以重叠执行
 同一 BUS：通过本 BUS Service / Driver 自动串行
 ```
-
-例如 BUS0 已经接受一条事务并进入工作状态后，下一条记录如果目标为 BUS3，只要 BUS3 Service 为 ready，就可以立即完成握手并启动 BUS3。这样多个 SPI BUS 可以同时处于工作状态，而上层仍保持单路 `bus_sel + valid / ready` 接口。
