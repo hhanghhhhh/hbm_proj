@@ -66,11 +66,6 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 - 不同 BUS 之间具备独立 `Bus Worker / SPI Master`，可以并行执行；
 - 同一 BUS 内仍保持一次只选择一颗 AD5560；
-- `Power Sequence Engine` 不要求等待当前事务 `done` 后才读取下一条，而是在目标 `Bus Worker` 完成 `valid / ready` 握手后即可继续读取下一条；
-- 如果下一条命令属于其他空闲 BUS，可立即握手，使多个 BUS 的事务自然重叠执行；
-- 如果下一条仍属于当前忙碌 BUS，则等待该 BUS 再次 `ready`。
-
-因此当前确定：**配置阶段串行执行；运行阶段通过各 Bus Worker 独立握手，允许多条 BUS 同时处于工作状态。**
 
 ---
 
@@ -113,11 +108,3 @@ flowchart TB
     BW -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| BW
 ```
-
-顶层循环例化 8 个 `Bus Worker`，每个实例具有固定 `BUS_ID`，根据上层输出的 `bus_sel / BUS_ID` 直接生成本实例的选择信号，例如：
-
-```verilog
-assign bus_selected = (bus_sel == BUS_ID);
-```
-
-目标 BUS 的 `ready` 再按 `bus_sel` 选择回送给当前请求源。该方式与现有多相 Buck 工程中的多 BUS 选择方式一致，不需要额外增加独立 MUX 模块。
