@@ -1,14 +1,10 @@
 # AD5560 FPGA 系统架构
 
-## 1. 系统定位
+## 1. 系统
 
 本系统由一片 FPGA 控制 **128 颗 AD5560**。上位机负责下发配置表和运行任务，FPGA 负责配置数据缓存、寄存器配置执行以及后续上下电时序控制。
 
----
-
-## 2. 数字控制信号划分
-
-### 2.1 SPI 与 SYNC
+### 1.1 SPI 与 SYNC
 
 - 共 **8 组 SPI 总线**；
 - 每组 SPI 连接 16 颗 AD5560；
@@ -16,7 +12,7 @@
 - 每条 BUS 对应一组共享 `BUSY`；
 - 每个 `Bus Worker` 负责本组 SPI、16 路 `SYNC` 和 1 路共享 `BUSY`。
 
-### 2.2 HW_INH
+### 1.2 HW_INH
 
 系统当前只使用 **1 根全局 `HW_INH`**。
 
@@ -24,38 +20,7 @@
 
 ---
 
-## 3. FPGA 模块初步划分
-
-当前先按以下模块划分组织 FPGA 内部功能，后续再逐个讨论模块接口和 RTL 细节。
-
-```text
-ad5560_controller
-│
-├── config_ram
-│     └─ 单块全局 RAM，保存全部 AD5560 寄存器配置表
-│
-├── config_manager
-│     └─ 顺序读取配置表，并产生寄存器事务请求
-│
-├── power_sequence_ram
-│     └─ 单块全局 RAM，保存 128 路上下电时序
-│
-├── power_sequence_engine
-│     └─ 按全局时序产生运行阶段寄存器事务请求
-│
-└── bus_worker[0..7]
-      └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
-           ├─ 管理本组 16 路独立 SYNC，一次事务只选择一颗器件
-           ├─ 管理本组共享 BUSY，等待器件内部操作完成并处理 timeout
-           └── spi_master
-                 └─ 产生对应 SPI BUS 的底层时序
-```
-
-`Config Manager` 和 `Power Sequence Engine` 均输出统一格式的寄存器事务，并携带 `BUS_ID`。顶层在循环例化 `Bus Worker` 时，根据 `BUS_ID` 直接选择对应实例，不再增加独立的 `Bus Command MUX / Arbiter` 模块。
-
----
-
-## 4. 配置数据组织
+## 2. 配置数据组织
 
 配置采用**寄存器级配置表**方式。
 
@@ -69,7 +34,7 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 固定配置和通道可变配置使用同一种数据格式。固定寄存器可由上位机保存为默认 Config Table 并下发；后续如需固化到 FPGA，也可增加内部 `Config Loader`，向同一 `Config RAM` 写入配置记录，后级执行模块无需改变。
 
-### 4.1 Config RAM 组织
+### 2.1 Config RAM 组织
 
 当前确定采用 **单块全局 `Config RAM`**，不按 8 条 SPI BUS 分成 8 块 RAM。
 
@@ -77,13 +42,13 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 当前配置时间不是系统瓶颈，因此第一版配置阶段采用串行执行，优先保证通信、RAM 管理和 `Config Manager` 逻辑简单。
 
-### 4.2 BUSY 处理
+### 2.2 BUSY 处理
 
 每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理。
 
 第一版采用保守策略：**每完成一笔 SPI transaction，都等待 AD5560 内部处理完成后再返回事务结束**，不使用 BUSY 期间的流水发送优化。
 
-### 4.3 SYNC 处理
+### 2.3 SYNC 处理
 
 `SYNC` 由各 `Bus Worker` 直接管理。
 
@@ -100,7 +65,7 @@ Bus Worker n
 
 ---
 
-## 5. 上下电时序组织
+## 3. 上下电时序组织
 
 上下电时序采用 **单块全局 `Power Sequence RAM` + 单个 `Power Sequence Engine`**。
 
