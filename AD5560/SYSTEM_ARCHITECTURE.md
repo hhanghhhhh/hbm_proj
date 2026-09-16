@@ -2,7 +2,7 @@
 
 ## 1. 系统
 
-本系统由一片 FPGA 控制 **128 颗 AD5560**。上位机负责下发配置表和运行任务，FPGA 负责配置数据缓存、寄存器配置执行以及后续上下电时序控制。
+本系统由一片 FPGA 控制 **128 颗 AD5560**。上位机负责下发配置表和运行任务，FPGA 负责配置数据缓存、寄存器配置执行、上下电时序控制以及后台遥测。
 
 ### 1.1 SPI 与 SYNC
 
@@ -10,7 +10,8 @@
 - 每组 SPI 连接 16 颗 AD5560；
 - `SYNC` 每颗 AD5560 独立，共 **128 根 SYNC**；
 - 每条 BUS 对应一组共享 `BUSY`；
-- 每个 `Bus Worker` 负责本组 SPI、16 路 `SYNC` 和 1 路共享 `BUSY`。
+- 每条 BUS 对应一个 `Bus Service` 和一个 `AD5560 Driver`；
+- `AD5560 Driver` 负责本组 SPI、16 路 `SYNC` 和 1 路共享 `BUSY`。
 
 ### 1.2 HW_INH
 
@@ -27,7 +28,7 @@
 上位机直接生成并下发 AD5560 配置记录，每条记录包含：
 
 ```text
-DEVICE_ID + REG_ADDR + REG_DATA
+BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
 ```
 
 FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和可靠执行配置表。
@@ -38,38 +39,86 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 当前确定采用 **单块全局 `Config RAM`**，不按 8 条 SPI BUS 分成 8 块 RAM。
 
-所有 BUS、所有器件的配置记录按上位机生成的顺序连续存储。`Config Manager` 从头到尾顺序读取配置记录，根据其中的 `BUS_ID` 将当前事务发送给对应的 `Bus Worker`，等待该事务完成后继续读取下一条记录。
+所有 BUS、所有器件的配置记录按上位机生成的顺序连续存储。`Config Manager` 从头到尾顺序读取配置记录，根据其中的 `BUS_ID` 将当前事务发送给对应的 `Bus Service`。
 
 当前配置时间不是系统瓶颈，因此第一版配置阶段采用串行执行，优先保证通信、RAM 管理和 `Config Manager` 逻辑简单。
 
-### 2.2 BUSY 处理
+---
 
-每条 SPI BUS 的 16 颗 AD5560 共用一根 `BUSY`，因此 `BUSY` 作为该 BUS 的组级资源，由对应 `Bus Worker` 直接管理。
+## 3. Bus Service
 
-第一版采用保守策略：**每完成一笔 SPI transaction，都等待 AD5560 内部处理完成后再返回事务结束**，不使用 BUSY 期间的流水发送优化。
+每条 SPI BUS 设置一个 `Bus Service`，负责该 BUS 的本地任务调度。
 
-### 2.3 SYNC 处理
+主要职责：
 
-`SYNC` 由各 `Bus Worker` 直接管理。
+- 接收 `Config Manager`、`Power Sequence Engine` 等上层产生的前台寄存器事务；
+- 在总线空闲时执行本 BUS 的后台遥测轮询；
+- 前台事务优先于后台遥测；
+- 调用本 BUS 的 `AD5560 Driver` 完成实际寄存器读写；
+- 保存本 BUS 的最新遥测结果。
 
-每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`。每次 SPI transaction 根据 `DEVICE_ID` 只选择一颗器件。
+遥测功能按 BUS 独立运行，因此采用 **每 BUS 一块 Telemetry RAM**。各 BUS 可以同时进行遥测，不需要对遥测 RAM 的写入做跨 BUS 仲裁。
+
+当前遥测内容可包括 AD5560 电压、电流、故障状态等，具体轮询寄存器和数据格式后续再确定。
+
+`Bus Service` 不保存 Config RAM。配置表仍由全局 `Config Manager` 顺序读取并按 `BUS_ID` 分发。
 
 ---
 
-## 3. 上下电时序组织
+## 4. AD5560 Driver
+
+`AD5560 Driver` 是单条 BUS 的 AD5560 寄存器事务执行层，只负责完成一笔指定器件的寄存器读写，不负责配置表管理、上下电时序调度或遥测轮询。
+
+每个 Driver 负责：
+
+- 根据 `DEVICE_ID` 控制本组 16 路独立 `SYNC`，一次事务只选择一颗器件；
+- 组织 AD5560 寄存器读写所需 SPI 帧；
+- 封装 AD5560 读寄存器所需的多帧操作；
+- 调用通用 `SPI Master`；
+- 检测本组共享 `BUSY` 并处理 timeout。
+
+---
+
+## 5. 上下电时序组织
 
 上下电时序采用 **单块全局 `Power Sequence RAM` + 单个 `Power Sequence Engine`**。
 
 128 路上下电时序属于同一个全局时间轴，不按 BUS 分成 8 套独立时序。
 
-与配置阶段不同，上下电时序需要考虑多通道并行启动：
+`Power Sequence Engine` 顺序读取时序记录，并通过 `BUS_ID` 将当前寄存器事务送到对应的 `Bus Service`。当前目标 BUS 完成 `valid / ready` 握手后即可读取下一条记录，不需要等待该 BUS 的实际寄存器事务完成。
 
-- 不同 BUS 之间具备独立 `Bus Worker / SPI Master`，可以并行执行；
-- 同一 BUS 内仍保持一次只选择一颗 AD5560；
+因此：
+
+```text
+不同 BUS：事务可以重叠执行
+同一 BUS：由本 BUS Service / Driver 自动串行执行
+```
+
+不同 BUS 的启动时间可能相差少量 FPGA clk，但不要求严格同一时钟周期启动。
 
 ---
 
-## 6. 各模块连接关系
+## 6. 多 BUS 选择
+
+8 个 `Bus Service` 在顶层通过 `generate` 循环例化，每个实例具有固定 `BUS_ID`。
+
+上层输出单路事务和 `bus_sel`，顶层直接选择目标 BUS：
+
+```verilog
+localparam [2:0] BUS_ID = bus_index;
+wire bus_selected;
+
+assign bus_selected = (bus_sel == BUS_ID);
+assign service_cmd_valid[bus_index] = cmd_valid && bus_selected;
+
+assign selected_ready = service_ready[bus_sel];
+```
+
+不设置独立的 Bus Command MUX 模块。
+
+---
+
+## 7. 各模块连接关系
 
 ```mermaid
 flowchart TB
@@ -83,17 +132,22 @@ flowchart TB
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine\n产生运行事务]
 
-        subgraph BUS[Bus Worker × 8]
-            BW[BUS0 ~ BUS7 Worker\n寄存器事务 + DEVICE 选择 + SYNC + BUSY]
+        subgraph BUS[Bus Service × 8]
+            BS[BUS0 ~ BUS7 Service\n前台事务 + 后台遥测调度]
+            TRAM[Telemetry RAM × 8]
+            DRV[AD5560 Driver × 8\n寄存器事务 + DEVICE 选择 + SYNC + BUSY]
             SPI[SPI Master × 8]
-            BW --> SPI
+
+            BS --> DRV
+            BS --> TRAM
+            DRV --> SPI
         end
 
         CRAM --> CM
         PSRAM --> PSE
 
-        CM -->|BUS_ID + Register Transaction| BW
-        PSE -->|BUS_ID + Register Transaction| BW
+        CM -->|BUS_ID + Register Transaction| BS
+        PSE -->|BUS_ID + Register Transaction| BS
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
@@ -105,6 +159,6 @@ flowchart TB
     COMM --> PSE
 
     SPI --> DEV
-    BW -->|SYNC 128 路| DEV
-    DEV -->|BUSY 8 路| BW
+    DRV -->|SYNC 128 路| DEV
+    DEV -->|BUSY 8 路| DRV
 ```
