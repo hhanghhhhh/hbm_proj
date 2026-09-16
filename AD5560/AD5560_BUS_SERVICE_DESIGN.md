@@ -11,8 +11,6 @@
 - 管理本 BUS 的 `Telemetry RAM`；
 - 向下调用 `AD5560 Driver` 完成实际寄存器读写。
 
-`Bus Service` 不负责 AD5560 SPI 帧、readback 两帧流程、`SYNC / BUSY` 等器件级时序，这些均由 `AD5560 Driver` 负责。
-
 ```text
 Bus Service
 ├─ Foreground Command
@@ -158,23 +156,6 @@ ITEM 2：Alarm / Fault Status
 ```
 
 具体 RAM 位宽和数据格式后续根据实际遥测寄存器确定。
-
-### 6.1 双口访问
-
-Telemetry RAM 使用双口 RAM：
-
-```text
-Port A：Bus Service 写入最新遥测结果
-Port B：上位机 / 通信模块读取
-```
-
-这样后台刷新和上位机读取可以同时进行，不需要增加 RAM 访问仲裁。
-
-如果两个端口在同一时刻访问同一个地址，读到更新前还是更新后的数据取决于 RAM IP 的 read-during-write 模式。Telemetry 属于实时状态缓存，因此第一版不要求同地址读写具有严格原子性；上位机允许读到本次更新前或更新后的值。
-
-第一版也不要求同一器件的 Voltage / Current / Alarm 必须来自完全相同的一轮扫描。如后续需要一致快照，再增加版本号或其他一致性机制。
-
----
 
 ## 7. 与 AD5560 Driver 的接口
 
