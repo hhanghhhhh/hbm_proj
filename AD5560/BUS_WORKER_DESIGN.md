@@ -141,18 +141,6 @@ assign selected_ready = worker_ready[bus_sel];
 
 ### 5.1 valid / ready 含义
 
-`Bus Worker` 空闲、可以接收新事务时：
-
-```text
-cmd_ready = 1
-```
-
-事务已经被接受并正在执行 SPI / BUSY 等流程时：
-
-```text
-cmd_ready = 0
-```
-
 当：
 
 ```text
@@ -161,68 +149,17 @@ cmd_valid && cmd_ready
 
 同时为 1 时，本次命令完成握手，`Bus Worker` 锁存命令参数并开始执行。握手完成后，上层不需要继续保持本条命令。
 
-`rsp_valid` 表示已经接受的事务真正执行完成，与 `cmd_ready` 的含义分开：
+`rsp_valid` 表示已经接受的事务真正执行完成：
 
-```text
-cmd_ready / valid  → 命令是否已经交给 Worker
-rsp_valid          → 该命令是否已经真正执行完成
-```
-
-### 5.2 Power Sequence Engine 的并行工作方式
-
-`Power Sequence Engine` 仍采用一套串行命令输出接口：
-
-```text
-seq_valid
-seq_bus_id
-seq_device_id
-seq_rw
-seq_reg_addr
-seq_wr_data
-```
+### 5.2 并行工作方式
 
 当前命令根据 `seq_bus_id` 选择目标 `Bus Worker`，并从该 Worker 取得 `seq_ready`。
 
-只要当前命令完成 `valid / ready` 握手，`Power Sequence Engine` 就可以继续读取下一条时序命令，**不需要等待当前 Worker 的 `rsp_valid / done`**。
+只要当前命令完成 `valid / ready` 握手，就可以继续读取下一条时序命令，**不需要等待当前 Worker 的 `rsp_valid`**。
 
-例如：
-
-```text
-Command 0 -> BUS0
-Command 1 -> BUS3
-Command 2 -> BUS5
-```
-
-执行关系可以是：
-
-```text
-BUS0 完成握手 -> Worker0 开始工作
-        ↓
-立即读取下一条
-        ↓
-BUS3 完成握手 -> Worker3 开始工作
-        ↓
-立即读取下一条
-        ↓
-BUS5 完成握手 -> Worker5 开始工作
-```
-
-此时 Worker0、Worker3、Worker5 可以同时处于工作状态，各自独立执行 SPI 事务，因此实现多 BUS 并行工作。
-
-如果下一条命令仍然属于当前正在工作的 BUS，例如：
-
-```text
-Command 0 -> BUS0
-Command 1 -> BUS0
-```
-
-第一条握手后 Worker0 的 `cmd_ready` 会拉低，第二条命令保持等待，直到 Worker0 再次空闲并重新拉高 `cmd_ready`。
-
-因此该结构的基本原则是：
+该结构的基本原则是：
 
 ```text
 不同 BUS：事务可以重叠执行
 同一 BUS：事务自动串行执行
 ```
-
-这种方式不要求 `Power Sequence Engine` 提供 8 套独立命令接口，只需要单路 `BUS_ID + valid/ready` 接口即可。
