@@ -8,8 +8,6 @@
 
 SPI 底层时序由通用 `SPI Master` 实现，`SPI Master` 支持常规 SPI 四种工作模式；AD5560 特有的器件选择、寄存器帧组织、读流程和 `BUSY` 处理均放在 `Bus Worker` 中。
 
-当前不再继续拆分 `Register Access`、`SYNC Control`、`BUSY Control` 等子模块，先由一个 `Bus Worker` FSM 完成这些功能。
-
 ---
 
 ## 2. 每个 Bus Worker 对应的硬件资源
@@ -24,7 +22,7 @@ Bus Worker n
 └─ 1 个 SPI Master
 ```
 
-每次事务只允许选择一颗 AD5560，不使用多个 `SYNC` 同时有效的方式。
+每次事务只允许选择一颗 AD5560。
 
 ---
 
@@ -33,8 +31,6 @@ Bus Worker n
 ### 3.1 器件选择
 
 上层提供 `DEVICE_ID`，`Bus Worker` 根据该编号控制本组对应的 `SYNC`。
-
-一次事务只选择一颗器件，其余 `SYNC` 保持无效。
 
 ### 3.2 AD5560 寄存器写
 
@@ -78,26 +74,6 @@ AD5560 读寄存器所需的多帧 SPI 操作由 `Bus Worker` 内部完成，最
 
 `BUSY` 等待需要设置 timeout，避免器件异常导致上层流程永久阻塞。
 
-### 3.5 SPI Master 调用
-
-`SPI Master` 只负责底层 SPI 时序，例如：
-
-```text
-start
-TX data
-RX data
-SPI done
-SCLK / MOSI / MISO
-```
-
-`SPI Master` 不负责：
-
-- AD5560 `DEVICE_ID`；
-- `SYNC` 选择；
-- AD5560 寄存器帧格式；
-- AD5560 读寄存器流程；
-- `BUSY` 检测。
-
 ---
 
 ## 4. 初步接口
@@ -127,49 +103,3 @@ rsp_error
 - 写操作使用 `cmd_wr_data`；
 - 读操作完成后通过 `rsp_rd_data` 返回结果；
 - `rsp_error` 用于返回 BUSY timeout 等事务异常。
-
-具体握手时序以及是否最终采用 `valid / ready` 形式，后续结合 `Config Manager`、`Power Sequence Engine` 的仲裁方式再确定。
-
----
-
-## 5. 模块边界
-
-`Bus Worker` 不区分请求来自：
-
-- `Config Manager`；
-- `Power Sequence Engine`；
-- 手动寄存器调试；
-- 其他后续控制模块。
-
-对 `Bus Worker` 来说，上层请求统一表现为一笔 AD5560 寄存器事务。
-
-上层多个请求源如何选择、仲裁，不放在 `Bus Worker` 内部处理，后续在其上一级单独确定。
-
----
-
-## 6. 当前模块关系
-
-```text
-上层事务源
-    │
-    │ DEVICE_ID / RW / ADDR / DATA
-    ▼
-┌─────────────────────────────┐
-│        Bus Worker           │
-│                             │
-│  - Transaction FSM          │
-│  - AD5560 frame organization│
-│  - SYNC control             │
-│  - BUSY check / timeout     │
-│  - read transaction flow    │
-│              │              │
-│              ▼              │
-│         SPI Master          │
-└─────────────────────────────┘
-       │       │       │
-      SPI    SYNC     BUSY
-       │       │       │
-       └── 16 × AD5560 ┘
-```
-
-当前文档只确定 `Bus Worker` 的职责和边界，具体 FSM 状态、timeout 数值、读写握手时序以及上层仲裁方式后续再讨论。
