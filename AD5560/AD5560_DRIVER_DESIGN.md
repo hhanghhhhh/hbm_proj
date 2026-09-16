@@ -6,7 +6,7 @@
 
 上层只需要描述“访问哪颗器件、读写哪个寄存器、写入什么数据”，`AD5560 Driver` 负责完成对应的 AD5560 SPI 事务。
 
-SPI 底层时序由通用 `SPI Master` 实现，`SPI Master` 支持常规 SPI 四种工作模式；AD5560 特有的器件选择、寄存器帧组织、读流程和 `BUSY` 处理均放在 `AD5560 Driver` 中。
+SPI 底层移位和时钟产生由通用 `SPI Master` 实现；AD5560 特有的器件选择、寄存器帧组织、读流程、`SYNC` 时序和 `BUSY` 处理均放在 `AD5560 Driver` 中。
 
 `AD5560 Driver` 不负责配置表管理、上下电时序调度、BUS 选择或后台遥测轮询。
 
@@ -50,35 +50,139 @@ REG_DATA
 
 上层只发起一次寄存器读请求。
 
-AD5560 读寄存器所需的多帧 SPI 操作由 `AD5560 Driver` 内部完成，最终向上层返回读取到的 `REG_DATA`。
+AD5560 readback 由 Driver 内部封装为两次 SPI 操作：
 
-上层模块不需要了解 AD5560 读操作的具体 SPI 帧流程。
+```text
+第 1 帧：发送 Read Request
+    ↓
+SYNC 拉高并等待 readback 间隔
+    ↓
+第 2 帧：发送 NOP，同时从 SDO 接收返回数据
+    ↓
+向上层返回 REG_DATA
+```
+
+第 2 帧使用 NOP，避免为了移出 readback 数据而修改其他寄存器。
+
+上层模块不需要了解 AD5560 readback 的两帧流程。
 
 ### 3.4 BUSY 处理
 
-每条 BUS 的 16 颗 AD5560 共用一根 `BUSY`，由对应 `AD5560 Driver` 直接检测。
+每条 BUS 的 16 颗 AD5560 共用一根开漏 `BUSY`，由对应 `AD5560 Driver` 直接检测。
 
-基本事务流程：
+新事务开始前必须确认 `BUSY` 已释放。一次写事务完成后不能在 `SYNC` 拉高的同一时刻立即判断 `BUSY`，而应先经过固定保护时间，再判断器件是否仍处于 BUSY。
+
+基本流程：
 
 ```text
 接收寄存器事务
     ↓
 确认 BUSY 已释放
     ↓
-选择 DEVICE / 控制 SYNC
+选择 DEVICE / SYNC 拉低
     ↓
 执行 SPI transaction
     ↓
-等待 BUSY 释放
+SYNC 拉高
+    ↓
+固定 BUSY 检测保护时间
+    ↓
+BUSY 已高：事务完成
+BUSY 为低：继续等待 BUSY 拉高
     ↓
 返回事务完成
 ```
+
+不要求必须观察到一次 `BUSY=0`。如果 BUSY 低脉冲较短，在保护时间结束前已经恢复为高，可直接认为器件内部处理已经结束。
 
 `BUSY` 等待需要设置 timeout，避免器件异常导致上层流程永久阻塞。
 
 ---
 
-## 4. 初步接口
+## 4. AD5560 专用时序约束
+
+以下约束属于 `AD5560 Driver`，而不是通用 `SPI Master`。Driver 负责在调用 SPI Master 前后插入所需等待时间。
+
+依据 AD5560 Rev.F datasheet Table 2：
+
+| 项目 | Datasheet 要求 | Driver 建议预留 |
+|---|---:|---:|
+| `SYNC↓` 到首个 SCLK falling edge | ≥ 10 ns | ≥ 50 ns |
+| 第 24 个 SCLK falling edge 到 `SYNC↑` | ≥ 5 ns | ≥ 50 ns |
+| 普通事务 `SYNC` high time | ≥ 15 ns | ≥ 50 ns |
+| `SYNC↑` 到 `BUSY↓` | 最大 40 ns | **先等待 ≥ 100 ns 再检测 BUSY** |
+| Readback 两帧之间 `SYNC` high time | ≥ 250 ns | **≥ 500 ns** |
+| `SYNC↑` 到 SDO high-Z | 最大 30 ns | 切换器件前至少保留普通 `SYNC` high guard |
+
+上述建议值以逻辑简单和留有裕量为优先，不追求极限 SPI 吞吐率。
+
+### 4.1 BUSY 检测保护时间
+
+AD5560 在 `SYNC` 拉高、完成一笔写事务后，`BUSY` 不一定立即拉低。Datasheet 给出的最坏条件为 `SYNC↑` 后最多约 40 ns 才出现 `BUSY↓`。
+
+因此禁止以下实现：
+
+```text
+SYNC↑
+下一拍立即发现 BUSY=1
+→ 判定事务完成
+```
+
+Driver 应先等待固定保护时间，例如 **100 ns**，再读取 `BUSY`：
+
+```text
+SYNC↑
+    ↓
+等待 100 ns
+    ↓
+BUSY = 0 → 等待 BUSY 回到 1
+BUSY = 1 → 当前事务完成
+```
+
+AD5560 的 DAC x1 写入 BUSY low 最长约 1.5 µs，其他寄存器写入最长约 280 ns，因此正常寄存器事务的 BUSY timeout 应明显大于 1.5 µs，并留有板级和时钟裕量。
+
+### 4.2 Readback 两帧间隔
+
+Readback 模式要求两次 SPI 操作之间的 `SYNC` high time 至少为 **250 ns**。
+
+Driver 第一版按 **500 ns** 处理：
+
+```text
+Read Request 帧结束 / SYNC↑
+    ↓
+等待 ≥ 500 ns
+    ↓
+SYNC↓
+发送 NOP 帧并采集 SDO
+```
+
+该间隔由 Driver 保证，SPI Master 不需要知道 readback 是两帧事务。
+
+### 4.3 Readback SCLK
+
+AD5560 的 SDO 驱动较弱，readback 时不能直接按最高写入 SCLK 工作。Datasheet 给出的典型上限为：
+
+```text
+DVCC = 2.3 ~ 2.7 V：Readback SCLK ≤ 12 MHz
+DVCC = 2.7 ~ 3.3 V：Readback SCLK ≤ 15 MHz
+DVCC = 4.5 ~ 5.5 V：Readback SCLK ≤ 20 MHz
+```
+
+为简化第一版设计，可统一采用 **10 MHz readback SCLK**。写事务仍可使用独立的正常 SPI 时钟配置。
+
+通用 `SPI Master` 只提供可配置时钟能力，具体在读事务中选择较低 SCLK 的策略由 `AD5560 Driver` 决定。
+
+### 4.4 SDO 释放与器件切换
+
+`SYNC` 拉高后，SDO 最迟约 30 ns 回到 high-Z。
+
+由于同一 BUS 上 16 颗 AD5560 共用 SDO，Driver 必须保证上一颗器件的 `SYNC` 已拉高并经过必要保护时间后，才允许拉低下一颗器件的 `SYNC`，避免两个 SDO 驱动器短时间重叠。
+
+任何时刻只允许一颗 AD5560 的 `SYNC` 为低。
+
+---
+
+## 5. 初步接口
 
 `Bus Service` 到 `AD5560 Driver` 的事务接口暂按以下信息组织：
 
@@ -118,7 +222,7 @@ cmd_valid && cmd_ready
 
 ---
 
-## 5. 与 Bus Service 的关系
+## 6. 与 Bus Service 的关系
 
 每条 BUS 设置一个 `Bus Service`，`AD5560 Driver` 作为该 Service 的下层寄存器访问执行器。
 
@@ -138,7 +242,7 @@ Bus Service
 
 ---
 
-## 6. 多 BUS 选择与并行工作
+## 7. 多 BUS 选择与并行工作
 
 BUS 选择不在 `AD5560 Driver` 内实现。8 个 `Bus Service` 在顶层通过 `generate` 循环例化，每个实例具有固定 `BUS_ID`。
 
