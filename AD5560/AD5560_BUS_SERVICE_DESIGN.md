@@ -11,16 +11,6 @@
 - 管理本 BUS 的 `Telemetry RAM`；
 - 向下调用 `AD5560 Driver` 完成实际寄存器读写。
 
-```text
-Bus Service
-├─ Foreground Command
-├─ Telemetry Scheduler
-├─ Telemetry RAM
-│
-└─ AD5560 Driver
-      └─ SPI Master
-```
-
 ---
 
 ## 2. 任务优先级
@@ -92,13 +82,6 @@ telemetry_mask[15:0]
 - 仅轮询 `telemetry_mask[n] = 1` 的器件；
 - `telemetry_mask[n] = 0` 的器件直接跳过。
 
-典型使用方式：
-
-```text
-配置阶段：telemetry_enable = 0
-上电运行后：telemetry_enable = 1
-```
-
 `telemetry_enable` 或 `telemetry_mask` 改变时，不强制中断已经启动的当前遥测事务，新配置从下一次调度开始生效。
 
 ---
@@ -112,28 +95,6 @@ Voltage
 Current
 Alarm / Fault Status
 ```
-
-具体寄存器地址后续确定。
-
-轮询过程例如：
-
-```text
-DEV n Voltage
-    ↓
-重新检查前台请求
-    ↓
-DEV n Current
-    ↓
-重新检查前台请求
-    ↓
-DEV n Alarm
-    ↓
-重新检查前台请求
-    ↓
-寻找下一颗 mask = 1 的 DEVICE
-```
-
-轮询到 DEV15 后重新从 DEV0 开始。
 
 ---
 
@@ -149,14 +110,6 @@ Telemetry RAM 只保存**最新状态**，不保存历史数据。新的遥测�
 DEVICE_ID + TELEMETRY_ITEM
 ```
 
-例如：
-
-```text
-ITEM 0：Voltage
-ITEM 1：Current
-ITEM 2：Alarm / Fault Status
-```
-
 具体 RAM 位宽和数据格式后续根据实际遥测寄存器确定。
 
 Telemetry RAM 建议使用双口 RAM：
@@ -164,69 +117,19 @@ Telemetry RAM 建议使用双口 RAM：
 - A 口由 `Bus Service` 写入最新遥测值；
 - B 口供上位机通信侧读取。
 
-因此后台刷新和上位机读取可以同时进行，不需要额外读写仲裁。同地址同时读写时允许读到更新前或更新后的值，第一版不做严格原子快照。
-
 ---
 
 ## 7. 与 AD5560 Driver 的接口
 
-`Bus Service` 与 `AD5560 Driver` 为一对一关系，内部不再使用第二套 `valid / ready` 握手，采用简单的 `start / done` 脉冲接口。
-
-Service 到 Driver：
-
-```text
-drv_start              // 单 clk 脉冲
-drv_rw
-drv_device_id[3:0]
-drv_reg_addr[6:0]
-drv_wr_data[15:0]
-```
-
-Driver 返回：
-
-```text
-drv_done               // 单 clk 脉冲
-drv_rd_data[15:0]
-drv_error
-```
-
-使用规则：
-
-```text
-Service 准备好 Driver 参数
-    ↓
-drv_start 拉高 1 clk
-    ↓
-Service 保持 drv_rw / device_id / reg_addr / wr_data 不变
-    ↓
-等待 drv_done
-    ↓
-处理读回数据或错误
-    ↓
-再决定下一笔前台 / Telemetry 事务
-```
-
-`Bus Service` 自己记录当前是否存在未完成 Driver 事务，因此 Driver 不需要再提供 `ready / busy`。
+`Bus Service` 与 `AD5560 Driver` 为一对一关系，采用简单的 `start / done` 脉冲接口。
 
 前台事务参数由 Service 在外层 `cmd_valid && cmd_ready` 时接收并保存；后台遥测参数则由 Service 自己产生。无论来源是哪一种，一旦发出 `drv_start`，在 `drv_done` 之前都保持 Driver 输入接口不变。
-
-`Bus Service` 不区分 Driver 内部的一帧写事务或两帧 readback，只等待最终 `drv_done`。
 
 ---
 
 ## 8. 多 BUS 工作方式
 
 8 个 `Bus Service` 相互独立，每个 Service 只管理自己的 SPI BUS、Driver 和 Telemetry RAM。
-
-因此可以出现：
-
-```text
-BUS0：执行 Power Sequence 前台命令
-BUS1：执行后台 Telemetry
-BUS2：空闲
-BUS3：执行前台寄存器配置
-...
-```
 
 不同 BUS 可以同时工作；同一 BUS 内由对应 `Bus Service` 保证事务串行执行。
 
