@@ -149,29 +149,6 @@ cmd_valid && cmd_ready
 
 ---
 
-## 6. 与 Bus Service 的关系
-
-每条 BUS 设置一个 `Bus Service`，`AD5560 Driver` 作为该 Service 的下层寄存器访问执行器。
-
-```text
-Bus Service
-├─ 接收前台寄存器事务
-├─ 空闲时发起后台遥测事务
-├─ 维护本 BUS Telemetry RAM
-│
-└─ AD5560 Driver
-      ├─ DEVICE_ID → SYNC 选择
-      ├─ 写事务 BUSY / readback 控制
-      └─ SPI Master
-            └─ 通用 CS_n
-```
-
-`Bus Service` 决定“下一笔执行什么事务”，`AD5560 Driver` 负责“把这一笔 AD5560 寄存器事务执行完成”，`SPI Master` 只负责单次通用 SPI transaction。
-
-前台任务优先于后台遥测。Driver 忙时 Service 不再向其提交新事务；Driver 完成后 Service 再决定下一笔任务来源。
-
----
-
 ## 7. 多 BUS 选择与并行工作
 
 BUS 选择不在 `AD5560 Driver` 内实现。8 个 `Bus Service` 在顶层通过 `generate` 循环例化，每个实例具有固定 `BUS_ID`。
