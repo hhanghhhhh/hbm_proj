@@ -43,9 +43,6 @@ ad5560_controller
 ├── power_sequence_engine
 │     └─ 按全局时序产生运行阶段寄存器事务请求
 │
-├── bus_command_mux_arbiter
-│     └─ 对不同上层请求源进行选择 / 仲裁，并按 BUS_ID 路由到对应 Bus Worker
-│
 └── bus_worker[0..7]
       └─ 每个实例负责一组 16 颗 AD5560 的完整寄存器事务
            ├─ 管理本组 16 路独立 SYNC，一次事务只选择一颗器件
@@ -54,7 +51,7 @@ ad5560_controller
                  └─ 产生对应 SPI BUS 的底层时序
 ```
 
-`Config Manager` 和 `Power Sequence Engine` 分别负责配置阶段和运行时序阶段，均通过 `Bus Command MUX / Arbiter` 使用下层 `Bus Worker`。
+`Config Manager` 和 `Power Sequence Engine` 均输出统一格式的寄存器事务，并携带 `BUS_ID`。顶层在循环例化 `Bus Worker` 时，根据 `BUS_ID` 直接选择对应实例，不再增加独立的 `Bus Command MUX / Arbiter` 模块。
 
 ---
 
@@ -113,8 +110,11 @@ Bus Worker n
 
 - 不同 BUS 之间具备独立 `Bus Worker / SPI Master`，可以并行执行；
 - 同一 BUS 内仍保持一次只选择一颗 AD5560；
+- `Power Sequence Engine` 不要求等待当前事务 `done` 后才读取下一条，而是在目标 `Bus Worker` 完成 `valid / ready` 握手后即可继续读取下一条；
+- 如果下一条命令属于其他空闲 BUS，可立即握手，使多个 BUS 的事务自然重叠执行；
+- 如果下一条仍属于当前忙碌 BUS，则等待该 BUS 再次 `ready`。
 
-因此当前只确定：**配置阶段串行执行；运行阶段允许 8 条独立 BUS 并行工作。**
+因此当前确定：**配置阶段串行执行；运行阶段通过各 Bus Worker 独立握手，允许多条 BUS 同时处于工作状态。**
 
 ---
 
@@ -132,8 +132,6 @@ flowchart TB
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine\n产生运行事务]
 
-        ARB[Bus Command MUX / Arbiter\n请求选择 / 仲裁 / BUS 路由]
-
         subgraph BUS[Bus Worker × 8]
             BW[BUS0 ~ BUS7 Worker\n寄存器事务 + DEVICE 选择 + SYNC + BUSY]
             SPI[SPI Master × 8]
@@ -143,9 +141,8 @@ flowchart TB
         CRAM --> CM
         PSRAM --> PSE
 
-        CM --> ARB
-        PSE --> ARB
-        ARB --> BW
+        CM -->|BUS_ID + Register Transaction| BW
+        PSE -->|BUS_ID + Register Transaction| BW
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
@@ -161,4 +158,10 @@ flowchart TB
     DEV -->|BUSY 8 路| BW
 ```
 
-`Bus Command MUX / Arbiter` 位于上层事务产生模块与 `Bus Worker` 之间。`Bus Worker` 不区分事务来源，只负责执行统一格式的 AD5560 寄存器读写事务；具体仲裁优先级和接口时序后续再确定。
+顶层循环例化 8 个 `Bus Worker`，每个实例具有固定 `BUS_ID`，根据上层输出的 `bus_sel / BUS_ID` 直接生成本实例的选择信号，例如：
+
+```verilog
+assign bus_selected = (bus_sel == BUS_ID);
+```
+
+目标 BUS 的 `ready` 再按 `bus_sel` 选择回送给当前请求源。该方式与现有多相 Buck 工程中的多 BUS 选择方式一致，不需要额外增加独立 MUX 模块。
