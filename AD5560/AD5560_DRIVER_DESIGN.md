@@ -112,7 +112,7 @@ AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction。
 
 ## 5. 与 Bus Service 的接口
 
-`Bus Service` 与 `AD5560 Driver` 为一对一关系，第一版不在内部继续使用 `valid / ready` 握手，采用简单的 `start / done` 脉冲接口。
+`Bus Service` 与 `AD5560 Driver` 为一对一关系，采用简单的 `start / done` 脉冲接口。
 
 Service 到 Driver：
 
@@ -142,19 +142,3 @@ drv_error
 - 读事务在 `drv_done` 有效时，`drv_rd_data` 有效；
 - `drv_error` 在 `drv_done` 有效时表示本次事务是否异常。
 
-Driver 不需要额外提供 `ready / busy`。Service 通过自身状态机记录“已经发出 `drv_start` 且尚未收到 `drv_done`”，即可知道 Driver 当前是否忙。
-
----
-
-## 6. 多 BUS 选择与并行工作
-
-BUS 选择不在 `AD5560 Driver` 内实现。8 个 `Bus Service` 在顶层通过 `generate` 循环例化，每个实例具有固定 `BUS_ID`。
-
-对于 `Power Sequence Engine`，当前记录与目标 `Bus Service` 完成外层 `valid / ready` 握手后即可继续读取下一条记录，不等待本条事务对应的 Driver `drv_done`。
-
-因此：
-
-```text
-不同 BUS：事务可以重叠执行
-同一 BUS：通过本 BUS Service / Driver 自动串行
-```
