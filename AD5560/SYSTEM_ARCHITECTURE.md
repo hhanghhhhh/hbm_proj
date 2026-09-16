@@ -132,11 +132,11 @@ flowchart TB
         PSRAM[单块 Power Sequence RAM\n全局上下电时序]
         PSE[Power Sequence Engine\n产生运行事务]
 
-        subgraph BUS[Bus Service × 8]
+        subgraph BUS[Bus Service]
             BS[BUS0 ~ BUS7 Service\n前台事务 + 后台遥测调度]
-            TRAM[Telemetry RAM × 8]
-            DRV[AD5560 Driver × 8\n寄存器事务 + DEVICE 选择 + SYNC + BUSY]
-            SPI[SPI Master × 8]
+            TRAM[Telemetry RAM]
+            DRV[AD5560 Driver\n寄存器事务 + DEVICE 选择 + SYNC + BUSY]
+            SPI[SPI Master]
 
             BS --> DRV
             BS --> TRAM
