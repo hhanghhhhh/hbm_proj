@@ -54,15 +54,6 @@ FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存�
 
 每个 `Bus Worker` 负责本组 16 颗 AD5560 的 16 路独立 `SYNC`。每次 SPI transaction 根据 `DEVICE_ID` 只选择一颗器件。
 
-因此每个 `Bus Worker` 在物理上完整对应一组 AD5560 资源：
-
-```text
-Bus Worker n
-├─ SPI BUS n
-├─ SYNC[16*n +: 16]
-└─ BUSY[n]
-```
-
 ---
 
 ## 3. 上下电时序组织
