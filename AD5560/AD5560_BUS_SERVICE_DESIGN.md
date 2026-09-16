@@ -33,11 +33,11 @@ Bus Service
 
 当存在前台请求时，优先提交给 `AD5560 Driver`。
 
-只有当前没有待执行前台请求，并且 Driver 可以接受新事务时，才允许发起后台遥测。
+只有当前没有待执行前台请求，并且本 Service 当前没有未完成的 Driver 事务时，才允许发起后台遥测。
 
 后台遥测以**单次寄存器读**为最小调度单位。完成一个遥测寄存器读取后，重新检查前台请求；如果此时出现前台请求，应先执行前台事务，再继续遥测。
 
-已经被 Driver 接受的单次遥测读不在中途取消，前台请求等待当前这笔寄存器事务完成即可。
+已经通过 `drv_start` 启动的单次遥测读不在中途取消，前台请求等待当前这笔寄存器事务完成即可。
 
 ---
 
@@ -70,6 +70,8 @@ cmd_valid && cmd_ready
 
 同时为 1 时，表示本条前台命令已经被本 BUS 接收。之后上层不需要继续保持该命令。
 
+由于 Driver 内部不再锁存命令参数，`Bus Service` 在接收前台命令后负责保存本条事务参数，并在 Driver 执行期间保持 Driver 输入不变。
+
 `rsp_valid` 表示该寄存器事务已经由下层 `AD5560 Driver` 真正执行完成。
 
 ---
@@ -97,7 +99,7 @@ telemetry_mask[15:0]
 上电运行后：telemetry_enable = 1
 ```
 
-`telemetry_enable` 或 `telemetry_mask` 改变时，不强制中断已经提交给 Driver 的当前遥测事务，新配置从下一次调度开始生效。
+`telemetry_enable` 或 `telemetry_mask` 改变时，不强制中断已经启动的当前遥测事务，新配置从下一次调度开始生效。
 
 ---
 
@@ -157,14 +159,24 @@ ITEM 2：Alarm / Fault Status
 
 具体 RAM 位宽和数据格式后续根据实际遥测寄存器确定。
 
+Telemetry RAM 建议使用双口 RAM：
+
+- A 口由 `Bus Service` 写入最新遥测值；
+- B 口供上位机通信侧读取。
+
+因此后台刷新和上位机读取可以同时进行，不需要额外读写仲裁。同地址同时读写时允许读到更新前或更新后的值，第一版不做严格原子快照。
+
+---
+
 ## 7. 与 AD5560 Driver 的接口
 
-`Bus Service` 向下只提交一笔普通 AD5560 寄存器事务：
+`Bus Service` 与 `AD5560 Driver` 为一对一关系，内部不再使用第二套 `valid / ready` 握手，采用简单的 `start / done` 脉冲接口。
+
+Service 到 Driver：
 
 ```text
-drv_cmd_valid
-drv_cmd_ready
-drv_cmd_rw
+drv_start              // 单 clk 脉冲
+drv_rw
 drv_device_id[3:0]
 drv_reg_addr[6:0]
 drv_wr_data[15:0]
@@ -173,14 +185,32 @@ drv_wr_data[15:0]
 Driver 返回：
 
 ```text
-drv_rsp_valid
-drv_rsp_rd_data[15:0]
-drv_rsp_error
+drv_done               // 单 clk 脉冲
+drv_rd_data[15:0]
+drv_error
 ```
 
-`Bus Service` 不区分 Driver 内部的一帧写事务或两帧 readback，只等待 Driver 返回最终结果。
+使用规则：
 
-前台请求和后台遥测共用同一个 Driver，不允许同时向 Driver 提交两笔事务。
+```text
+Service 准备好 Driver 参数
+    ↓
+drv_start 拉高 1 clk
+    ↓
+Service 保持 drv_rw / device_id / reg_addr / wr_data 不变
+    ↓
+等待 drv_done
+    ↓
+处理读回数据或错误
+    ↓
+再决定下一笔前台 / Telemetry 事务
+```
+
+`Bus Service` 自己记录当前是否存在未完成 Driver 事务，因此 Driver 不需要再提供 `ready / busy`。
+
+前台事务参数由 Service 在外层 `cmd_valid && cmd_ready` 时接收并保存；后台遥测参数则由 Service 自己产生。无论来源是哪一种，一旦发出 `drv_start`，在 `drv_done` 之前都保持 Driver 输入接口不变。
+
+`Bus Service` 不区分 Driver 内部的一帧写事务或两帧 readback，只等待最终 `drv_done`。
 
 ---
 
