@@ -10,8 +10,8 @@
 - 保存配置记录；
 - 配置启动后按顺序读取记录；
 - 将每条记录转换成一笔 AD5560 寄存器写事务；
-- 等待该事务真正执行完成后继续下一条；
-- 出错时记录当前配置索引并结束本次配置。
+- 当前记录完成 `valid / ready` 握手后立即继续下一条；
+- 检测任意 `bus_fault`，出现故障后停止剩余配置。
 
 `Config Manager` 不负责运行期遥测、上下电时序或其他动态寄存器控制。
 
@@ -68,23 +68,23 @@ cfg_record_count
 cfg_busy
 cfg_done
 cfg_error
-cfg_error_index
 ```
 
 其中：
 
 - `cfg_start` 为单 clk 启动脉冲；
 - `cfg_record_count` 表示本次需要执行的有效记录数量；
-- `cfg_busy` 表示正在执行配置；
-- `cfg_done` 表示本次配置正常结束；
-- `cfg_error` 表示本次配置因事务错误结束；
-- `cfg_error_index` 保存出错记录索引。
+- `cfg_busy` 表示正在派发配置记录；
+- `cfg_done` 表示全部配置记录已经完成握手并提交给下游；
+- `cfg_error` 表示配置过程中检测到 `bus_fault`，剩余记录停止派发。
+
+配置写事务本身没有可确认的 SPI ACK，因此 Config Manager 不等待逐条写事务完成，也不维护逐条配置结果。
 
 ---
 
 ## 4. 配置执行流程
 
-第一版采用完全串行执行，不利用 8 条 BUS 做并行配置。
+Config Manager 按 Config RAM 顺序产生单路命令流，但不等待每笔寄存器写真正执行完成。
 
 基本流程：
 
@@ -99,28 +99,55 @@ index = 0
   ↓
 解析 BUS_ID / DEVICE_ID / REG_ADDR / REG_DATA
   ↓
-向 Command Arbiter 提交一笔寄存器写事务
+向 Command Arbiter 提交寄存器写事务
   ↓
-等待目标 Bus Service 真正执行完成
+等待 cfg_cmd_valid && cfg_cmd_ready
   ↓
-成功：index + 1
-失败：记录 error_index 并结束
+握手完成：index + 1，立即处理下一条
   ↓
-全部记录完成后 cfg_done
+全部记录完成握手后 cfg_done
 ```
 
-配置时间不是系统瓶颈，因此同一时刻只允许一笔配置事务在途。
+目标 `Bus Service` 忙时，其 `ready` 为低，Config Manager 保持当前记录不变并等待；目标 Service 可以接收后完成握手，Config Manager 随即继续下一条。
 
-这样可以保证：
+因此配置记录仍按 RAM 顺序派发，但不同 BUS 的实际 SPI 事务可以重叠执行：
 
-- 配置记录和执行结果一一对应；
-- 错误索引明确；
-- 不需要维护多 BUS pending 状态；
-- 第一版状态机保持简单。
+```text
+BUS0 record → handshake
+BUS3 record → handshake
+BUS7 record → handshake
+BUS0 record → 若 BUS0 仍忙，则停在该记录等待
+```
+
+第一版不做乱序调度或跳过当前记录。
 
 ---
 
-## 5. 与 Command Arbiter 的接口
+## 5. bus_fault 处理
+
+8 个 `Bus Service` 的 `bus_fault` 作为系统故障状态提供给 Config Manager。
+
+配置期间只要检测到任意：
+
+```text
+bus_fault != 0
+```
+
+则：
+
+```text
+停止继续读取 / 派发剩余 Config RAM 记录
+cfg_busy  = 0
+cfg_error = 1
+```
+
+已经完成握手并交给其他 Bus Service 的事务不取消，由对应 Service / Driver 自行结束。
+
+`bus_fault` 的产生和故障信息保存由 `Bus Service` 负责；Config Manager 只根据该状态停止剩余配置，不负责判断 SPI 数据是否真正写入器件。
+
+---
+
+## 6. 与 Command Arbiter 的接口
 
 `Config Manager` 作为一个前台命令源，通过 `Command Arbiter` 访问目标 `Bus Service`。
 
@@ -137,26 +164,17 @@ cfg_wr_data[15:0]
 
 由于 Config Table 第一版只有写操作，`Config Manager` 不需要内部保存 `RW` 字段；送入统一命令接口时固定为寄存器写。
 
-返回：
-
-```text
-cfg_rsp_valid
-cfg_rsp_error
-```
-
 执行原则：
 
 ```text
 cfg_cmd_valid && cfg_cmd_ready
 ```
 
-表示当前配置记录已被下游接收。
-
-`Config Manager` 随后等待 `cfg_rsp_valid`，确认该寄存器写事务已经真正完成后，才继续读取下一条配置记录。
+表示当前配置记录已经被目标 Bus Service 接收。握手完成后 Config Manager 不等待 Driver `done`，直接处理下一条配置记录。
 
 ---
 
-## 6. 与其他模块的边界
+## 7. 与其他模块的边界
 
 ```text
 Config Manager
@@ -172,6 +190,6 @@ Bus Service × 8
 AD5560 Driver
 ```
 
-`Config Manager` 只负责初始化配置表执行。
+`Config Manager` 只负责初始化配置表的顺序派发。
 
 `Power Sequence Engine` 和后续可能增加的运行期控制模块作为独立前台命令源，也通过同一个 `Command Arbiter` 访问 `Bus Service`。
