@@ -233,7 +233,6 @@ flowchart TB
         SYS -->|alarm_start / alarm_vector| AH
 
         SYS -->|BUS_ID + Register Transaction| DRV
-        SYS -->|bus_fault_clear x8| DRV
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
