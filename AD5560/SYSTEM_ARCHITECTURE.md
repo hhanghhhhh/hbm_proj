@@ -248,5 +248,4 @@ flowchart TB
     SPI --> DEV
     DRV -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| DRV
-    DEV -->|ALARM 8 路| SYS
 ```
