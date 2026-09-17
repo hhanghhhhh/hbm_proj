@@ -232,11 +232,6 @@ flowchart TB
         SYS -->|seq_start / pause / abort| PSE
         SYS -->|alarm_start / alarm_vector| AH
 
-        CM -->|Config command| SYS
-        PSE -->|Sequence command| SYS
-        AH -->|Alarm read command| SYS
-        RC -.->|Runtime command| SYS
-
         SYS -->|BUS_ID + Register Transaction| DRV
         DRV -->|read response / bus_fault x8| SYS
         SYS -->|bus_fault_clear x8| DRV
