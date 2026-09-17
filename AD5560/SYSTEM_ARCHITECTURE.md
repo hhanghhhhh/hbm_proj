@@ -133,7 +133,7 @@ BUS_ID + Register Transaction
 
 AD5560 不再做后台寄存器轮询，也不设置 Telemetry RAM。
 
-电压、电流实时值由系统外部 ADC 采样，不通过 AD5560 寄存器周期读取。
+电压、电流实时值由系统外部 ADC 采样，不通过 AD5560 寄存器周期读取。外部 ADC 的具体采样链路不在本文档中展开。
 
 每条 BUS 提供 1 路 `ALARM` 信号，共 8 路。ALARM 由上层 `Alarm Handler` 处理：
 
@@ -207,7 +207,6 @@ flowchart TB
         ARB -->|bus_fault / bus_fault_vector| PSE
     end
 
-    ADC[外部 ADC\n电压 / 电流实时采样]
     DEV[128 × AD5560\n8 BUS × 16 Device]
 
     PC --> COMM
@@ -220,5 +219,4 @@ flowchart TB
     DRV -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| DRV
     DEV -->|ALARM 8 路| AH
-    ADC --> COMM
 ```
