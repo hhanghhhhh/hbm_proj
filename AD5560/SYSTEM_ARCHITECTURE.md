@@ -203,8 +203,6 @@ flowchart TB
         RC -.->|Runtime Transaction| ARB
         ARB -->|BUS_ID + Register Transaction| DRV
         DRV -->|read response / bus_fault x8| ARB
-        ARB -->|bus_fault| CM
-        ARB -->|bus_fault / bus_fault_vector| PSE
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
