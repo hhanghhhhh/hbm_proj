@@ -206,27 +206,24 @@ flowchart TB
     PC[上位机]
     COMM[通信 / 命令分发]
 
-    subgraph CTRL[ad5560_controller]
-        SYS[System Controller\n系统状态 / sel_id / BUS选择 / fault锁存]
-        CM[Config Manager\n配置]
-        PSE[Power Sequence Engine\n全局上下电时序]
-        AH[Alarm Handler\n事件触发读取状态]
-
-        subgraph DRIVERS[AD5560 Driver x8]
-            DRV[BUS0 ~ BUS7 Driver\nvalid/ready + SYNC + BUSY + bus_fault]
-            SPI[SPI Master x8\n通用 SPI]
-            DRV --> SPI
-        end
-
-        SYS --> CM
-        SYS --> PSE
-        SYS --> AH
-
-        CM --> DRV
-        PSE --> DRV
-        AH --> DRV
-
-    end
+      SYS[System Controller\n系统状态 / sel_id / BUS选择 / fault锁存]
+      CM[Config Manager\n配置]
+      PSE[Power Sequence Engine\n全局上下电时序]
+      AH[Alarm Handler\n事件触发读取状态]
+      
+      subgraph DRIVERS[AD5560 Driver x8]
+      DRV[BUS0 ~ BUS7 Driver\nvalid/ready + SYNC + BUSY + bus_fault]
+      SPI[SPI Master x8\n通用 SPI]
+      DRV --> SPI
+      end
+      
+      SYS --> CM
+      SYS --> PSE
+      SYS --> AH
+      
+      CM --> DRV
+      PSE --> DRV
+      AH --> DRV
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
 
