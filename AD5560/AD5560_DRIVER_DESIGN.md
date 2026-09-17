@@ -4,7 +4,7 @@
 
 `AD5560 Driver` 对应一条 AD5560 SPI BUS，负责本组 16 颗 AD5560 的寄存器事务执行。
 
-系统共实例化 8 个 Driver，由 `System Controller` 根据 `BUS_ID` 直接选择目标 Driver，不再设置 `Bus Service` 中间层。
+系统共实例化 8 个 Driver。
 
 SPI 底层移位、时钟以及单路片选时序由通用 `SPI Master` 实现。`SPI Master` 只输出一根通用 `CS_n`，不知道 AD5560，也不知道本 BUS 上有 16 颗器件。
 
@@ -77,8 +77,6 @@ bus_fault_clear
 - `BUSY timeout` 时置位 sticky `bus_fault` 并停止接收新的事务；
 - `bus_fault_clear` 为单 clk 清除脉冲，由 `System Controller` 在完成系统 fault 锁存后发出。
 
-因此 `Config Manager`、`Power Sequence Engine` 等纯写命令源只关心命令握手，不需要等待实际 SPI 事务完成。
-
 ---
 
 ## 4. 器件选择与 SYNC 映射
@@ -100,16 +98,7 @@ SYNC[device_id] = spi_cs_n
 
 Driver 组织 AD5560 的 24 bit SPI 写帧并调用 SPI Master。
 
-写事务结束后不能立即用当前 `BUSY=1` 判断完成，应先经过固定保护时间，再判断 BUSY：
-
-```text
-SPI transaction 完成 / SYNC↑
-    ↓
-等待 ≥ 100 ns
-    ↓
-BUSY = 0 → 等待 BUSY 回到 1
-BUSY = 1 → 写事务完成
-```
+写事务结束后不能立即用当前 `BUSY=1` 判断完成，应先经过固定保护时间，再判断 BUSY。
 
 不要求必须观察到一次 `BUSY=0`。如果 BUSY 低脉冲较短，在保护时间结束前已经恢复为高，可直接认为内部处理完成。
 
@@ -136,23 +125,11 @@ bus_fault_clear = 1 pulse
 
 Driver 收到清除脉冲后清除本地 sticky fault 并回到空闲状态。
 
-是否允许系统继续执行由 `System Controller` 的 `FAULT` 状态决定，Driver 清除本地 fault 不代表系统自动恢复。
-
 ---
 
 ## 6. AD5560 寄存器读
 
 上层只发起一次寄存器读请求，Driver 内部完成两次 SPI transaction：
-
-```text
-第 1 帧：Read Request
-    ↓
-SYNC high 等待 ≥ 500 ns
-    ↓
-第 2 帧：NOP，同时采集 SDO
-    ↓
-rsp_valid + rsp_rd_data
-```
 
 依据 AD5560 Rev.F SPI Read Timing：
 
@@ -181,11 +158,7 @@ rsp_valid + rsp_rd_data
 
 ## 8. 多 BUS 工作方式
 
-系统实例化 8 个独立 `AD5560 Driver`。
-
-`System Controller` 根据 `BUS_ID` 把当前命令送到目标 Driver，并把该 Driver 的 `ready` 返回给当前命令源。
-
-因此：
+系统实例化 8 个独立 `AD5560 Driver`。根据业务模块的 `BUS_ID` 自动选择。
 
 ```text
 不同 BUS：可以同时执行 SPI 事务
