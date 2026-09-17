@@ -31,7 +31,7 @@
 BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
 ```
 
-FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和可靠执行配置表。
+FPGA 不负责把电压、限流、Ramp 等工程参数转换成 AD5560 寄存器值，只负责保存和执行配置表。
 
 ### 2.1 Config RAM 组织
 
@@ -47,9 +47,11 @@ Config Manager
 
 所有 BUS、所有器件的配置记录按上位机生成的顺序连续存储。
 
-`Config Manager` 启动后顺序读取记录，并逐条产生寄存器写事务。第一版完全串行执行：当前配置事务真正完成后，才继续读取下一条记录。
+`Config Manager` 启动后顺序读取记录。当前记录与下游完成 `valid / ready` 握手后，即可继续处理下一条记录，不等待本次 SPI 事务真正执行完成。
 
-配置时间不是系统瓶颈，因此优先保证 RAM 管理、错误定位和状态机简单。
+不同 BUS 已经接受的配置事务可以并行执行；如果后续记录目标 BUS 尚未 ready，则 Config Manager 在该记录处等待。
+
+`Config Manager` 只监测 `Command Arbiter` 输出的总 `bus_fault`。任意 BUS 出现故障后，停止继续派发剩余配置记录。
 
 ---
 
@@ -63,15 +65,31 @@ Power Sequence Engine ├─> Command Arbiter ─> Bus Service × 8
 Runtime Control       ┘     （后续可增加）
 ```
 
-`Command Arbiter` 负责：
+`Command Arbiter` 是上层控制模块与 8 个 `Bus Service` 之间的统一前台控制边界，负责：
 
 - 选择当前前台命令来源；
-- 转发统一寄存器事务及 `BUS_ID`；
-- 将目标 `Bus Service` 的 `ready / response` 返回给当前命令源。
+- 根据 `BUS_ID` 将寄存器事务送到目标 `Bus Service`；
+- 将目标 `Bus Service` 的 `ready` 返回给当前命令源；
+- 汇总 8 个 `Bus Service` 的故障状态。
 
-第一版不需要复杂公平仲裁。系统正常工作时各类前台任务由工作模式约束，通常不会同时抢占；Arbiter 只需要保证一笔已接受事务的命令源和返回响应保持对应关系。
+8 路 Service fault 汇总后，Arbiter 同时输出：
 
-后台 Telemetry 不经过 `Command Arbiter`，它属于各 `Bus Service` 内部的本地后台任务。
+```text
+bus_fault             // 任意 BUS 故障
+bus_fault_vector[7:0] // 各 BUS 独立故障状态
+```
+
+其中：
+
+```verilog
+assign bus_fault = |bus_fault_vector;
+```
+
+`Command Arbiter` 只负责 fault 汇总，不负责故障锁存；故障状态由对应 `Bus Service` 自己维护。
+
+第一版不需要复杂公平仲裁、命令队列或乱序调度。
+
+后台 Telemetry 不参与前台命令仲裁，仍由各 `Bus Service` 内部自行调度。
 
 ---
 
@@ -79,12 +97,15 @@ Runtime Control       ┘     （后续可增加）
 
 每条 SPI BUS 设置一个 `Bus Service`，负责该 BUS 的本地任务调度。
 
+对上层控制模块而言，`Bus Service` 只通过 `Command Arbiter` 连接，不再由 `Config Manager`、`Power Sequence Engine` 等模块分别直接连接。
+
 主要职责：
 
 - 接收 `Command Arbiter` 转发的前台寄存器事务；
 - 在总线空闲时执行本 BUS 的后台遥测轮询；
 - 调用本 BUS 的 `AD5560 Driver` 完成实际寄存器读写；
-- 保存本 BUS 的最新遥测结果。
+- 保存本 BUS 的最新遥测结果；
+- 维护本 BUS 的故障状态并输出给 `Command Arbiter`。
 
 本 BUS 内的优先级固定为：
 
@@ -107,6 +128,8 @@ Runtime Control       ┘     （后续可增加）
 - 封装 AD5560 readback 两帧流程；
 - 调用通用 `SPI Master`；
 - 对写事务检测本组共享 `BUSY` 并处理 timeout。
+
+Driver 检测到 `BUSY timeout` 后通知本 `Bus Service`，由 Service 锁存本 BUS 的 fault 状态。
 
 ---
 
@@ -135,25 +158,22 @@ BUS_ID + Register Transaction
 
 不同 BUS 的启动时间可能相差少量 FPGA clk，但不要求严格同一时钟周期启动。
 
+系统级故障策略可直接使用 `Command Arbiter` 提供的 `bus_fault`；需要定位具体 BUS 时使用 `bus_fault_vector[7:0]`。
+
 ---
 
 ## 7. 多 BUS 选择
 
-`Command Arbiter` 输出单路前台事务和 `bus_sel / BUS_ID`。
+`Command Arbiter` 输出单路前台事务和 `BUS_ID`。
 
-8 个 `Bus Service` 在顶层通过 `generate` 循环例化，每个实例具有固定 `BUS_ID`，目标 BUS 由简单比较选择：
+8 个 `Bus Service` 通过固定 `BUS_ID` 选择目标 Service：
 
 ```verilog
-localparam [2:0] BUS_ID = bus_index;
-wire bus_selected;
-
-assign bus_selected = (bus_sel == BUS_ID);
-assign service_cmd_valid[bus_index] = cmd_valid && bus_selected;
-
-assign selected_ready = service_ready[bus_sel];
+assign service_cmd_valid[n] = cmd_valid && (cmd_bus_id == n);
+assign cmd_ready = service_cmd_ready[cmd_bus_id];
 ```
 
-因此 `Command Arbiter` 解决的是**前台命令来源选择**，而目标 BUS 仍通过简单 `BUS_ID` 选择，不需要再增加复杂的多 BUS 调度器。
+因此同一条前台命令只送到一个目标 `Bus Service`，而不同 BUS 已经接受的事务可以在各自 Service / Driver 中并行执行。
 
 ---
 
@@ -167,7 +187,7 @@ flowchart TB
     subgraph CTRL[ad5560_controller]
         subgraph CFG[Config Manager]
             CRAM[Config RAM\n全部 BUS 配置记录]
-            CM[Config FSM\n顺序执行配置]
+            CM[Config FSM\n握手后继续下一条]
             CRAM --> CM
         end
 
@@ -175,10 +195,10 @@ flowchart TB
         PSE[Power Sequence Engine\n产生运行事务]
         RC[Runtime Control\n后续按需增加]
 
-        ARB[Command Arbiter\n前台命令源选择 / 响应回送]
+        ARB[Command Arbiter\n命令源选择 / BUS选择 / fault汇总]
 
         subgraph BUS[Bus Service x8]
-            BS[BUS0 ~ BUS7 Service\n前台事务 + 后台遥测调度]
+            BS[BUS0 ~ BUS7 Service\n前台事务 + 后台遥测 + bus_fault]
             TRAM[Telemetry RAM\n最新遥测数据]
             DRV[AD5560 Driver\n寄存器事务 + DEVICE/SYNC + BUSY]
             SPI[SPI Master\n通用 SPI]
@@ -194,6 +214,9 @@ flowchart TB
         PSE -->|Sequence Transaction| ARB
         RC -.->|Runtime Transaction| ARB
         ARB -->|BUS_ID + Register Transaction| BS
+        BS -->|bus_fault[7:0]| ARB
+        ARB -->|bus_fault| CM
+        ARB -->|bus_fault / bus_fault_vector| PSE
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
