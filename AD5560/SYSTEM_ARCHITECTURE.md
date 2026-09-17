@@ -228,8 +228,6 @@ flowchart TB
             DRV --> SPI
         end
 
-        PSRAM --> PSE
-
         SYS -->|cfg_start / cfg_abort| CM
         SYS -->|seq_start / pause / abort| PSE
         SYS -->|alarm_start / alarm_vector| AH
