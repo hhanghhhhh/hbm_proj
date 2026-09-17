@@ -2,37 +2,39 @@
 
 ## 1. 模块定位
 
-`Command Arbiter` 是上层控制模块与 8 个 `Bus Service` 之间的统一边界。
+`Command Arbiter` 是上层控制模块与 8 个 `AD5560 Driver` 之间的统一控制边界。
 
-上层模块不直接连接各 `Bus Service`。前台寄存器事务、BUS 选择以及 BUS 故障状态统一经过 `Command Arbiter`。
+上层模块不直接连接各 Driver。前台寄存器事务、BUS 选择、读回数据以及 BUS 故障状态统一经过 `Command Arbiter`。
 
 ```text
 Config Manager ───────┐
-Power Sequence Engine ├──> Command Arbiter ───> Bus Service × 8
-Runtime Control       ┘        （后续按需增加）
+Power Sequence Engine ├──> Command Arbiter ───> AD5560 Driver × 8
+Alarm Handler ────────┤
+Runtime Control ──────┘
 ```
 
-后台 Telemetry 仍由各 `Bus Service` 内部自行调度，不参与前台命令仲裁。
+其中 `Alarm Handler`、`Runtime Control` 按实际需求增加。
 
 ---
 
 ## 2. 主要职责
 
-`Command Arbiter` 第一版只负责以下功能：
+第一版只负责：
 
-- 在多个前台命令源之间选择当前命令；
-- 根据 `BUS_ID` 将命令送到目标 `Bus Service`；
-- 将目标 Service 的 `ready` 返回给当前命令源；
-- 汇总 8 个 `Bus Service` 的故障状态；
+- 在上层命令源之间选择当前命令；
+- 根据 `BUS_ID` 将命令送到目标 Driver；
+- 将目标 Driver 的 `ready` 返回给当前命令源；
+- 对需要读回的命令返回 `rsp_valid / rsp_rd_data`；
+- 汇总 8 个 Driver 的 `bus_fault`；
 - 对上层同时提供总故障位和 8 bit BUS 故障向量。
 
-第一版不实现复杂公平仲裁、命令队列或乱序调度。
+不实现复杂公平仲裁、命令队列或乱序调度。
 
 ---
 
-## 3. 前台命令接口
+## 3. 上层命令接口
 
-各命令源使用统一的寄存器事务接口：
+各命令源使用统一寄存器事务接口：
 
 ```text
 cmd_valid
@@ -50,95 +52,99 @@ cmd_wr_data[15:0]
 cmd_valid && cmd_ready
 ```
 
-同时为 1 时，表示当前命令已经被目标 `Bus Service` 接收。命令源随后即可继续处理下一条命令，不需要等待本次 SPI 事务真正执行完成。
+同时为 1 时，表示当前命令已经被目标 Driver 接收。
 
-`Config Manager` 第一版只产生写命令，因此其 `cmd_rw` 固定为写。
+命令源随后即可继续处理下一条命令，不需要等待本次 SPI 事务真正完成。
+
+因此 `Config Manager`、`Power Sequence Engine` 等纯写模块均按“握手即前进”工作。
 
 ---
 
 ## 4. BUS 选择
 
-`Command Arbiter` 根据当前命令的 `BUS_ID` 选择目标 `Bus Service`。
-
-逻辑保持简单：
+Arbiter 根据 `cmd_bus_id` 选择目标 Driver：
 
 ```text
-service_cmd_valid[n] = cmd_valid && (cmd_bus_id == n)
-cmd_ready            = service_cmd_ready[cmd_bus_id]
+driver_cmd_valid[n] = cmd_valid && (cmd_bus_id == n)
+cmd_ready           = driver_cmd_ready[cmd_bus_id]
 ```
 
-同一时刻只向一条 `Bus Service` 转发当前前台命令。
+同一条命令只送到一个 Driver。
 
-不同 BUS 已经接受的事务可以在各自 Service / Driver 中并行执行。
+不同 BUS 已经完成握手的事务可以在 8 个 Driver 中并行执行；如果当前目标 Driver 忙，则其 `ready=0`，当前命令源保持本条命令等待。
 
 ---
 
 ## 5. BUS fault 汇总
 
-每个 `Bus Service` 独立维护本 BUS 的故障状态，例如 Driver 检测到 `BUSY timeout` 后置位本 BUS 的 `bus_fault`。
+每个 Driver 独立维护本 BUS 的故障状态。第一版主要故障来源为写事务 `BUSY timeout`。
 
-8 路 Service fault 汇总到 `Command Arbiter`：
+8 路 Driver fault 输入 Arbiter：
 
 ```text
-service_bus_fault[7:0]
+driver_bus_fault[7:0]
 ```
 
-Arbiter 对上层同时输出：
+Arbiter 输出：
 
 ```text
-bus_fault            // 任意 BUS 故障
+bus_fault             // 任意 BUS 故障
 bus_fault_vector[7:0] // 各 BUS 独立故障状态
 ```
 
 逻辑关系：
 
 ```verilog
-assign bus_fault_vector = service_bus_fault;
-assign bus_fault = |service_bus_fault;
+assign bus_fault_vector = driver_bus_fault;
+assign bus_fault = |driver_bus_fault;
 ```
 
-`Command Arbiter` 只负责汇总，不负责锁存故障。故障锁存由对应 `Bus Service` 完成。
+Arbiter 只负责汇总，不重复锁存故障；故障状态由对应 Driver 保存。
 
-这样不同上层模块可以按需求选择使用：
+不同上层模块可按需要使用：
 
 ```text
-Config Manager       -> 只使用 bus_fault，任意 BUS 故障即停止剩余配置
-Power Sequence Engine-> 可使用 bus_fault，任意 BUS 故障时停止当前时序
-状态 / 故障管理模块 -> 使用 bus_fault_vector 判断具体故障 BUS
+Config Manager        -> bus_fault，任意 BUS 故障时停止剩余配置
+Power Sequence Engine -> bus_fault，系统级故障策略使用
+故障管理 / 上位机状态 -> bus_fault_vector[7:0] 定位具体 BUS
 ```
 
 ---
 
-## 6. 与 Bus Service 的边界
+## 6. 读事务返回
 
-每个 `Bus Service` 对外的前台控制和故障状态统一连接到 `Command Arbiter`。
+`Config Manager` 和正常 Power Sequence 主要产生写事务，不依赖逐条完成响应。
+
+后续 `Alarm Handler` 或其他运行期控制模块需要读寄存器时，Driver 返回：
+
+```text
+rsp_valid
+rsp_rd_data[15:0]
+```
+
+`Command Arbiter` 将目标 Driver 的读回结果返回给发起该读命令的上层模块。
+
+第一版可限制需要读回的数据访问按顺序执行，不引入多个未完成读事务的复杂匹配机制。
+
+---
+
+## 7. 与 Driver 的边界
 
 ```text
 Command Arbiter
       │
-      ├─ command / ready
-      ├─ BUS_ID 选择
-      └─ bus_fault 汇总
+      ├─ valid / ready
+      ├─ RW / DEVICE_ID / REG_ADDR / WR_DATA
+      └─ BUS_ID 选择
       │
       ▼
-Bus Service × 8
+AD5560 Driver × 8
+      │
+      ├─ rsp_valid / rsp_rd_data
+      └─ bus_fault
       │
       ▼
-AD5560 Driver
+SPI Master × 8
 ```
 
-`Bus Service` 内部仍负责：
-
-- 前台命令优先于后台 Telemetry；
-- 一条 BUS 内的事务串行执行；
-- Driver 调用；
-- Telemetry 轮询和 Telemetry RAM 更新；
-- 本 BUS 故障状态维护。
-
----
-
-## 7. 读事务返回
-
-第一版 `Config Manager` 和 `Power Sequence Engine` 均不依赖逐条事务返回结果。
-
-后续如果增加需要主动读寄存器的 `Runtime Control`，可由 `Command Arbiter` 将目标 `Bus Service` 的读回数据返回给当前命令源。该功能不改变现有前台命令和 fault 汇总结构。
+Driver 在 `valid && ready` 时锁存命令参数，因此握手后 Arbiter 可以立即切换到下一条命令。
