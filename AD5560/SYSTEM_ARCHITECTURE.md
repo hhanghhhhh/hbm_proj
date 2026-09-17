@@ -212,11 +212,13 @@ flowchart TB
         subgraph CFG[Config Manager]
             CRAM[Config RAM\n全部 BUS 配置记录]
             CM[Config FSM\n握手后继续下一条]
-            CRAM --> CM
         end
 
-        PSRAM[Power Sequence RAM\n全局上下电时序]
-        PSE[Power Sequence Engine]
+        subgraph PSEQ[Power Seq]
+            PSRAM[Power Sequence RAM\n全局上下电时序]
+            PSE[Power Sequence Engine]
+        end
+
         AH[Alarm Handler\n事件触发读取状态]
         RC[Runtime Control\n后续按需增加]
 
@@ -233,16 +235,15 @@ flowchart TB
         SYS -->|alarm_start / alarm_vector| AH
 
         SYS -->|BUS_ID + Register Transaction| DRV
-        DRV -->|read response / bus_fault x8| SYS
         SYS -->|bus_fault_clear x8| DRV
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
 
     PC --> COMM
-    COMM --> CRAM
+    COMM --> CM
     COMM --> SYS
-    COMM --> PSRAM
+    COMM --> PSE
 
     SPI --> DEV
     DRV -->|SYNC 128 路| DEV
