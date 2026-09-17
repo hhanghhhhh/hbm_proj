@@ -218,13 +218,13 @@ flowchart TB
             DRV --> SPI
         end
 
-        SYS -->|cfg_start / cfg_abort| CM
-        SYS -->|seq_start / pause / abort| PSE
-        SYS -->|alarm_start / alarm_vector| AH
+        SYS --> CM
+        SYS --> PSE
+        SYS --> AH
 
-        CM -->|BUS_ID + Register Transaction| DRV
-        PSE -->|BUS_ID + Register Transaction| DRV
-        AH -->|BUS_ID + Register Transaction| DRV
+        CM --> DRV
+        PSE --> DRV
+        AH --> DRV
 
     end
 
