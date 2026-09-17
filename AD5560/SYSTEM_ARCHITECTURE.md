@@ -232,7 +232,10 @@ flowchart TB
         SYS -->|seq_start / pause / abort| PSE
         SYS -->|alarm_start / alarm_vector| AH
 
-        SYS -->|BUS_ID + Register Transaction| DRV
+        CM -->|BUS_ID + Register Transaction| DRV
+        PSEQ -->|BUS_ID + Register Transaction| DRV
+        AH -->|BUS_ID + Register Transaction| DRV
+
     end
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
