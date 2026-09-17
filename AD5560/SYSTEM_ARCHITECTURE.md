@@ -62,7 +62,7 @@ Config Manager
 ```text
 Config Manager ───────┐
 Power Sequence Engine ├─> Command Arbiter ─> Bus Service × 8
-Runtime Control       ┘     （后续可增加）
+Runtime Control       ┘     
 ```
 
 `Command Arbiter` 是上层控制模块与 8 个 `Bus Service` 之间的统一前台控制边界，负责：
@@ -73,23 +73,6 @@ Runtime Control       ┘     （后续可增加）
 - 汇总 8 个 `Bus Service` 的故障状态。
 
 8 路 Service fault 汇总后，Arbiter 同时输出：
-
-```text
-bus_fault             // 任意 BUS 故障
-bus_fault_vector[7:0] // 各 BUS 独立故障状态
-```
-
-其中：
-
-```verilog
-assign bus_fault = |bus_fault_vector;
-```
-
-`Command Arbiter` 只负责 fault 汇总，不负责故障锁存；故障状态由对应 `Bus Service` 自己维护。
-
-第一版不需要复杂公平仲裁、命令队列或乱序调度。
-
-后台 Telemetry 不参与前台命令仲裁，仍由各 `Bus Service` 内部自行调度。
 
 ---
 
@@ -214,7 +197,7 @@ flowchart TB
         PSE -->|Sequence Transaction| ARB
         RC -.->|Runtime Transaction| ARB
         ARB -->|BUS_ID + Register Transaction| BS
-        BS -->|bus_fault[7:0]| ARB
+        BS -->|bus_fault x8| ARB
         ARB -->|bus_fault| CM
         ARB -->|bus_fault / bus_fault_vector| PSE
     end
