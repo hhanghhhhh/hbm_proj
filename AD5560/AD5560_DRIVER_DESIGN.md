@@ -4,7 +4,7 @@
 
 `AD5560 Driver` 对应一条 AD5560 SPI BUS，负责本组 16 颗 AD5560 的寄存器事务执行。
 
-系统共实例化 8 个 Driver，由 `Command Arbiter` 根据 `BUS_ID` 直接选择目标 Driver，不再设置 `Bus Service` 中间层。
+系统共实例化 8 个 Driver，由 `System Controller` 根据 `BUS_ID` 直接选择目标 Driver，不再设置 `Bus Service` 中间层。
 
 SPI 底层移位、时钟以及单路片选时序由通用 `SPI Master` 实现。`SPI Master` 只输出一根通用 `CS_n`，不知道 AD5560，也不知道本 BUS 上有 16 颗器件。
 
@@ -39,7 +39,7 @@ AD5560 Driver n
 
 ---
 
-## 3. Command Arbiter 接口
+## 3. System Controller 接口
 
 Driver 直接使用 `valid / ready` 接收寄存器事务：
 
@@ -59,10 +59,11 @@ rsp_valid
 rsp_rd_data[15:0]
 ```
 
-故障状态：
+故障接口：
 
 ```text
 bus_fault
+bus_fault_clear
 ```
 
 接口规则：
@@ -73,7 +74,8 @@ bus_fault
 - 当前事务完成后重新进入可接收状态；
 - 读事务完成时 `rsp_valid` 拉高 1 clk，同时 `rsp_rd_data` 有效；
 - 普通写事务不需要上层等待完成响应；
-- `BUSY timeout` 时置位本 Driver 的 `bus_fault`，第一版故障后停止接收新的事务。
+- `BUSY timeout` 时置位 sticky `bus_fault` 并停止接收新的事务；
+- `bus_fault_clear` 为单 clk 清除脉冲，由 `System Controller` 在完成系统 fault 锁存后发出。
 
 因此 `Config Manager`、`Power Sequence Engine` 等纯写命令源只关心命令握手，不需要等待实际 SPI 事务完成。
 
@@ -122,6 +124,20 @@ cmd_ready = 0
 
 SPI 写本身没有 ACK，因此除 BUSY timeout 外，Driver 不判断“寄存器是否真正写入成功”。
 
+### 5.1 bus_fault 清除
+
+`bus_fault` 由 Driver 锁存，不能自动清除。
+
+System Controller 检测到 fault 后先锁存系统级 `fault_vector`，随后向对应 Driver 发：
+
+```text
+bus_fault_clear = 1 pulse
+```
+
+Driver 收到清除脉冲后清除本地 sticky fault 并回到空闲状态。
+
+是否允许系统继续执行由 `System Controller` 的 `FAULT` 状态决定，Driver 清除本地 fault 不代表系统自动恢复。
+
 ---
 
 ## 6. AD5560 寄存器读
@@ -167,7 +183,7 @@ rsp_valid + rsp_rd_data
 
 系统实例化 8 个独立 `AD5560 Driver`。
 
-`Command Arbiter` 根据 `BUS_ID` 把当前命令送到目标 Driver，并把该 Driver 的 `ready` 返回给命令源。
+`System Controller` 根据 `BUS_ID` 把当前命令送到目标 Driver，并把该 Driver 的 `ready` 返回给当前命令源。
 
 因此：
 
@@ -176,4 +192,4 @@ rsp_valid + rsp_rd_data
 同一 BUS：Driver 自身一次只接受一笔事务，自动串行
 ```
 
-Driver 的 `bus_fault` 输出统一送回 `Command Arbiter` 汇总。
+8 路 Driver 的 `bus_fault` 输出统一送到 `System Controller`，由其进行系统级 fault 锁存和处理。
