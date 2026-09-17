@@ -4,7 +4,7 @@
 
 `Config Manager` 负责执行 AD5560 的初始化配置表。
 
-其职责仅限于：
+职责：
 
 - 接收通信侧写入的配置记录；
 - 保存配置记录；
@@ -13,22 +13,11 @@
 - 当前记录完成 `valid / ready` 握手后立即继续下一条；
 - 收到 `cfg_abort` 后停止当前配置流程。
 
-`Config Manager` 不负责系统工作状态、上下电时序、Alarm 处理或系统级 fault 判断。
-
 ---
 
 ## 2. Config RAM
 
 第一版将 **Config RAM 直接放在 `Config Manager` 内部**。
-
-```text
-Config Manager
-├─ Config RAM
-│   ├─ 写口：通信侧写入配置记录
-│   └─ 读口：Config Manager 顺序读取
-│
-└─ Config FSM
-```
 
 Config RAM 采用单块全局 RAM，不按 8 条 SPI BUS 分开。
 
@@ -91,38 +80,9 @@ SPI 写本身没有 ACK，因此 Config Manager 不等待逐条写事务完成�
 
 ## 4. 配置执行流程
 
-Config Manager 按 Config RAM 顺序产生单路命令流：
+Config Manager 按 Config RAM 顺序产生单路命令流。
 
-```text
-IDLE
-  ↓
-cfg_start
-  ↓
-index = 0
-  ↓
-读取 Config RAM[index]
-  ↓
-解析 BUS_ID / DEVICE_ID / REG_ADDR / REG_DATA
-  ↓
-向 System Controller 提交寄存器写事务
-  ↓
-等待 cfg_cmd_valid && cfg_cmd_ready
-  ↓
-握手完成：index + 1，立即处理下一条
-  ↓
-全部记录完成握手后 cfg_done
-```
-
-目标 Driver 忙时，`ready` 由 `System Controller` 返回为低，Config Manager 保持当前记录不变并等待。
-
-因此配置记录仍按 RAM 顺序派发，但不同 BUS 的实际 SPI 事务可以重叠执行：
-
-```text
-BUS0 record → handshake
-BUS3 record → handshake
-BUS7 record → handshake
-BUS0 record → 若 BUS0 Driver 仍忙，则停在该记录等待
-```
+配置记录仍按 RAM 顺序派发，但不同 BUS 的实际 SPI 事务可以重叠执行。
 
 第一版不做乱序调度或跳过当前记录。
 
@@ -130,25 +90,7 @@ BUS0 record → 若 BUS0 Driver 仍忙，则停在该记录等待
 
 ## 5. abort 处理
 
-Config Manager 不直接接收 Driver `bus_fault`。
-
-系统 fault 由 `System Controller` 统一判断。发生系统 fault 时：
-
-```text
-System Controller
-      ↓
-cfg_abort = 1
-      ↓
-Config Manager 停止继续派发
-```
-
-收到 `cfg_abort` 后：
-
-```text
-cfg_busy  = 0
-cfg_done  = 0
-cfg_error = 1
-```
+系统 fault 由 `System Controller` 统一判断。发生系统 fault 时 Config Manager 停止继续派发。
 
 已经完成握手并交给 Driver 的事务不取消，由对应 Driver 自行结束。
 
@@ -175,21 +117,6 @@ cfg_cmd_valid && cfg_cmd_ready
 
 表示当前配置记录已经被目标 Driver 接收。握手后 Config Manager 直接处理下一条记录。
 
----
-
-## 7. 模块连接关系
-
-```text
-通信侧 ──> Config RAM
-
-System Controller
-      │ cfg_start / cfg_abort
-      ▼
-Config Manager
-      │ config command
-      ▼
-System Controller
-      │ BUS_ID select
       ▼
 AD5560 Driver × 8
 ```
