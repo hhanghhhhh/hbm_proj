@@ -208,19 +208,9 @@ flowchart TB
 
     subgraph CTRL[ad5560_controller]
         SYS[System Controller\n系统状态 / sel_id / BUS选择 / fault锁存]
-
-        subgraph CFG[Config Manager]
-            CRAM[Config RAM\n全部 BUS 配置记录]
-            CM[Config FSM\n握手后继续下一条]
-        end
-
-        subgraph PSEQ[Power Seq]
-            PSRAM[Power Sequence RAM\n全局上下电时序]
-            PSE[Power Sequence Engine]
-        end
-
+        CM[Config Manager\n配置]
+        PSE[Power Sequence Engine\n全局上下电时序]
         AH[Alarm Handler\n事件触发读取状态]
-        RC[Runtime Control\n后续按需增加]
 
         subgraph DRIVERS[AD5560 Driver x8]
             DRV[BUS0 ~ BUS7 Driver\nvalid/ready + SYNC + BUSY + bus_fault]
