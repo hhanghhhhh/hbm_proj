@@ -2,23 +2,7 @@
 
 ## 1. 模块定位
 
-`System Controller` 是 AD5560 子系统的顶层控制状态机，同时负责命令源选择、BUS 选择以及系统级故障处理。
-
-它不实现 AD5560 具体寄存器事务，实际 SPI 访问仍由 8 个 `AD5560 Driver` 完成。
-
-```text
-上位机命令 / ALARM / Driver bus_fault
-                │
-                ▼
-        System Controller
-          │     │     │
-          │     │     └─ 系统状态 / fault 锁存
-          │     └────── 启停 Config / Sequence / Alarm
-          └──────────── sel_id + 命令通路选择
-                │
-                ▼
-        AD5560 Driver × 8
-```
+`System Controller` 是 AD5560 子系统的顶层控制状态机，同时负责命令源选择、业务模块选择以及系统级故障处理。
 
 ---
 
@@ -28,10 +12,7 @@
 
 - 根据上位机命令控制 `Config Manager` 和 `Power Sequence Engine` 启动；
 - 接收 `ALARM[7:0]`，锁存报警 BUS 并启动 `Alarm Handler`；
-- 根据当前系统状态产生 `sel_id`，选择当前寄存器命令源；
-- 根据命令中的 `BUS_ID` 选择目标 `AD5560 Driver`；
-- 将目标 Driver 的 `ready` 返回给当前命令源；
-- 将读事务结果返回给当前读命令源；
+- 根据当前系统状态产生 `sel_id`，选择当前业务模块；
 - 接收 8 路 Driver `bus_fault`，锁存系统 fault 信息；
 - fault 锁存完成后清除 Driver 内部 sticky `bus_fault`；
 - fault 发生时停止当前 Config / Sequence，并进入 `FAULT` 状态。
@@ -41,32 +22,6 @@
 ---
 
 ## 3. 系统状态
-
-建议第一版使用以下主要状态：
-
-```text
-IDLE
-CONFIG
-READY
-SEQUENCE
-RUN
-ALARM
-FAULT
-```
-
-基本流程：
-
-```text
-IDLE
-  │ CONFIG_START
-  ▼
-CONFIG ── cfg_done ──> READY
-                         │ SEQ_START
-                         ▼
-                      SEQUENCE ── seq_done ──> RUN
-```
-
-`ALARM` 为事件处理状态；`FAULT` 为系统故障状态。
 
 ### 3.1 Config
 
@@ -103,71 +58,6 @@ sel_id           = SEL_ALARM
 已经被 Driver 接受的 SPI 事务不取消。Alarm Handler 通过统一命令通路读取对应 BUS 的 Alarm / Fault Status 寄存器。
 
 Alarm 处理期间不再向 Power Sequence Engine 或 Config Manager 返回命令 `ready`，因此它们不会继续派发新事务。`alarm_done` 后若没有系统 fault，再返回被 Alarm 打断前的正常状态。
-
----
-
-## 4. 命令源选择
-
-建议定义：
-
-```text
-SEL_NONE
-SEL_CONFIG
-SEL_SEQUENCE
-SEL_ALARM
-SEL_RUNTIME     // 后续按需增加
-```
-
-System Controller 根据当前状态选择一组上层命令：
-
-```text
-CONFIG   -> Config Manager
-SEQUENCE -> Power Sequence Engine
-ALARM    -> Alarm Handler
-RUN      -> Runtime Control（如后续需要）
-```
-
-各命令源使用统一事务接口：
-
-```text
-cmd_valid
-cmd_ready
-cmd_bus_id[2:0]
-cmd_rw
-cmd_device_id[3:0]
-cmd_reg_addr[6:0]
-cmd_wr_data[15:0]
-```
-
-当前命令完成：
-
-```text
-cmd_valid && cmd_ready
-```
-
-握手后，命令已经被目标 Driver 接收。Config Manager 和 Power Sequence Engine 可直接处理下一条，不等待 SPI 真正完成。
-
----
-
-## 5. Driver 选择
-
-System Controller 根据当前命令的 `BUS_ID` 选择 8 个 Driver 中的一个：
-
-```text
-driver_cmd_valid[n] = cmd_valid && (cmd_bus_id == n)
-cmd_ready           = driver_cmd_ready[cmd_bus_id]
-```
-
-不同 BUS 已经握手的事务可以在各 Driver 中并行执行。
-
-读事务完成后，由 System Controller 将目标 Driver 的：
-
-```text
-rsp_valid
-rsp_rd_data[15:0]
-```
-
-返回给当前读命令源。
 
 ---
 
@@ -233,28 +123,3 @@ bus_fault > ALARM > 当前正常工作状态
 
 - `ALARM`：进入 Alarm Handler，读取状态后再决定后续策略；
 - `bus_fault`：直接停止 Config / Sequence，进入 `FAULT`。
-
----
-
-## 8. 模块边界
-
-```text
-                 System Controller
-        ┌────────────┼────────────┐
-        │            │            │
- Config Manager     PSE      Alarm Handler
-        │            │            │
-        └────── command sources ───┘
-                     │
-                     ▼
-              command select
-                     │
-                 BUS_ID select
-                     │
-                     ▼
-            AD5560 Driver × 8
-                     │
-              SPI Master × 8
-```
-
-`System Controller` 负责系统工作状态和控制通路；`Config Manager`、`Power Sequence Engine`、`Alarm Handler` 只实现各自业务流程，不各自重复处理系统级 fault。
