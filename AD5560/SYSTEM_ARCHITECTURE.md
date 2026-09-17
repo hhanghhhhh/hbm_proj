@@ -231,9 +231,9 @@ flowchart TB
     DEV[128 × AD5560\n8 BUS × 16 Device]
 
     PC --> COMM
-    COMM --> CM
-    COMM --> SYS
-    COMM --> PSE
+    COMM -->|写ram| CM
+    COMM -->|写命令| SYS
+    COMM -->|写ram| PSE
 
     SPI --> DEV
     DRV -->|SYNC 128 路| DEV
