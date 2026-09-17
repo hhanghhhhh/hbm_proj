@@ -8,14 +8,12 @@
 
 - 接收通信侧写入的配置记录；
 - 保存配置记录；
-- 配置启动后按顺序读取记录；
+- 收到 `System Controller` 的 `cfg_start` 后按顺序读取记录；
 - 将每条记录转换成一笔 AD5560 寄存器写事务；
 - 当前记录完成 `valid / ready` 握手后立即继续下一条；
-- 检测 `Command Arbiter` 输出的总 `bus_fault`，出现故障后停止剩余配置。
+- 收到 `cfg_abort` 后停止当前配置流程。
 
-`Config Manager` 不负责上下电时序、Alarm 处理或其他运行期寄存器控制。
-
-后续 FPGA 内部如需运行期读写 AD5560 寄存器，应由独立功能模块通过 `Command Arbiter` 直接访问对应 `AD5560 Driver`，不经过 `Config Manager`。
+`Config Manager` 不负责系统工作状态、上下电时序、Alarm 处理或系统级 fault 判断。
 
 ---
 
@@ -34,7 +32,7 @@ Config Manager
 
 Config RAM 采用单块全局 RAM，不按 8 条 SPI BUS 分开。
 
-通信侧先完成配置表写入，再启动配置。配置执行期间不允许修改当前 Config RAM。
+通信侧先完成配置表写入，再由 `System Controller` 启动配置。配置执行期间不允许修改当前 Config RAM。
 
 ### 2.1 配置记录
 
@@ -53,16 +51,27 @@ REG_DATA   16 bit
 
 ---
 
-## 3. 通信侧接口
+## 3. 控制接口
+
+通信侧负责 Config RAM 写入：
 
 ```text
 cfg_ram_wr_en
 cfg_ram_wr_addr
 cfg_ram_wr_data[31:0]
-
-cfg_start
 cfg_record_count
+```
 
+`System Controller` 负责配置流程控制：
+
+```text
+cfg_start
+cfg_abort
+```
+
+Config Manager 返回：
+
+```text
 cfg_busy
 cfg_done
 cfg_error
@@ -71,10 +80,10 @@ cfg_error
 其中：
 
 - `cfg_start` 为单 clk 启动脉冲；
-- `cfg_record_count` 表示本次有效记录数量；
+- `cfg_abort` 为系统故障或其他上层原因导致的终止信号；
 - `cfg_busy` 表示正在派发配置记录；
 - `cfg_done` 表示全部配置记录已经完成握手并提交给下游；
-- `cfg_error` 表示配置过程中检测到 `bus_fault`，剩余记录停止派发。
+- `cfg_error` 表示本次配置被 `cfg_abort` 终止。
 
 SPI 写本身没有 ACK，因此 Config Manager 不等待逐条写事务完成，也不维护逐条配置结果。
 
@@ -95,7 +104,7 @@ index = 0
   ↓
 解析 BUS_ID / DEVICE_ID / REG_ADDR / REG_DATA
   ↓
-向 Command Arbiter 提交寄存器写事务
+向 System Controller 提交寄存器写事务
   ↓
 等待 cfg_cmd_valid && cfg_cmd_ready
   ↓
@@ -104,7 +113,7 @@ index = 0
 全部记录完成握手后 cfg_done
 ```
 
-目标 Driver 忙时，其 `ready` 通过 `Command Arbiter` 返回为低，Config Manager 保持当前记录不变并等待。
+目标 Driver 忙时，`ready` 由 `System Controller` 返回为低，Config Manager 保持当前记录不变并等待。
 
 因此配置记录仍按 RAM 顺序派发，但不同 BUS 的实际 SPI 事务可以重叠执行：
 
@@ -119,35 +128,33 @@ BUS0 record → 若 BUS0 Driver 仍忙，则停在该记录等待
 
 ---
 
-## 5. bus_fault 处理
+## 5. abort 处理
 
-Config Manager 只接收 `Command Arbiter` 汇总后的单 bit：
+Config Manager 不直接接收 Driver `bus_fault`。
+
+系统 fault 由 `System Controller` 统一判断。发生系统 fault 时：
 
 ```text
-bus_fault
+System Controller
+      ↓
+cfg_abort = 1
+      ↓
+Config Manager 停止继续派发
 ```
 
-配置期间只要检测到：
+收到 `cfg_abort` 后：
 
 ```text
-bus_fault = 1
-```
-
-则：
-
-```text
-停止继续读取 / 派发剩余 Config RAM 记录
 cfg_busy  = 0
+cfg_done  = 0
 cfg_error = 1
 ```
 
-已经完成握手并交给其他 Driver 的事务不取消，由对应 Driver 自行结束。
-
-具体是哪条 BUS 故障由 `Command Arbiter` 的 `bus_fault_vector[7:0]` 提供给其他状态 / 故障管理模块；Config Manager 自身不需要该向量。
+已经完成握手并交给 Driver 的事务不取消，由对应 Driver 自行结束。
 
 ---
 
-## 6. 与 Command Arbiter 的接口
+## 6. 与 System Controller 的命令接口
 
 Config Manager 作为一个写命令源输出：
 
@@ -173,16 +180,18 @@ cfg_cmd_valid && cfg_cmd_ready
 ## 7. 模块连接关系
 
 ```text
-Config Manager
-      │
+通信侧 ──> Config RAM
+
+System Controller
+      │ cfg_start / cfg_abort
       ▼
-Command Arbiter
-      │
+Config Manager
+      │ config command
+      ▼
+System Controller
+      │ BUS_ID select
       ▼
 AD5560 Driver × 8
-      │
-      ▼
-SPI Master × 8
 ```
 
-`Power Sequence Engine`、`Alarm Handler` 和后续可能增加的运行期控制模块也作为独立命令源接入同一个 `Command Arbiter`。
+`Power Sequence Engine`、`Alarm Handler` 和后续可能增加的运行期控制模块也作为独立命令源接入 `System Controller`。
