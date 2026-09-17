@@ -4,19 +4,22 @@
 
 `AD5560 Driver` 对应一条 AD5560 SPI BUS，负责本组 16 颗 AD5560 的寄存器事务执行。
 
-上层只需要描述“访问哪颗器件、读写哪个寄存器、写入什么数据”，`AD5560 Driver` 负责完成对应的 AD5560 SPI 事务。
+系统共实例化 8 个 Driver，由 `Command Arbiter` 根据 `BUS_ID` 直接选择目标 Driver，不再设置 `Bus Service` 中间层。
 
 SPI 底层移位、时钟以及单路片选时序由通用 `SPI Master` 实现。`SPI Master` 只输出一根通用 `CS_n`，不知道 AD5560，也不知道本 BUS 上有 16 颗器件。
 
-`AD5560 Driver` 根据 `DEVICE_ID` 将 SPI Master 的 `CS_n` 映射到本组 16 路独立 `SYNC` 中的一路，因此器件选择仍属于 Driver。
+`AD5560 Driver` 负责：
 
-`AD5560 Driver` 还负责 AD5560 特有的寄存器帧组织、readback 两帧流程、SPI transaction 之间的等待时间、读回时钟选择以及写事务的 `BUSY` 处理。
+- 接收并锁存一笔寄存器事务；
+- 根据 `DEVICE_ID` 将 SPI Master 的 `CS_n` 映射到本组 16 路独立 `SYNC` 中的一路；
+- 组织 AD5560 寄存器读写帧；
+- 封装 readback 两帧流程；
+- 处理 AD5560 专用时序和写事务 `BUSY`；
+- `BUSY timeout` 时锁存本 BUS 的 `bus_fault`。
 
 ---
 
-## 2. 每个 AD5560 Driver 对应的硬件资源
-
-每个实例固定对应一条 SPI BUS：
+## 2. 每个 Driver 对应的硬件资源
 
 ```text
 AD5560 Driver n
@@ -36,109 +39,141 @@ AD5560 Driver n
 
 ---
 
-## 3. 主要功能
+## 3. Command Arbiter 接口
 
-### 3.1 器件选择与 SYNC 映射
-
-上层提供 `DEVICE_ID`。Driver 执行期间不再额外锁存 `DEVICE_ID`，由上层 `Bus Service` 保证从 `drv_start` 发出到 `drv_done` 返回期间，所有 Driver 命令参数保持不变。
-
-Driver 根据当前 `DEVICE_ID` 将 SPI Master 的 `CS_n` 映射为对应 AD5560 的 `SYNC`。
-
-实际 RTL 需保证任何时刻最多只有一路 `SYNC` 为低。
-
-### 3.2 AD5560 寄存器写
-
-上层提供：
+Driver 直接使用 `valid / ready` 接收寄存器事务：
 
 ```text
-RW
-DEVICE_ID
-REG_ADDR
-REG_DATA
+cmd_valid
+cmd_ready
+cmd_rw
+cmd_device_id[3:0]
+cmd_reg_addr[6:0]
+cmd_wr_data[15:0]
 ```
 
-`AD5560 Driver` 负责组织 AD5560 的 24 bit SPI 写帧，并调用 `SPI Master` 完成一次完整 SPI transaction。
+读事务返回：
 
-对于写事务，Driver 不能在 SPI 完成的同一时刻立即判断 `BUSY`，而应先经过固定保护时间，再判断器件是否仍处于 BUSY。
+```text
+rsp_valid
+rsp_rd_data[15:0]
+```
 
-对于写事务，不要求必须观察到一次 `BUSY=0`。如果 BUSY 低脉冲较短，在保护时间结束前已经恢复为高，可直接认为器件内部处理已经结束。
+故障状态：
 
-`BUSY` 等待需要设置 timeout，避免器件异常导致上层流程永久阻塞。
+```text
+bus_fault
+```
 
-AD5560 的 DAC x1 写入 BUSY low 最长约 1.5 µs，其他寄存器写入最长约 280 ns，因此正常写事务的 BUSY timeout 应明显大于 1.5 µs，并留有板级和时钟裕量。
+接口规则：
 
-写结束已经等待 BUSY 固定时长，且大于 `SYNC↑` 到 SDO high-Z，无需重复等待。
+- Driver 空闲且无故障时 `cmd_ready = 1`；
+- `cmd_valid && cmd_ready` 时 Driver 锁存本次 `RW / DEVICE_ID / REG_ADDR / WR_DATA`；
+- 握手后 Driver 拉低 `cmd_ready` 并独立执行该事务，上层参数随后可以变化；
+- 当前事务完成后重新进入可接收状态；
+- 读事务完成时 `rsp_valid` 拉高 1 clk，同时 `rsp_rd_data` 有效；
+- 普通写事务不需要上层等待完成响应；
+- `BUSY timeout` 时置位本 Driver 的 `bus_fault`，第一版故障后停止接收新的事务。
 
-### 3.3 AD5560 寄存器读
+因此 `Config Manager`、`Power Sequence Engine` 等纯写命令源只关心命令握手，不需要等待实际 SPI 事务完成。
 
-上层只发起一次寄存器读请求。
+---
 
-AD5560 readback 由 Driver 内部封装为两次独立 SPI transaction。
+## 4. 器件选择与 SYNC 映射
 
-依据 AD5560 Rev.F 的 SPI Read Timing，readback 两帧之间只要求满足最小 `SYNC` high time；**读事务两帧之间不等待 BUSY，也不执行写事务的 BUSY 检测流程。**
+Driver 在命令握手时锁存 `DEVICE_ID`，并在本次事务执行期间保持不变。
 
-因此 readback 要求的 `SYNC` high time，本质上就是两次 SPI transaction 之间的间隔。
+SPI Master 只产生通用单路 `CS_n`，Driver 根据锁存的 `DEVICE_ID` 将其映射为对应 AD5560 的 `SYNC`：
+
+```text
+SYNC[0..15] = 全部保持高
+SYNC[device_id] = spi_cs_n
+```
+
+实际 RTL 必须保证任何时刻最多只有一路 `SYNC` 为低。
+
+---
+
+## 5. AD5560 寄存器写
+
+Driver 组织 AD5560 的 24 bit SPI 写帧并调用 SPI Master。
+
+写事务结束后不能立即用当前 `BUSY=1` 判断完成，应先经过固定保护时间，再判断 BUSY：
+
+```text
+SPI transaction 完成 / SYNC↑
+    ↓
+等待 ≥ 100 ns
+    ↓
+BUSY = 0 → 等待 BUSY 回到 1
+BUSY = 1 → 写事务完成
+```
+
+不要求必须观察到一次 `BUSY=0`。如果 BUSY 低脉冲较短，在保护时间结束前已经恢复为高，可直接认为内部处理完成。
+
+`BUSY` 等待需要设置 timeout。正常写事务 timeout 应明显大于 DAC x1 写入约 1.5 µs 的最坏 BUSY 时间，并留有裕量。
+
+发生 timeout 时：
+
+```text
+bus_fault = 1
+cmd_ready = 0
+```
+
+SPI 写本身没有 ACK，因此除 BUSY timeout 外，Driver 不判断“寄存器是否真正写入成功”。
+
+---
+
+## 6. AD5560 寄存器读
+
+上层只发起一次寄存器读请求，Driver 内部完成两次 SPI transaction：
+
+```text
+第 1 帧：Read Request
+    ↓
+SYNC high 等待 ≥ 500 ns
+    ↓
+第 2 帧：NOP，同时采集 SDO
+    ↓
+rsp_valid + rsp_rd_data
+```
+
+依据 AD5560 Rev.F SPI Read Timing：
+
+- readback 两帧之间只要求满足 `SYNC` high time；
+- **两帧之间不等待 BUSY**；
+- 第二帧结束后等待 SDO 释放保护时间，再返回读结果。
 
 第 2 帧使用 NOP，避免为了移出 readback 数据而修改其他寄存器。
 
-读后注意 `SYNC` 拉高后，SDO 最迟约 30 ns 回到 high-Z。完成该保护时间后再返回 `drv_done`。
-
-### 3.4 BUSY 处理
-
-每条 BUS 的 16 颗 AD5560 共用一根开漏 `BUSY`，由对应 `AD5560 Driver` 直接检测。
-
-`BUSY` 主要用于写事务以及 RESET / 上电等内部处理状态。Datasheet 的 BUSY Function 明确说明寄存器写会使 BUSY 拉低；readback 时序图不要求在两帧之间等待 BUSY。
-
-为避免在前一笔写操作尚未完成时启动新的访问，**任何新事务开始前仍应先确认共享 `BUSY` 已释放。**
-
 ---
 
-## 4. SPI / AD5560 时序边界
+## 7. SPI / AD5560 时序边界
 
-依据 AD5560 Rev.F datasheet Table 2，建议第一版按以下方式预留：
-
-| 项目 | Datasheet 要求 | 实现建议 | 归属 |
+| 项目 | Datasheet 要求 | 第一版建议 | 归属 |
 |---|---:|---:|---|
-| `SYNC↓` 到首个 SCLK falling edge | ≥ 10 ns | ≥ 50 ns | SPI Master 的 CS setup |
-| 第 24 个 SCLK falling edge 到 `SYNC↑` | ≥ 5 ns | ≥ 50 ns | SPI Master 的 CS hold |
+| `SYNC↓` 到首个 SCLK falling edge | ≥ 10 ns | ≥ 50 ns | SPI Master CS setup |
+| 第 24 个 SCLK falling edge 到 `SYNC↑` | ≥ 5 ns | ≥ 50 ns | SPI Master CS hold |
 | 普通事务 `SYNC` high time | ≥ 15 ns | ≥ 50 ns | SPI Master / transaction 间隔 |
-| 写事务 `SYNC↑` 到 `BUSY↓` | 最大 40 ns | SPI done 后先等待 ≥ 100 ns 再检测 BUSY | AD5560 Driver |
-| Readback 两帧之间 `SYNC` high time | ≥ 250 ns | 两次 SPI transaction 间隔 ≥ 500 ns，**不等待 BUSY** | AD5560 Driver |
-| `SYNC↑` 到 SDO high-Z | 最大 30 ns | 下一次 SPI transaction 不早于普通 CS high guard | SPI Master / Driver |
+| 写事务 `SYNC↑` 到 `BUSY↓` | 最大 40 ns | SPI done 后等待 ≥ 100 ns 再检测 BUSY | Driver |
+| Readback 两帧之间 `SYNC` high time | ≥ 250 ns | ≥ 500 ns，不等待 BUSY | Driver |
+| `SYNC↑` 到 SDO high-Z | 最大 30 ns | 下一事务前满足保护时间 | Driver / SPI Master |
 
-上述建议值以逻辑简单和留有裕量为优先，不追求极限 SPI 吞吐率。
+上述建议值优先保证 RTL 简单和时序裕量，不追求极限 SPI 吞吐率。
 
 ---
 
-## 5. 与 Bus Service 的接口
+## 8. 多 BUS 工作方式
 
-`Bus Service` 与 `AD5560 Driver` 为一对一关系，采用简单的 `start / done` 脉冲接口。
+系统实例化 8 个独立 `AD5560 Driver`。
 
-Service 到 Driver：
+`Command Arbiter` 根据 `BUS_ID` 把当前命令送到目标 Driver，并把该 Driver 的 `ready` 返回给命令源。
 
-```text
-drv_start              // 单 clk 脉冲
-drv_rw
-drv_device_id[3:0]
-drv_reg_addr[6:0]
-drv_wr_data[15:0]
-```
-
-Driver 返回：
+因此：
 
 ```text
-drv_done               // 单 clk 脉冲
-drv_rd_data[15:0]
-drv_error
+不同 BUS：可以同时执行 SPI 事务
+同一 BUS：Driver 自身一次只接受一笔事务，自动串行
 ```
 
-接口约束：
-
-- `drv_start` 仅在 Driver 空闲时拉高 1 clk；
-- Driver 收到 `drv_start` 后立即开始执行当前输入参数描述的寄存器事务；
-- Driver 内部不再重复锁存 `drv_rw / drv_device_id / drv_reg_addr / drv_wr_data`；
-- `Bus Service` 必须保证从 `drv_start` 发出开始，到 `drv_done` 返回之前，上述参数保持不变；
-- `drv_done` 为单 clk 脉冲，表示本次寄存器事务已经完全结束；
-- 读事务在 `drv_done` 有效时，`drv_rd_data` 有效；
-- `drv_error` 在 `drv_done` 有效时表示本次事务是否异常。
-
+Driver 的 `bus_fault` 输出统一送回 `Command Arbiter` 汇总。
