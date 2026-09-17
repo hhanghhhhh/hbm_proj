@@ -233,7 +233,7 @@ flowchart TB
         SYS -->|alarm_start / alarm_vector| AH
 
         CM -->|BUS_ID + Register Transaction| DRV
-        PSEQ -->|BUS_ID + Register Transaction| DRV
+        PSE -->|BUS_ID + Register Transaction| DRV
         AH -->|BUS_ID + Register Transaction| DRV
 
     end
