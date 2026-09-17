@@ -117,7 +117,5 @@ cfg_cmd_valid && cfg_cmd_ready
 
 表示当前配置记录已经被目标 Driver 接收。握手后 Config Manager 直接处理下一条记录。
 
-AD5560 Driver × 8
-```
 
-`Power Sequence Engine`、`Alarm Handler` 和后续可能增加的运行期控制模块也作为独立命令源接入 `System Controller`。
+
