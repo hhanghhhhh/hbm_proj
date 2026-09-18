@@ -38,6 +38,26 @@ REG_DATA   16 bit
 
 第一版 Config Table 只执行寄存器写操作，因此记录中不需要 `RW` 字段。
 
+### 2.2 RAM 容量计算
+
+每条 Config Record 使用 1 个 32-bit word，因此：
+
+```text
+CONFIG_RAM_WORDS = MAX_CONFIG_RECORDS
+CONFIG_RAM_BITS  = MAX_CONFIG_RECORDS × 32
+CONFIG_RAM_BYTES = MAX_CONFIG_RECORDS × 4
+```
+
+当前文档尚未固定 `MAX_CONFIG_RECORDS`，RTL 实现时按实际需要的最大配置记录数确定 RAM 深度。
+
+例如实际需要保存 N 条配置记录，则所需容量为：
+
+```text
+N × 32 bit = N × 4 Byte
+```
+
+后续如果 Config Record 格式或最大记录数发生变化，应同步重新计算本节 RAM 容量。
+
 ---
 
 ## 3. 控制接口
@@ -93,29 +113,5 @@ Config Manager 按 Config RAM 顺序产生单路命令流。
 系统 fault 由 `System Controller` 统一判断。发生系统 fault 时 Config Manager 停止继续派发。
 
 已经完成握手并交给 Driver 的事务不取消，由对应 Driver 自行结束。
-
----
-
-## 6. 与 System Controller 的命令接口
-
-Config Manager 作为一个写命令源输出：
-
-```text
-cfg_cmd_valid
-cfg_cmd_ready
-cfg_bus_id[2:0]
-cfg_device_id[3:0]
-cfg_reg_addr[6:0]
-cfg_wr_data[15:0]
-```
-
-由于 Config Table 第一版只有写操作，统一命令接口中的 `RW` 固定为写。
-
-```text
-cfg_cmd_valid && cfg_cmd_ready
-```
-
-表示当前配置记录已经被目标 Driver 接收。握手后 Config Manager 直接处理下一条记录。
-
 
 

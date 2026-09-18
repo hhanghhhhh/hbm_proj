@@ -21,192 +21,65 @@
 
 正常上下电主要采用 AD5560 的 **Ramp Function + SPI 软件控制**，`HW_INH` 不作为正常单通道上下电时序控制信号。
 
----
 
-## 2. System Controller
-
-`System Controller` 是 AD5560 子系统的顶层控制状态机。
-
-它负责：
-
-- 接收上位机配置、上下电等运行命令；
-- 控制 `Config Manager`、`Power Sequence Engine` 和 `Alarm Handler` 启停；
-- 根据当前系统状态产生 `sel_id`，选择当前寄存器命令源；
-- 根据 `BUS_ID` 将当前命令送到目标 Driver；
-- 返回目标 Driver 的 `ready` 和读回数据；
-- 接收并锁存 `ALARM[7:0]`；
-- 接收 8 路 Driver `bus_fault`，锁存系统 fault 信息；
-- fault 锁存完成后清除 Driver 内部 sticky fault；
-- fault 时终止当前 Config / Sequence 并进入 `FAULT` 状态。
 
 ---
 
-## 3. Config Manager
 
-配置采用寄存器级配置表：
+## 2. Driver BUS 选择
 
-```text
-BUS_ID + DEVICE_ID + REG_ADDR + REG_DATA
-```
+System Controller 只根据系统状态产生 `sel_id`，用于选择当前业务模块。
 
-单块全局 `Config RAM` 放在 `Config Manager` 内部，不按 8 条 BUS 分开。
-
-通信侧先写入配置表，随后上位机下发配置启动命令，由 `System Controller` 产生 `cfg_start`。
+当前业务模块输出统一命令字段：
 
 ```text
-System Controller
-      │ cfg_start / cfg_abort
-      ▼
-Config Manager
+cmd_valid
+cmd_bus_id
+cmd_device_id
+cmd_reg_addr
+cmd_wr_data
 ```
 
-Config Manager 顺序读取记录。当前记录完成 `valid / ready` 握手后立即继续下一条，不等待 SPI 事务真正完成。
-
-不同 BUS 已接受的配置事务可以并行执行；如果后续记录目标 Driver 尚未 ready，则停在当前记录等待。
-
-Config Manager 不直接判断系统 `bus_fault`。fault 由 System Controller 统一处理，并通过 `cfg_abort` 终止配置。
-
----
-
-## 4. AD5560 Driver
-
-系统实例化 8 个 `AD5560 Driver`，每个 Driver 对应一条物理 SPI BUS。
-
-Driver 直接通过 `valid / ready` 接收 System Controller 转发的寄存器事务，并在握手时锁存命令参数。
-
-每个 Driver 负责：
-
-- 根据 `DEVICE_ID` 将 SPI Master 单路 `CS_n` 映射到本组 16 路独立 `SYNC` 中的一路；
-- 组织 AD5560 寄存器读写 SPI 帧；
-- 封装 readback 两帧流程；
-- 调用通用 `SPI Master`；
-- 对写事务检测共享 `BUSY` 并处理 timeout；
-- `BUSY timeout` 时锁存本 BUS 的 `bus_fault`；
-- 接收 System Controller 的 `bus_fault_clear` 清除本地 sticky fault。
-
-因此：
-
-```text
-不同 BUS：8 个 Driver 可并行执行
-同一 BUS：单个 Driver 一次只接受一笔事务，自动串行
-```
-
----
-
-## 5. 上下电时序
-
-上下电时序采用 **单块全局 `Power Sequence RAM` + 单个 `Power Sequence Engine`**。
-
-128 路上下电时序属于同一个全局时间轴，不按 BUS 分成 8 套独立时序。
-
-System Controller 根据上位机命令控制：
-
-```text
-seq_start
-seq_pause
-seq_abort
-```
-
-Power Sequence Engine 顺序读取时序记录并产生：
-
-```text
-BUS_ID + Register Transaction
-```
-
-当前记录完成 `valid / ready` 握手后即可继续下一条，不等待目标 Driver 的 SPI 事务完成。
-
-Alarm 处理期间 System Controller 暂停新的 Sequence 命令派发；发生系统 `bus_fault` 时直接 `seq_abort`。
-
----
-
-## 6. ALARM 与运行期状态读取
-
-AD5560 不做后台寄存器轮询，也不设置 Telemetry RAM。
-
-电压、电流实时值由系统外部 ADC 采样，不通过 AD5560 寄存器周期读取。外部 ADC 的具体采样链路不在本文档中展开。
-
-每条 BUS 提供 1 路 `ALARM`，共 8 路。ALARM 先进入 System Controller：
-
-```text
-ALARM[7:0]
-    ↓
-System Controller
-    ↓ 锁存 alarm_vector / alarm_start
-Alarm Handler
-    ↓ register read command
-System Controller
-    ↓
-目标 AD5560 Driver
-```
-
-System Controller 收到 ALARM 后切换：
-
-```text
-sel_id = SEL_ALARM
-```
-
-Alarm Handler 按需要读取对应 BUS 上 AD5560 的 Alarm / Fault Status 寄存器进行故障定位。
-
-已经被 Driver 接受的 SPI 事务不取消。Alarm Handler 完成后，如果没有系统 fault，再返回被 Alarm 打断前的正常状态。
-
----
-
-## 7. bus_fault 处理
-
-每个 Driver 输出一位 sticky `bus_fault`，8 路汇总到 System Controller：
-
-```text
-driver_bus_fault[7:0]
-```
-
-System Controller 检测到 fault 后：
-
-```text
-1. fault_vector_latched[7:0] <- driver_bus_fault[7:0]
-2. cfg_abort / seq_abort
-3. 进入 FAULT 状态
-4. 锁存完成后向对应 Driver 发 bus_fault_clear 脉冲
-```
-
-系统内部保留完整：
-
-```text
-fault_vector_latched[7:0]
-```
-
-需要单个 `fault_id` 时可由该向量编码得到。
-
-清除 Driver 内部 `bus_fault` 只用于释放底层 sticky 状态，不代表系统恢复。System Controller 的故障锁存继续保持，直到上位机明确执行故障复位 / 重新启动。
-
-第一版事件优先级：
-
-```text
-bus_fault > ALARM > 当前正常工作状态
-```
-
----
-
-## 8. Driver BUS 选择
-
-System Controller 先根据 `sel_id` 选择当前命令源，再根据当前命令的 `BUS_ID` 选择目标 Driver：
+顶层对 8 个 Driver 循环例化，并在每个实例中用固定 `BUS_ID` 与 `cmd_bus_id` 比较：
 
 ```verilog
-assign driver_cmd_valid[n] = cmd_valid && (cmd_bus_id == n);
+assign bus_selected = (cmd_bus_id == BUS_ID);
+assign driver_cmd_valid = cmd_valid && bus_selected;
 assign cmd_ready = driver_cmd_ready[cmd_bus_id];
 ```
 
-Driver 在 `valid && ready` 时锁存本次命令，因此握手后当前命令源可以继续处理下一条事务。
+因此 8 条 BUS 的目标选择由命令自身的 `BUS_ID` 和顶层 generate 路由完成，不由 System Controller 做 BUS 仲裁。
+
+Driver 在 `valid && ready` 时锁存本次命令，因此握手后当前业务模块可以继续处理下一条事务。
+
+### 2.1 业务模块握手原则
+
+Config Manager、Power Sequence Engine、Alarm Handler 等业务模块只以 `valid / ready` 作为命令提交握手。
+
+```text
+valid && ready = 1
+```
+
+表示当前命令已经被目标 Driver 接收。业务模块在握手完成后即可继续后续流程，不需要：
+
+- 等待额外的 `ok / done`；
+- 判断 SPI / BUSY 执行是否成功；
+- 自行处理底层 Driver 错误。
+
+底层事务由 Driver 独立执行；Driver 检测到 `BUSY timeout` 等异常后输出 `bus_fault`，系统级错误由 System Controller 统一锁存和处理，并根据需要向当前业务模块发出 `abort / pause`。
+
+因此业务模块只负责“产生命令并完成握手”，不重复实现底层错误判断和完成确认。
 
 ---
 
-## 9. 各模块连接关系
+## 3. 各模块连接关系
 
 ```mermaid
 flowchart TB
     PC[上位机]
     COMM[通信 / 命令分发]
 
-      SYS[System Controller\n系统状态 / sel_id / BUS选择 / fault锁存]
+      SYS[System Controller\n系统状态 / sel_id / fault锁存]
       CM[Config Manager\n配置]
       PSE[Power Sequence Engine\n全局上下电时序]
       AH[Alarm Handler\n事件触发读取状态]
@@ -218,12 +91,18 @@ flowchart TB
       end
       
       SYS --> CM
-      SYS --> PSE
       SYS --> AH
-      
-      CM --> DRV
-      PSE --> DRV
-      AH --> DRV
+      SYS --> PSE
+ 
+
+      MUX[业务命令 MUX\nsel_id 选择命令源]
+      ROUTE[BUS 路由\ncmd_bus_id == BUS_ID]
+
+      CM --> MUX
+      PSE --> MUX
+      AH --> MUX
+      MUX --> ROUTE
+      ROUTE --> DRV
 
     DEV[128 × AD5560\n8 BUS × 16 Device]
 

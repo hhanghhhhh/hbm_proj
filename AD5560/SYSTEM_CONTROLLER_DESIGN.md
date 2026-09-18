@@ -2,7 +2,7 @@
 
 ## 1. 模块定位
 
-`System Controller` 是 AD5560 子系统的顶层控制状态机，同时负责命令源选择、业务模块选择以及系统级故障处理。
+`System Controller` 是 AD5560 子系统的顶层控制状态机，负责业务模块选择、系统流程控制以及系统级故障处理。
 
 ---
 
@@ -16,6 +16,8 @@
 - 接收 8 路 Driver `bus_fault`，锁存系统 fault 信息；
 - fault 锁存完成后清除 Driver 内部 sticky `bus_fault`；
 - fault 发生时停止当前 Config / Sequence，并进入 `FAULT` 状态。
+
+System Controller 不负责 8 条 BUS 的仲裁或 Driver 选择。当前被选中的业务模块自行输出 `BUS_ID`，顶层公共命令通路根据该 `BUS_ID` 路由到对应 Driver。
 
 第一版不实现复杂公平仲裁、命令队列或乱序调度。
 
@@ -55,7 +57,7 @@ alarm_start      = 1 pulse
 sel_id           = SEL_ALARM
 ```
 
-已经被 Driver 接受的 SPI 事务不取消。Alarm Handler 通过统一命令通路读取对应 BUS 的 Alarm / Fault Status 寄存器。
+已经被 Driver 接受的 SPI 事务不取消。Alarm Handler 输出自己的 `BUS_ID` 和读命令，通过统一命令通路访问对应 BUS 的 Alarm / Fault Status 寄存器。
 
 Alarm 处理期间不再向 Power Sequence Engine 或 Config Manager 返回命令 `ready`，因此它们不会继续派发新事务。`alarm_done` 后若没有系统 fault，再返回被 Alarm 打断前的正常状态。
 

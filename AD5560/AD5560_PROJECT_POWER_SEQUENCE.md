@@ -107,46 +107,15 @@ FPGA 按项目定义的下电顺序和延迟逐路执行，时序控制精度同
 
 ---
 
-## 5. Power Sequence Engine 与 System Controller
+## 5. FPGA 时序执行
 
-`Power Sequence Engine` 只负责按 Power Sequence RAM 产生寄存器事务，不负责系统工作模式或系统级 fault 判断。
+FPGA 根据上位机下发的 Power Sequence 数据执行多路上下电先后关系，时序精度目标约为 `1 ms`。
 
-`System Controller` 提供：
+Power Sequence RTL 模块的 RAM 格式、接口、状态机、pause / abort 等实现约束单独维护在：
 
-```text
-seq_start
-seq_pause
-seq_abort
-```
+- [`POWER_SEQUENCE_ENGINE_DESIGN.md`](./POWER_SEQUENCE_ENGINE_DESIGN.md)
 
-Power Sequence Engine 返回：
-
-```text
-seq_busy
-seq_done
-```
-
-并向 System Controller 输出统一寄存器命令：
-
-```text
-seq_cmd_valid
-seq_cmd_ready
-seq_bus_id[2:0]
-seq_rw
-seq_device_id[3:0]
-seq_reg_addr[6:0]
-seq_wr_data[15:0]
-```
-
-当前记录完成：
-
-```text
-seq_cmd_valid && seq_cmd_ready
-```
-
-握手后即可继续下一条记录，不等待目标 Driver 的 SPI 事务真正执行完成。
-
-不同 BUS 已接受的事务可以在 8 个 Driver 中并行执行；如果当前记录目标 Driver 仍忙，则停在当前记录等待。
+本文不重复 RTL 模块设计细节。
 
 ---
 
@@ -168,59 +137,17 @@ Alarm Handler 完成状态读取后，是否继续 Sequence 或转入故障处�
 
 ---
 
-## 7. bus_fault 处理
+## 7. 故障处理原则
 
-Driver 的 `BUSY timeout` 等执行异常通过 `bus_fault` 上报给 `System Controller`。
+运行过程中发生 AD5560 Alarm 时，FPGA 读取对应状态寄存器进行故障定位，再由系统策略决定是否继续运行。
 
-发生 `bus_fault` 时：
+如果 SPI / BUSY 等底层执行出现系统级异常，则停止当前上下电流程。需要立即关断输出时，可使用全局 `HW_INH` 进入 High-Z，不要求等待正常 Ramp Down 完成。
 
-```text
-System Controller
-      ↓
-锁存 fault_vector
-      ↓
-seq_abort
-      ↓
-进入 FAULT 状态
-```
-
-Power Sequence Engine 收到 `seq_abort` 后立即停止继续派发新的时序记录，并退出 busy 状态。
-
-故障需要立即关断输出时，可由更上层系统策略控制全局 `HW_INH` 进入 High-Z，不要求等待正常 Ramp Down 完成。
+具体状态机和模块接口见 `SYSTEM_CONTROLLER_DESIGN.md` 与 `POWER_SEQUENCE_ENGINE_DESIGN.md`。
 
 ---
 
-## 8. FPGA 实现边界
-
-FPGA 侧主要关系为：
-
-```text
-System Controller
-      │ seq_start / pause / abort
-      ▼
-Power Sequence Engine
-      │ register transaction
-      ▼
-System Controller
-      │ BUS_ID select
-      ▼
-AD5560 Driver × 8
-      │
-      ▼
-SPI Master × 8
-```
-
-其中：
-
-- AD5560 Driver 负责单颗器件的 SPI 事务和 BUSY 时序；
-- Power Sequence Engine 负责多个通道之间的先后顺序和延时；
-- System Controller 负责系统工作状态、Sequence 启停、Alarm 插入处理和系统级 fault；
-- 单路 Ramp 斜率由 AD5560 的 Ramp Step、RCLK Divider 和 RCLK 决定；
-- 多路之间的毫秒级时序由 Power Sequence Engine 的计数器/状态机决定。
-
----
-
-## 9. 当前结论
+## 8. 当前结论
 
 本项目正常上下电统一采用：
 

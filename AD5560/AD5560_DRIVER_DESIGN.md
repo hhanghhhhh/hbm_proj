@@ -39,9 +39,11 @@ AD5560 Driver n
 
 ---
 
-## 3. System Controller 接口
+## 3. 公共命令接口
 
-Driver 直接使用 `valid / ready` 接收寄存器事务：
+Driver 直接使用 `valid / ready` 接收顶层公共命令通路送来的寄存器事务。业务模块只输出目标 `BUS_ID`，顶层 generate 根据固定 `BUS_ID` 选择对应 Driver；Driver 本身不参与跨 BUS 仲裁。
+
+接口：
 
 ```text
 cmd_valid
@@ -158,7 +160,7 @@ Driver 收到清除脉冲后清除本地 sticky fault 并回到空闲状态。
 
 ## 8. 多 BUS 工作方式
 
-系统实例化 8 个独立 `AD5560 Driver`。根据业务模块的 `BUS_ID` 自动选择。
+系统实例化 8 个独立 `AD5560 Driver`。业务模块输出 `BUS_ID`，顶层 generate 中各 Driver 通过固定 `BUS_ID` 比较自动选择。
 
 ```text
 不同 BUS：可以同时执行 SPI 事务
