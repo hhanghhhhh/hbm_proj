@@ -208,51 +208,35 @@ EN_MASK[127:0]         = 8 word
 Channel Parameter Records：
 
 ```text
-CHANNEL_COUNT          = popcount(EN_MASK)
+CHANNEL_COUNT         = 128
 每个有效通道           = 6 word
 
-PARAM_WORDS            = CHANNEL_COUNT × 6
+PARAM_WORDS           = 128 × 6 = 768
 ```
 
 Power-Up / Power-Down Sequence：
 
 ```text
 每个 Step              = 9 word
+上、下电各预留 32 个 step
 
-UP_SEQUENCE_WORDS      = UP_STEP_COUNT × 9
-DOWN_SEQUENCE_WORDS    = DOWN_STEP_COUNT × 9
+UP_SEQUENCE_WORDS      = 32 × 9 = 288
+DOWN_SEQUENCE_WORDS    = 32 × 9 = 288
 ```
 
 因此当前结构的总容量为：
 
 ```text
-TOTAL_WORDS =
-    11
-  + CHANNEL_COUNT × 6
-  + UP_STEP_COUNT × 9
-  + DOWN_STEP_COUNT × 9
-
-TOTAL_BITS  = TOTAL_WORDS × 16
-TOTAL_BYTES = TOTAL_WORDS × 2
+TOTAL_WORDS = 11 + 768 + 288 + 288 = 1355
 ```
 
-有效通道最多 128 个，因此参数区最大：
+因此第一版 RAM 按：
 
 ```text
-MAX_PARAM_WORDS = 128 × 6 = 768 word
-                = 12,288 bit
-                = 1,536 Byte
+1355 × 16 bit
 ```
 
-不计 Sequence 时，Header + EN_MASK + 最大参数区为：
 
-```text
-11 + 768 = 779 word
-          = 12,464 bit
-          = 1,558 Byte
-```
-
-当前 `UP_STEP_COUNT` / `DOWN_STEP_COUNT` 的最大值尚未固定，因此 Power Sequence RAM 的最终深度按实际最大 Step 数代入上式确定。
 
 后续如果 Header、Parameter Record 或 Step 格式发生变化，应同步重新计算本节 RAM 容量。
 
@@ -265,7 +249,6 @@ System Controller 提供流程控制：
 ```text
 seq_start
 seq_mode          // POWER_ON / POWER_OFF
-seq_pause
 seq_abort
 ```
 
@@ -430,21 +413,9 @@ Delay 结束后读取下一 Step。
 
 ---
 
-## 8. pause / abort
+## 8. abort
 
-### 8.1 pause
 
-System Controller 在 Alarm 处理期间置 `seq_pause`。
-
-pause 期间：
-
-- 不派发新的寄存器命令；
-- Delay 计数暂停；
-- 保留当前模式、阶段、Step、target_state 和 pending 状态。
-
-解除 pause 后从原位置继续。
-
-### 8.2 abort
 
 收到 `seq_abort` 后：
 

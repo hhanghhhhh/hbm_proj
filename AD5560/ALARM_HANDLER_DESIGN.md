@@ -88,6 +88,28 @@ DEV0 ~ DEV15
 
 因此“扫描”和“清除”是两个独立流程。
 
+### 4.1 初始化稳定后的预清除
+
+AD5560 上电、量程切换、Clamp / Force / Sense 等配置过程中，模拟状态尚未稳定，可能产生瞬时 Alarm 毛刺。若 Alarm 配置为 Latched 模式，这类瞬时报警会被锁存并一直保持。
+
+因此初始化流程增加一次预清除：
+
+```text
+完成 AD5560 配置
+    ↓
+等待模拟状态稳定
+    ↓
+读取 Alarm Clear (0x44)
+    ↓
+清除初始化 / 配置过程产生的历史 Latched Alarm
+    ↓
+进入正式 RUN 状态
+```
+
+该操作只用于进入正式运行前建立干净的 Alarm 基线，不作为运行阶段的自动清除机制。
+
+进入 RUN 后仍遵循原规则：Alarm 扫描只读 `0x43`，不读 `0x44`；只有收到明确的 Alarm Clear 命令后才执行 `0x44` 清除。
+
 ---
 
 ## 5. Alarm Result RAM
@@ -157,16 +179,6 @@ device_fault_vector[channel_id] = 1
 channel_id = {BUS_ID, DEVICE_ID}
 ```
 
-即：
-
-```text
-device_fault_vector[0]   -> BUS0 / DEV0
-...
-device_fault_vector[15]  -> BUS0 / DEV15
-device_fault_vector[16]  -> BUS1 / DEV0
-...
-device_fault_vector[127] -> BUS7 / DEV15
-```
 
 因此上位机只需要读取：
 
@@ -194,12 +206,6 @@ Header                 = 2 word
 
 ALARM_RAM_WORDS        = 2 + 128 × 2
                        = 258 word
-
-ALARM_RAM_BITS         = 258 × 16
-                       = 4,128 bit
-
-ALARM_RAM_BYTES        = 4,128 / 8
-                       = 516 Byte
 ```
 
 因此第一版 Alarm Result RAM 按：
@@ -208,9 +214,7 @@ ALARM_RAM_BYTES        = 4,128 / 8
 258 × 16 bit
 ```
 
-即可覆盖最坏情况。
 
-`device_fault_vector[127:0]` 为独立寄存器状态，不计入 Result RAM 容量。
 
 后续如果 Alarm Record 格式增加字段，应同步重新计算本节 RAM 容量。
 
@@ -222,7 +226,7 @@ ALARM_RAM_BYTES        = 4,128 / 8
 
 Alarm Clear (0x44) 不与扫描绑定。
 
-在上位机明确下发清除故障命令之前，Alarm Handler 不清除任何器件 Alarm。
+除“初始化稳定后的预清除”外，正式 RUN 阶段在上位机明确下发清除故障命令之前，Alarm Handler 不清除任何器件 Alarm。
 
 清除流程由独立控制命令启动，例如：
 

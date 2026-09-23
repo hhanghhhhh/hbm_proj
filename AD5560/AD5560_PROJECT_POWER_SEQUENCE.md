@@ -125,9 +125,13 @@ AD5560 没有独立的 `RAMP_DONE` 引脚或 Ramp Complete 状态位。
 
 FPGA 采用以下方式管理 Ramp：
 
+```text
 1. 根据 Start Code、End Code、Step、RCLK Divider 和 RCLK 计算预计 Ramp 时间；
 2. 到达预计结束时间后留出必要裕量；
 3. 需要确认时可读回 `FIN DAC x1 (0x08)`，检查是否已经到达 End Code。
+```
+
+一定要确保 ramp 完成，因为 ramp 会被 alarm 打断，很可能报错导致没有完成。紧急下电可不用 ramp 功能。
 
 AD5560 不做后台状态寄存器轮询。
 
