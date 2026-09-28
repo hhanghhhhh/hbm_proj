@@ -117,6 +117,8 @@ SPI 写本身没有 ACK，因此除 BUSY timeout 外，Driver 不判断“寄存
 
 ### 5.1 bus_fault 清除
 
+`reset` 优先于 `bus_fault_clear`。两者同周期有效时按 reset 处理。
+
 `bus_fault` 由 Driver 锁存，不能自动清除。
 
 System Controller 检测到 fault 后先锁存系统级 `fault_vector`，随后向对应 Driver 发：

@@ -267,15 +267,43 @@ seq_busy
 seq_done
 ```
 
-`seq_start` 有效时锁存 `seq_mode`，之后整个流程由 Power Sequence Engine 自主完成。
+仅在 `seq_busy=0` 时接受 `seq_start`。接受启动命令时锁存 `seq_mode`，之后整个流程由 Power Sequence Engine 自主完成。
+
+`seq_busy=1` 期间再次收到 `seq_start` 时直接忽略：
+
+- 不重新启动；
+- 不清除当前进度；
+- 不重新锁存 `seq_mode`；
+- 不产生额外 `seq_done`。
 
 第一版不允许执行过程中切换 `seq_mode`。
 
 ---
 
-## 4. 第一阶段：Ramp 参数装载
+## 4. 启动与空 Sequence 处理
 
-收到 `seq_start` 后，Power Sequence Engine 先根据 `seq_mode` 选择对应方向的 Ramp 参数。
+收到并接受 `seq_start` 后，Power Sequence Engine 根据锁存的 `seq_mode` 选择本次 Step Count：
+
+```text
+POWER_ON  -> UP_STEP_COUNT
+POWER_OFF -> DOWN_STEP_COUNT
+```
+
+如果本方向：
+
+```text
+STEP_COUNT == 0
+```
+
+则本轮 Power Sequence 直接结束：
+
+也就是说，`UP_STEP_COUNT=0` 时 POWER_ON 直接完成，`DOWN_STEP_COUNT=0` 时 POWER_OFF 直接完成。
+
+---
+
+## 5. 第一阶段：Ramp 参数装载
+
+非空 Sequence 收到 `seq_start` 后，Power Sequence Engine 先根据 `seq_mode` 选择对应方向的 Ramp 参数。
 
 POWER_ON 时写：
 
@@ -317,7 +345,7 @@ seq_bus_ready == 8'hFF
 
 ---
 
-## 5. 第二阶段：EN Sequence
+## 6. 第二阶段：EN Sequence
 
 Ramp 参数全部装载完成后，开始执行对应方向的 EN Sequence。
 
@@ -349,7 +377,7 @@ REG_DATA = 16'hFFFF
 
 ---
 
-## 6. 8 BUS pending 调度
+## 7. 8 BUS pending 调度
 
 有效通道的变化按照 8 条物理 BUS 拆成：
 
@@ -391,7 +419,7 @@ available_bus = pending_bus & seq_bus_ready
 
 ---
 
-## 7. Step 完成与 Delay
+## 8. Step 完成与 Delay
 
 一个 Step 的全部 `pending_mask` 清零后，表示该 Step 中所有需要变化的通道都已完成 Ramp Enable 命令握手。
 
@@ -413,9 +441,9 @@ Delay 结束后读取下一 Step。
 
 ---
 
-## 8. abort
+## 9. abort
 
-
+`seq_abort` 优先于正常完成条件。若 `seq_abort` 与 `seq_done` 条件同周期出现，本轮按 abort 处理，不产生 `seq_done`。
 
 收到 `seq_abort` 后：
 

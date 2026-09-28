@@ -51,17 +51,27 @@ Power Sequence Engine 按时序产生寄存器写事务，直到 `seq_done`。
 
 ### 3.3 Alarm
 
-任意 `ALARM[n]` 有效时，System Controller 先锁存报警向量，再启动 `Alarm Handler`：
+任意 `ALARM[n]` 有效时，System Controller 锁存报警向量，终止当前 Config / Sequence，并启动 `Alarm Handler`：
 
 ```text
-alarm_latch[7:0] <- ALARM[7:0]
-alarm_start      = 1 pulse
-sel_id           = SEL_ALARM
+ALARM
+  ↓
+锁存 alarm_vector
+  ↓
+abort 当前业务
+  ↓
+Alarm Handler 扫描并定位故障 Device
+  ↓
+alarm_done
+  ↓
+进入 FAULT_HANDLE
 ```
 
-已经被 Driver 接受的 SPI 事务不取消。Alarm Handler 输出自己的 `BUS_ID` 和读命令，通过统一命令通路访问对应 BUS 的 Alarm / Fault Status 寄存器。
+Alarm 扫描阶段只读取状态，不清除 Alarm。
 
-Alarm 处理期间不再向 Power Sequence Engine 或 Config Manager 返回命令 `ready`，因此它们不会继续派发新事务。`alarm_done` 后若没有系统 fault，再返回被 Alarm 打断前的正常状态。
+进入 `FAULT_HANDLE` 后根据实际故障执行后续处理；具体处理策略后续确定。故障处理完成后，再单独启动 Alarm Clear。
+
+Alarm 发生后不恢复被中断的 Config / Power Sequence。
 
 ---
 
@@ -100,7 +110,21 @@ driver_fault_clear[7:0]
 
 只用于清除 Driver 内部 sticky fault。**清除 Driver fault 不代表系统故障恢复。**
 
-System Controller 自己锁存的 `fault_vector_latched` 在 `FAULT` 状态继续保留，直到收到上位机明确的故障复位 / 重新启动命令。
+System Controller 自己锁存的 `fault_vector_latched` 在 `FAULT` 状态继续保留。
+
+系统故障恢复使用独立 `fault_reset` 命令，仅在 `FAULT` 状态有效：
+
+```text
+fault_reset
+  ↓
+等待全部 Driver ready
+  ↓
+清除 fault_vector_latched
+  ↓
+进入 IDLE
+```
+
+恢复后不直接进入 `READY`，也不自动继续故障前的 Config / Sequence；后续流程由上位机重新发起。
 
 fault 发生时应同时向正在运行的功能模块发出：
 

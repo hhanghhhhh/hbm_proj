@@ -234,7 +234,9 @@ ALARM_RAM_WORDS        = 2 + 128 × 2
 
 Alarm Clear (0x44) 不与扫描绑定。
 
-除“初始化稳定后的预清除”外，正式 RUN 阶段在上位机明确下发清除故障命令之前，Alarm Handler 不清除任何器件 Alarm。
+正式运行阶段发生 Alarm 后，先完成扫描并保存故障信息，然后进入系统 `FAULT_HANDLE`。故障处理完成前不清除 Alarm。
+
+只有故障处理完成并收到独立清除命令后，Alarm Handler 才执行 Alarm Clear。
 
 清除流程由独立控制命令启动，例如：
 
@@ -307,5 +309,11 @@ alarm_result_rd_data[15:0]
 ```
 
 运行扫描或清除流程期间，不允许上位机改写 Result RAM。
+
+### 7.1 abort 优先级
+
+`alarm_abort` 优先于 `alarm_done`。若同周期出现，按 abort 处理，不产生 `alarm_done`。
+
+若 Alarm Handler 正在等待 `rsp_valid` 时收到 `alarm_abort`，立即退出当前流程并回到 IDLE；已经提交给 Driver 的读事务不撤销，之后晚到的 `rsp_valid` 直接忽略。
 
 

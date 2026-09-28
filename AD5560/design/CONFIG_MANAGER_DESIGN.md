@@ -85,6 +85,8 @@ cfg_bus_ready[7:0]
 其中：
 
 - `cfg_start` 为单 clk 启动脉冲；
+- 仅在 `cfg_busy=0` 时接受 `cfg_start`；
+- `cfg_busy=1` 期间再次收到 `cfg_start` 时直接忽略，不重新启动、不重置当前进度，也不产生额外 `cfg_done/cfg_error`；
 - `cfg_abort` 为系统故障或其他上层原因导致的终止信号；
 - `cfg_busy` 表示配置流程尚未真正结束；
 - 全部配置记录完成 `valid / ready` 握手后，Config Manager 不再派发新命令；
@@ -114,6 +116,20 @@ Config Manager 按 Config RAM 顺序产生单路命令流。
 
 第一版不做乱序调度或跳过当前记录。
 
+### 4.1 空配置表
+
+如果接受 `cfg_start` 时：
+
+```text
+cfg_record_count == 0
+```
+
+则本轮没有任何配置记录需要执行，Config Manager 直接结束本轮流程。
+
+空配置表不需要等待 `cfg_bus_ready == 8'hFF`，因为本轮配置没有向 Driver 提交任何事务。
+
+### 4.2 正常配置表
+
 最后一条配置记录完成 `valid / ready` 握手后，不立即产生 `cfg_done`，而是进入完成等待阶段：
 
 ```text
@@ -134,8 +150,8 @@ cfg_busy = 0
 
 ## 5. abort 处理
 
-系统 fault 由 `System Controller` 统一判断。发生系统 fault 时 Config Manager 停止继续派发。
+`cfg_abort` 优先于正常完成条件。若 `cfg_abort` 与 `cfg_done` 条件同周期出现，本轮按 abort 处理，不产生 `cfg_done`。
 
-已经完成握手并交给 Driver 的事务不取消，由对应 Driver 自行结束。
+收到 `cfg_abort` 后停止继续派发；已经完成握手并交给 Driver 的事务不取消，由对应 Driver 自行结束。
 
 
