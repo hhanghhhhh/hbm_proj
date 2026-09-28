@@ -40,20 +40,10 @@ REG_DATA   16 bit
 
 ### 2.2 RAM 容量计算
 
-每条 Config Record 使用 1 个 32-bit word，因此：
+每条 Config Record 使用 1 个 32-bit word，实际需要保存 1024 条配置记录，则所需容量为：
 
 ```text
-CONFIG_RAM_WORDS = MAX_CONFIG_RECORDS
-CONFIG_RAM_BITS  = MAX_CONFIG_RECORDS × 32
-CONFIG_RAM_BYTES = MAX_CONFIG_RECORDS × 4
-```
-
-当前文档尚未固定 `MAX_CONFIG_RECORDS`，RTL 实现时按实际需要的最大配置记录数确定 RAM 深度。
-
-例如实际需要保存 N 条配置记录，则所需容量为：
-
-```text
-N × 32 bit = N × 4 Byte
+1024 × 32 bit
 ```
 
 后续如果 Config Record 格式或最大记录数发生变化，应同步重新计算本节 RAM 容量。
@@ -86,15 +76,33 @@ cfg_done
 cfg_error
 ```
 
+另外，顶层将 8 个 Driver 的 `cmd_ready` 状态汇总提供给 Config Manager：
+
+```text
+cfg_bus_ready[7:0]
+```
+
 其中：
 
 - `cfg_start` 为单 clk 启动脉冲；
 - `cfg_abort` 为系统故障或其他上层原因导致的终止信号；
-- `cfg_busy` 表示正在派发配置记录；
-- `cfg_done` 表示全部配置记录已经完成握手并提交给下游；
+- `cfg_busy` 表示配置流程尚未真正结束；
+- 全部配置记录完成 `valid / ready` 握手后，Config Manager 不再派发新命令；
+- 随后等待 `cfg_bus_ready == 8'hFF`，确认所有 Driver 均已完成最后一批 SPI / BUSY 流程并恢复可接收状态；
+- 只有在上述条件满足后才产生 `cfg_done`；
 - `cfg_error` 表示本次配置被 `cfg_abort` 终止。
 
-SPI 写本身没有 ACK，因此 Config Manager 不等待逐条写事务完成，也不维护逐条配置结果。
+因此 `cfg_done` 的语义为：
+
+```text
+全部配置记录已提交
++
+所有 Driver 已恢复 ready
+=
+本轮配置流程真正完成
+```
+
+SPI 写本身没有 ACK，因此 Config Manager 不等待每一条写事务逐条返回结果，也不维护逐条配置结果；仅在全部记录提交完成后增加一次全局完成屏障。
 
 ---
 
@@ -105,6 +113,22 @@ Config Manager 按 Config RAM 顺序产生单路命令流。
 配置记录仍按 RAM 顺序派发，但不同 BUS 的实际 SPI 事务可以重叠执行。
 
 第一版不做乱序调度或跳过当前记录。
+
+最后一条配置记录完成 `valid / ready` 握手后，不立即产生 `cfg_done`，而是进入完成等待阶段：
+
+```text
+最后一条 Record 完成握手
+    ↓
+停止派发新配置命令
+    ↓
+等待 cfg_bus_ready == 8'hFF
+    ↓
+cfg_done = 1 pulse
+    ↓
+cfg_busy = 0
+```
+
+这样可保证 System Controller 进入 `READY` 时，不存在尚未结束的配置 SPI / BUSY 事务。
 
 ---
 

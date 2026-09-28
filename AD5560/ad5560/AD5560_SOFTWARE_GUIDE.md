@@ -1,14 +1,6 @@
 # AD5560 FPGA 控制与寄存器使用指南
 
-## 1. 文档目的
 
-本文面向使用 FPGA 控制 AD5560 的开发人员，从“如何通过数字接口控制器件”的角度整理 AD5560 Rev.F 数据手册中的主要内容。
-
-本文主要依据 Analog Devices **AD5560 Rev.F Data Sheet** 整理。模拟外围、电源轨、PCB、散热和外部补偿元件等仍应以原始数据手册为最终依据。
-
-> 本文重点是 AD5560 自身机理和 FPGA 控制接口。已有的 [`AD5560_CONTROL.md`](./AD5560_CONTROL.md) 更侧重 DUT 上下电、`SW_INH/HW_INH`、Slew Rate、Ramp 和 LOAD 时序。
-
----
 
 ## 2. AD5560 是什么
 
@@ -35,56 +27,6 @@ AD5560 是一颗单通道可编程 DPS（Device Power Supply），主要用于 A
 
 AD5560 **没有内部 ADC 把实际电压/电流直接转换为数字码**。实际测量值主要从模拟 `MEASOUT` 输出，再由系统外部 ADC 采样并送回 FPGA。
 
----
-
-## 3. FPGA 控制时首先要理解的几个概念
-
-### 3.1 Force 与 Measure 是两条不同路径
-
-Force 路径负责输出：
-
-```text
-FIN DAC -> Force Amplifier -> FORCE / EXTFORCE -> DUT
-```
-
-Measure 路径负责观测：
-
-```text
-DUT / SENSE / Current Sense
-        -> Measure MUX
-        -> MEASOUT
-        -> 外部 ADC
-        -> FPGA
-```
-
-因此：
-
-- 写 FIN DAC 只改变目标输出值；
-- 选择 MEASOUT 不改变 Force DAC；
-
-### 3.2 Current Range 不只是“测量量程”
-
-`DPS Register 1` 中的 `I[2:0]` 会选择实际工作的输出/测流通道。
-
-| I[2:0] | Current Range |
-|---:|---|
-| 0 | ±5 µA |
-| 1 | ±25 µA |
-| 2 | ±250 µA |
-| 3 | ±2.5 mA |
-| 4 | ±25 mA |
-| 5 | External Range 2，最高约 ±500 mA |
-| 6 | External Range 1，最高约 ±1.2 A |
-| 7 | Reserved |
-
-前 5 档使用片内 Sense Resistor，高电流两档使用外部 Sense Resistor。
-
-量程变化会同时影响：
-
-- 实际输出路径；
-- 电流测量换算；
-- Comparator 阈值组；
-- Clamp 和稳定性设计。
 
 ---
 
@@ -362,59 +304,6 @@ DAC `x2` 不支持 Readback。
 | `0x44` | Alarm + Clear | 读取并清 Latched Alarm |
 | `0x45~0x4A` | VSENSE CPL/CPH | 电压比较器阈值及校正 |
 
----
-
-
-## 11. FORCE / EXTFORCE / SENSE / DUTGND 等引脚
-
-这几个引脚功能不同，不能简单理解成“只接 FORCE 和 SENSE 就够了”。
-
-### 11.1 FORCE
-
-`FORCE` 是 **片内五档电流量程**的 Force 输出。
-
-
-
-### 11.2 EXTFORCE1 / EXTFORCE2
-
-
-```text
-EXTFORCE1 -> 最大约 ±1.2 A
-EXTFORCE2 -> 最大约 ±500 mA
-```
-
-高电流档需要配合外部 Sense Resistor 和对应的外部测流引脚。
-
-### 11.3 SENSE
-
-`SENSE` 是 DUT 电压 Kelvin Sense 输入。
-
-
-
-### 11.4 DUTGND
-
-`DUTGND` 表示 DUT 实际地电位，是 AD5560 的 DUT Ground Reference / Kelvin Ground 节点，而不是简单等同于板上的 AGND。
-
-对于远端 DUT、Probe Card、较大电流回路，应考虑 DUTGND 走线压降及 DUTGND Kelvin Alarm。
-
-### 11.5 SYS_FORCE / SYS_SENSE
-
-- `SYS_FORCE`：外部 System PMU 的 Force 信号输入；
-- `SYS_SENSE`：把本通道 SENSE 节点送给外部 System PMU。
-
-用于系统 PMU 校准和额外测量。普通 DUT 供电不需要它们。
-
-### 11.6 GUARD / SYS_DUTGND
-
-`GUARD/SYS_DUTGND` 为复用引脚：
-
-- Guard 模式：Guard Amplifier 输出，用于高阻/低电流测量时驱动线缆屏蔽层，减小绝缘漏电；
-- SYS_DUTGND 模式：把 DUTGND 节点送到 System PMU。
-
-使用 SYS_DUTGND 时必须把 Guard Amplifier 设置为 High-Z。
-
-
-
 
 ---
 
@@ -437,28 +326,6 @@ TMPALM -> Temperature Alarm
 `KELALM` 内部可以由 OSALM、DUTALM、GRDALM 共同产生。
 
 多个 AD5560 的 Alarm 可以 wired-OR，再由 FPGA 扫描各器件 `0x43` 定位。
-
----
-
-## 17. Alarm Setup Register `0x06`
-
-可以分别配置 TMPALM、OSALM、DUTALM、CLALM、GRDALM 是否映射到外部 pin，以及是否 Latched。
-
-即使某类 Alarm 不输出到硬件 pin，其状态仍可从 `0x43/0x44` 读取。
-
----
-
-## 18. Alarm Status `0x43 / 0x44`
-
-`0x43` 只读状态，不清 Latched Alarm；`0x44` 读取并清除 Latched Alarm。
-
-Alarm bit 是 Active-Low 语义：
-
-```text
-0 = Alarm
-1 = No Alarm
-```
-
 
 
 ---
@@ -522,17 +389,6 @@ Selected Diode D- -> AGND
 | 普通 TSENSE | MEASOUT | 普通 die temperature 监测 |
 | Shutdown Sensor / VPTAT | 内部保护；诊断时可到 MEASOUT | 过温保护、功率级诊断 |
 | Thermal Diode Array | GPO + AGND | 多点热点/温度梯度测量 |
-
----
-
-## 21. Compensation
-
-Force Amplifier 有 Safe Mode、Auto Compensation 和 Manual Compensation 三种补偿方式。
-
-Auto Compensation `0x04` 根据 CDUT / ESR 选择内部补偿组合；Manual Compensation `0x05` 可以直接配置 gm、RP、RZ、CF、CC 等参数。
-
-补偿直接影响稳定性、过冲和建立时间。
-
 
 
 ---

@@ -1,17 +1,6 @@
 # AD5560 控制与上电时序说明
 
-## 1. 文档目的
 
-本文整理 AD5560 在 DUT 供电场景下与输出控制、上下电、电压变化和多器件同步相关的器件机理。
-
-本文属于 **AD5560 器件控制手册说明**，用于描述芯片本身提供的各种控制机制，不限定具体项目必须采用其中哪一种方案。
-
-项目级设计文档应根据实际 DUT 的电源时序、斜率和故障处理要求，从本文描述的机制中选择最终方案，并只保留项目真正采用的控制流程。
-
-本文只描述 AD5560 自身控制相关内容，不讨论其他电源方案。
-
-
----
 
 ## 3. FIN DAC、SW_INH 与 HW_INH
 
@@ -35,11 +24,9 @@
 
 ## 4. High-Z 与主动输出 0 V
 
-这是理解 AD5560 上下电和 Ramp 时非常重要的区别。
 
 ### 4.1 High-Z
 
-当：
 
 ```text
 SW_INH = 0 或 HW _INH = 0
@@ -50,7 +37,6 @@ Force Amplifier 被禁止，DUT 端相当于高阻。
 
 ### 4.2 主动输出 0 V
 
-当：
 
 ```text
 SW_INH = 1
@@ -145,92 +131,6 @@ AD5560 标称 Force Voltage span 为约 `25 V`，额外的模拟增益用于给�
 
 `5.125` 本身固定，不能通过寄存器关闭或修改；有效数字增益由 `m` register 另外控制。
 
-### 5.3 x1 -> x2：Calibration Engine
-
-DAC 数字校准公式为：
-
-
-```text
-x2 = x1 x (m + 1) / 65536 + (c - 32768)
-```
-
-其中：
-
-| 参数 | 含义 | 默认值 |
-|---|---|---:|
-| `x1` | 写入 FIN DAC input register 的 16-bit code | `0x8000` |
-| `m` | Gain Correction | `0xFFFF` |
-| `c` | Offset Correction | `0x8000` |
-| `x2` | Calibration Engine 计算后送入实际 DAC 的 code | 内部值 |
-
-默认：
-
-```text
-m = 0xFFFF -> (m + 1) / 65536 = 1
-c = 0x8000 -> c - 32768 = 0
-```
-
-因此默认情况下：
-
-```text
-x2 = x1
-```
-
-
-### 5.4 x2 -> Force 电压
-
-Force DAC 的转换关系为：
-
-
-```text
-VFORCE = (5.125 x VREF / 65536) x (x2 - OFFSET_DAC_CODE)
-       + DUTGND
-```
-
-这里：
-
-- `x2` 是经过 `m/c` Calibration Engine 后的 FIN DAC code；
-- `OFFSET_DAC_CODE` 是独立 Offset DAC 的 code，用于平移 Force/Clamp/Comparator 等 DAC 的工作窗口；
-- `DUTGND` 是整个 DUT 电压的参考基准。
-
-
-### 5.5 c register 与 Offset DAC 的区别
-
-作用位置不同，c 只能改变 code X2 的值，不影响 DAC 的输出范围，offset 影响实际输出范围：
-
-```text
-c register
-    -> Calibration Engine 内部的数字 offset correction
-    -> 直接修正 x1 -> x2
-
-Offset DAC
-    -> 独立的 16-bit DAC
-    -> 用于整体移动约 25 V 的 Force 输出窗口
-```
-
-
-### 5.6 默认直接更新时序
-
-默认没有启用外部 LOAD 延迟更新时，写入新的 `x1` 后：
-
-```text
-Write FIN x1
-    |
-    v
-Calibration Engine 计算 x2
-    |
-    | BUSY = Low
-    v
-x2 Ready
-    |
-    | BUSY -> High
-    v
-Actual DAC 更新
-```
-
-因此“FIN DAC 写入后直接更新”更准确的说法是：
-
-> 在默认直接更新模式下，写 `x1` 会触发 Calibration Engine；计算完成后新的 `x2` 自动更新到实际 DAC，并不是 SPI 帧结束瞬间模拟输出立即变化。
 
 ---
 
@@ -438,42 +338,6 @@ Ramp Enable 后通常需要约：
 才开始实际更新，如果不同 device 使用不同 RCLK 需要考虑该延迟，因为 Divider = 255 时延迟还挺大的。
 
 
----
-
-## 7. 两类典型电压控制场景
-
-AD5560 的控制可以先按两类场景理解。
-
-### 7.1 场景 A：High-Z / 下电状态 -> 工作电压
-
-
-#### 方法 A：预设目标 FIN + HW_INH/SW_INH + Slew Rate
-
-
-适合 Slew Rate 范围本身能够满足 DUT 要求的情况。
-
-#### 方法 B：先进入主动起始电压，再用 Ramp Function
-
-
-适合需要远慢于 Programmable Slew Rate、并要求斜率由数字 Step/RCLK 明确控制的情况。
-
-需要注意：
-
-> `High-Z -> 主动 0 V` 这一段本身不属于 Ramp Function。
-
-
-### 7.2 场景 B：已经在线输出 V1 -> V2
-
-
-#### 方法 A：直接写新的 FIN DAC + Slew Rate
-
-
-适合普通在线电压调整。
-
-#### 方法 B：Ramp Function
-
-
-这通常是 Ramp Function 最直接的使用方式，因为 Force Amplifier 已经处于工作状态。
 
 ---
 
@@ -805,29 +669,7 @@ Manual 模式下设置 `0x05[15] = 1`，由软件直接设置 gm、RZ、RP、CF�
 
 量产时可以针对不同 DUT / Range 固化不同 Manual Compensation Profile。
 
-### 14.5 推荐使用流程
 
-开发阶段建议按以下流程使用：
-
-```text
-上电 / Reset
-    ↓
-Safe Mode
-    ↓
-完成 Range、Force 等基础配置
-    ↓
-根据已知 DUT C / ESR 切换 Auto
-    ↓
-验证阶跃、Ramp、过冲和负载瞬态
-    ↓
-必要时读取 0x05 查看 Auto 结果
-    ↓
-继续使用 Auto
-或
-固化为经过验证的 Manual Profile
-```
-
-补偿参数属于闭环的一部分，正常情况下不建议在 DUT 已处于高电压、大电流工作状态时随意切换 Safe / Auto / Manual。优先在 High-Z 或安全低电压状态完成补偿切换，再进入正常输出或 Ramp。
 
 ### 14.6 GANG 模式
 

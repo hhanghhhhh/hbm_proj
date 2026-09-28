@@ -50,25 +50,40 @@ assign cmd_ready = driver_cmd_ready[cmd_bus_id];
 
 因此 8 条 BUS 的目标选择由命令自身的 `BUS_ID` 和顶层 generate 路由完成，不由 System Controller 做 BUS 仲裁。
 
-Driver 在 `valid && ready` 时锁存本次命令，因此握手后当前业务模块可以继续处理下一条事务。
+Driver 在 `valid && ready` 时锁存本次命令。对于写事务，业务模块握手后可继续处理后续独立命令；对于读事务，若后续流程依赖读回结果，则必须等待 `rsp_valid` 后再继续。
 
 ### 2.1 业务模块握手原则
 
-Config Manager、Power Sequence Engine、Alarm Handler 等业务模块只以 `valid / ready` 作为命令提交握手。
+Config Manager、Power Sequence Engine、Alarm Handler 等业务模块统一使用 `valid / ready` 完成命令提交。
 
 ```text
 valid && ready = 1
 ```
 
-表示当前命令已经被目标 Driver 接收。业务模块在握手完成后即可继续后续流程，不需要：
+表示当前命令已经被目标 Driver 接收。Driver 在握手后锁存命令参数并独立执行底层 SPI / BUSY 流程。
 
-- 等待额外的 `ok / done`；
-- 判断 SPI / BUSY 执行是否成功；
-- 自行处理底层 Driver 错误。
+对于**写事务**：
 
-底层事务由 Driver 独立执行；Driver 检测到 `BUSY timeout` 等异常后输出 `bus_fault`，系统级错误由 System Controller 统一锁存和处理，并根据需要向当前业务模块发出 `abort / pause`。
+- `valid / ready` 握手完成即表示该写命令已经提交；
+- 业务模块不等待额外的 `ok / done`；
+- 业务模块不判断 SPI / BUSY 是否执行成功；
+- Driver 检测到 `BUSY timeout` 等异常后输出 `bus_fault`，由 System Controller 统一处理。
 
-因此业务模块只负责“产生命令并完成握手”，不重复实现底层错误判断和完成确认。
+对于**读事务**：
+
+- `valid / ready` 仅表示读命令已经提交给 Driver；
+- Driver 内部完成 AD5560 两帧 readback 流程；
+- 业务模块必须等待 `rsp_valid`，并在 `rsp_valid` 有效时取得 `rsp_rd_data`；
+- 任何依赖读回数据的后续流程，只能在收到 `rsp_valid` 后继续。
+
+因此：
+
+```text
+WRITE : valid/ready = 命令提交完成，业务模块可继续派发后续独立命令
+READ  : valid/ready = 读命令提交完成，rsp_valid = 读结果返回完成
+```
+
+底层错误仍由 Driver 和 System Controller 统一处理，业务模块不重复实现底层错误判断。
 
 ---
 

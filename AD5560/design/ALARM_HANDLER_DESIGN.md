@@ -29,6 +29,8 @@ Alarm Handler
 
 Alarm Handler 在 `alarm_start` 时锁存本轮 `alarm_vector`，本轮扫描只依据锁存值执行，不根据实时 ALARM 电平提前停止。
 
+Alarm Status 属于读事务，因此 `cmd_valid && cmd_ready` 仅表示读命令已经提交。Alarm Handler 必须等待 Driver 返回 `rsp_valid`，在读结果有效后才能判断状态并继续扫描下一颗 Device。
+
 基本流程：
 
 ```text
@@ -42,9 +44,15 @@ FAULT_COUNT = 0
     ↓
 每个报警 BUS 固定扫描 DEV0 ~ DEV15
     ↓
-读取 Alarm Status
+提交 Alarm Status 读命令
+    ↓
+等待 rsp_valid
+    ↓
+读取 rsp_rd_data
     ↓
 status != 0 → 写 Result RAM
+    ↓
+继续下一颗 Device
     ↓
 全部报警 BUS 扫描完成
     ↓
@@ -250,7 +258,9 @@ Result RAM 继续保留详细的 Alarm Status，`device_fault_vector` 负责快�
 
 这样不需要重新扫描全部 Device，也不会清除未记录的器件状态。
 
-清除完成后产生：
+Alarm Clear (0x44) 本身也是读事务。每次 Clear 命令完成 `valid / ready` 握手后，Alarm Handler 仍需等待对应的 `rsp_valid`，确认该次 read/clear transaction 已完成；读回数据本身可以忽略。
+
+全部目标 Device 的 Clear transaction 均收到 `rsp_valid` 后产生：
 
 ```text
 alarm_clear_done

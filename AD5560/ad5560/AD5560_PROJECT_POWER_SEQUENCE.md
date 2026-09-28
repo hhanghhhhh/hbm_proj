@@ -1,17 +1,6 @@
 # AD5560 项目上下电时序方案
 
-## 1. 文档目的
 
-本文只定义本项目采用的 AD5560 上下电方案。
-
-AD5560 的器件机理、寄存器说明、`LOAD`、`SW_INH/HW_INH`、Alarm、Calibration Engine 等详细内容见：
-
-- [`AD5560_CONTROL.md`](./AD5560_CONTROL.md)
-- [`AD5560_SOFTWARE_GUIDE.md`](./AD5560_SOFTWARE_GUIDE.md)
-
-本文不重复这些通用说明。
-
----
 
 ## 2. 已确定方案
 

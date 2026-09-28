@@ -34,7 +34,9 @@ cfg_start = 1 pulse
 sel_id    = SEL_CONFIG
 ```
 
-Config Manager 完成全部配置记录派发并返回 `cfg_done` 后进入 `READY`。
+Config Manager 完成全部配置记录派发，并等待 8 个 Driver 全部恢复 `ready` 后返回 `cfg_done`。System Controller 收到该 `cfg_done` 后进入 `READY`。
+
+因此进入 `READY` 时，可以认为本轮配置涉及的最后一批 SPI / BUSY 事务已经全部结束。
 
 ### 3.2 Sequence
 
