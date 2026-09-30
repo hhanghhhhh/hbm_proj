@@ -34,7 +34,9 @@ cfg_start = 1 pulse
 sel_id    = SEL_CONFIG
 ```
 
-Config Manager 完成全部配置记录派发，并等待 8 个 Driver 全部恢复 `ready` 后返回 `cfg_done`。System Controller 收到该 `cfg_done` 后进入 `READY`。
+通信模块负责在此之前完成 Config RAM CRC 校验，只有校验通过才向 System Controller 发配置启动请求。System Controller 不接收也不判断 CRC 结果。
+
+Config Manager 完成全部配置记录派发，并等待 8 个 Driver 全部恢复 `ready` 后返回 `cfg_done`。System Controller 收到 `cfg_done` 后进入 `READY`。
 
 因此进入 `READY` 时，可以认为本轮配置涉及的最后一批 SPI / BUSY 事务已经全部结束。
 

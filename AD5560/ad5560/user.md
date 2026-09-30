@@ -1,10 +1,11 @@
 ## AD5560
 
-1. 对于上位机不显示 bus，上位机下发 0 - 127，fpga 自己分配 bus + device_id
-2. 指令：开始配置某个，开始配置全部（支持 8 条并行配置），开始上电
+### 代码待做
 
-再开始细节，各模块的接口设计。
 
+
+
+### CPO 告警
 
 CLH/CLL 是用来设置限流 current clamp 的
 CPL/CPH 这个是 Comparator（比较器），仅用来告警，不限制电流，告警信号通过 CPOH/CPOL/CPO 指示。

@@ -50,9 +50,10 @@ assign cmd_ready = driver_cmd_ready[cmd_bus_id];
 
 因此 8 条 BUS 的目标选择由命令自身的 `BUS_ID` 和顶层 generate 路由完成，不由 System Controller 做 BUS 仲裁。
 
+
 Driver 在 `valid && ready` 时锁存本次命令。对于写事务，业务模块握手后可继续处理后续独立命令；对于读事务，若后续流程依赖读回结果，则必须等待 `rsp_valid` 后再继续。
 
-### 2.1 业务模块握手原则
+### 2.2 业务模块握手原则
 
 Config Manager、Power Sequence Engine、Alarm Handler 等业务模块统一使用 `valid / ready` 完成命令提交。
 

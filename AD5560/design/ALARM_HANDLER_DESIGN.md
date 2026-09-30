@@ -100,14 +100,16 @@ DEV0 ~ DEV15
 
 AD5560 上电、量程切换、Clamp / Force / Sense 等配置过程中，模拟状态尚未稳定，可能产生瞬时 Alarm 毛刺。若 Alarm 配置为 Latched 模式，这类瞬时报警会被锁存并一直保持。
 
-因此初始化流程增加一次预清除：
+因此初始化流程增加一次全清：
 
 ```text
 完成 AD5560 配置
     ↓
 等待模拟状态稳定
     ↓
-读取 Alarm Clear (0x44)
+alarm_clear_start + alarm_clear_all
+    ↓
+全部 128 颗依次读取 Alarm Clear (0x44)
     ↓
 清除初始化 / 配置过程产生的历史 Latched Alarm
     ↓
@@ -122,109 +124,41 @@ AD5560 上电、量程切换、Clamp / Force / Sense 等配置过程中，模拟
 
 ## 5. Alarm Result RAM
 
-Alarm Handler 内部保存一块 Result RAM。
+Result RAM 使用 `258 × 16 bit`，地址以 16-bit word 为单位。
 
-第一版采用：
+### 5.1 总体布局
 
-```text
-word 0 : FAULT_COUNT
-word 1 : ALARM_BUS_VECTOR
+| 区域 | 地址 / 格式 | 说明 |
+|---|---|---|
+| Header | word 0 | `FAULT_COUNT`，本轮有效 Fault Record 数 |
+|  | word 1 | `ALARM_BUS_VECTOR[7:0]`，本轮启动时锁存的 BUS 报警向量 |
+| Fault Record | word 2 开始 | 每个有效故障 Device 占 2 word |
 
-word 2 : Record0 ID
-word 3 : Record0 ALARM_STATUS
+### 5.2 Record 格式
 
-word 4 : Record1 ID
-word 5 : Record1 ALARM_STATUS
-...
-```
+| word offset | 内容 |
+|---:|---|
+| +0 | Record ID：`[6:4] BUS_ID`，`[3:0] DEVICE_ID`，其余保留 |
+| +1 | `ALARM_STATUS[15:0]` |
 
-### 5.1 Header
-
-`FAULT_COUNT` 表示本轮扫描实际发现多少颗有报警状态的 Device。
-
-`ALARM_BUS_VECTOR` 保存本轮 `alarm_start` 时锁存的 BUS 报警向量，低 8 bit 有效。
-
-每次新的扫描开始时：
-
-```text
-FAULT_COUNT = 0
-write_ptr   = Record0
-device_fault_vector[127:0] = 0
-```
-
-不需要清空整块 Result RAM，`FAULT_COUNT` 决定有效 Record 数量。
-
-### 5.2 Record
-
-每个有效故障 Device 占 2 个 16-bit word：
-
-```text
-Record ID:
-[15:7] Reserved
-[6:4]  BUS_ID
-[3:0]  DEVICE_ID
-
-Record Status:
-[15:0] ALARM_STATUS
-```
-
-只有：
-
-```text
-ALARM_STATUS != 0
-```
-
-时才写入一条 Record，并：
+仅当 `ALARM_STATUS != 0` 时生成一条 Record，并：
 
 ```text
 FAULT_COUNT++
-device_fault_vector[channel_id] = 1
+device_fault_vector[{BUS_ID, DEVICE_ID}] = 1
 ```
 
-其中：
+新的 `alarm_start` 会清零 `FAULT_COUNT`、写指针和 `device_fault_vector`；无需清空整块 RAM，`FAULT_COUNT` 决定有效 Record 数。
+
+上位机只需读取 Header 和 `FAULT_COUNT` 条 Record。
+
+容量最坏为：
 
 ```text
-channel_id = {BUS_ID, DEVICE_ID}
+2 + 128×2 = 258 word
 ```
 
-
-因此上位机只需要读取：
-
-```text
-FAULT_COUNT
-FAULT_COUNT × Record
-```
-
-不需要读取全部 128 个 Device 的结果。
-
-最坏情况下 128 个 Device 全部有报警：
-
-```text
-2 + 128 × 2 = 258 个 16-bit word
-```
-
-### 5.3 RAM 容量计算
-
-Alarm Result RAM 固定按最坏情况支持 128 个 Device 全部产生故障记录：
-
-```text
-Header                 = 2 word
-每个 Fault Record      = 2 word
-最大 Fault Record 数   = 128
-
-ALARM_RAM_WORDS        = 2 + 128 × 2
-                       = 258 word
-```
-
-因此第一版 Alarm Result RAM 按：
-
-```text
-258 × 16 bit
-```
-
-
-
-后续如果 Alarm Record 格式增加字段，应同步重新计算本节 RAM 容量。
+因此使用 `258 × 16 bit` 即可。后续 Record 格式增加字段时应同步重新计算容量。
 
 公共寄存器读写接口和握手规则统一参考 `AD5560_DRIVER_DESIGN.md`。
 
@@ -232,43 +166,64 @@ ALARM_RAM_WORDS        = 2 + 128 × 2
 
 ## 6. 独立 Alarm Clear 流程
 
-Alarm Clear (0x44) 不与扫描绑定。
-
-正式运行阶段发生 Alarm 后，先完成扫描并保存故障信息，然后进入系统 `FAULT_HANDLE`。故障处理完成前不清除 Alarm。
-
-只有故障处理完成并收到独立清除命令后，Alarm Handler 才执行 Alarm Clear。
-
-清除流程由独立控制命令启动，例如：
+Alarm Clear (0x44) 不与扫描绑定，由以下两个输入共同定义：
 
 ```text
 alarm_clear_start
+alarm_clear_all
 ```
 
-第一版 Alarm Clear 可直接根据 `device_fault_vector[127:0]` 选择需要清除的 Device：
+启动时锁存 `alarm_clear_all`，本轮 Clear 过程中不再受输入变化影响。
+
+两种模式：
 
 ```text
-device_fault_vector
-    ↓
-扫描置 1 bit
-    ↓
-得到 BUS_ID + DEVICE_ID
-    ↓
-执行对应 Device 的 Alarm Clear
+alarm_clear_all = 0
+    → 根据最近一次 device_fault_vector 选择目标
+    → 用于运行期故障处理后的定向清除
+
+alarm_clear_all = 1
+    → DEV0~127 全部清除
+    → 用于初始化稳定后的预清除
 ```
 
-Result RAM 继续保留详细的 Alarm Status，`device_fault_vector` 负责快速定位和清除目标选择。
+运行期正常流程：
 
-这样不需要重新扫描全部 Device，也不会清除未记录的器件状态。
+```text
+ALARM
+  ↓
+Scan 0x43
+  ↓
+device_fault_vector
+  ↓
+故障处理
+  ↓
+alarm_clear_start，alarm_clear_all=0
+  ↓
+只清本次扫描记录到的故障 Device
+```
 
-Alarm Clear (0x44) 本身也是读事务。每次 Clear 命令完成 `valid / ready` 握手后，Alarm Handler 仍需等待对应的 `rsp_valid`，确认该次 read/clear transaction 已完成；读回数据本身可以忽略。
+初始化流程不要求先 Scan：
 
-全部目标 Device 的 Clear transaction 均收到 `rsp_valid` 后产生：
+```text
+配置完成并稳定
+  ↓
+alarm_clear_start，alarm_clear_all=1
+  ↓
+128 颗全部执行 Alarm Clear
+```
+
+Alarm Clear 本身也是 READ 事务。每次 0x44 完成 `valid / ready` 握手后，仍需等待对应的 `rsp_valid`，确认 transaction 已完成；读回数据忽略。
+
+全部目标均完成后产生：
 
 ```text
 alarm_clear_done
 ```
 
-Alarm Clear 完成后，器件共享 ALARM 线是否释放由实际硬件状态决定。
+Clear 不修改 `device_fault_vector` 和 Result RAM；它们继续保存最近一次扫描快照，直到下一次 `alarm_start`。
+
+Alarm Clear 完成后，共享 ALARM 线是否释放由实际硬件状态决定。
 
 ---
 
@@ -281,6 +236,7 @@ alarm_start
 alarm_vector[7:0]
 alarm_abort
 alarm_clear_start
+alarm_clear_all
 ```
 
 Alarm Handler → System Controller / 外部模块：
