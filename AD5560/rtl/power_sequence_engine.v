@@ -11,7 +11,8 @@
  * 关键数据：
  * - Sequence RAM：2048 x 16 bit；Header 固定 20 word。
  * - Header 直接保存每个 BUS 的 Parameter 起始地址和 Record 数量。
- * - Parameter Record：DEVICE_ID + UP/DOWN Ramp 参数，共 7 word。
+ * - Parameter Record 共 7 word：DEVICE_ID、UP End/Step/Div、Control(0x02)、DOWN Step/Div。
+ * - Control(0x02) 当前仅用于 Power-On；bit15=SW_INH 由 FPGA 强制写 1。Power-Off 暂不修改该寄存器。
  * - Sequence Step：8 word TRIGGER_MASK + 1 word Delay_ms。
  *
  * 关键约束：
@@ -65,6 +66,8 @@ module power_sequence_engine #(
 localparam MODE_POWER_ON  = 1'b0;
 localparam MODE_POWER_OFF = 1'b1;
 
+localparam [6:0] REG_CONTROL   = 7'h02;
+localparam [6:0] REG_FIN_DAC   = 7'h08;
 localparam [6:0] REG_RAMP_END  = 7'h3E;
 localparam [6:0] REG_RAMP_STEP = 7'h3F;
 localparam [6:0] REG_RCLK_DIV  = 7'h40;
@@ -170,11 +173,13 @@ reg [31:0]  delay_clk_cnt;
 //-------------------------------------------------------------------
 // 每条 BUS 独立保存 Parameter 读取进度，调度器可在不同 BUS 之间切换而不丢失上下文。
 //-------------------------------------------------------------------
-reg [10:0] param_ptr       [0:7];
-reg [15:0] param_left      [0:7];
-// phase=0 读取 DEVICE_ID；phase=1/2/3 依次处理 Ramp End / Ramp Step / RCLK Divider。
-reg [1:0]  param_phase     [0:7];
-reg [3:0]  param_device_id [0:7];
+reg [10:0] param_ptr       [0:7]; //当前 BUS 正在处理的 Parameter Record 起始地址。
+reg [15:0] param_left      [0:7]; //当前 BUS 还剩多少条 Parameter Record。
+// phase=0 读取 DEVICE_ID；后续 phase 根据上下电方向执行固定值或 RAM 参数写入。
+// Power-On : 1=FIN(0), 2=Ramp End, 3=Ramp Step, 4=RCLK Div, 5=Control(0x02)
+// Power-Off: 1=Ramp End(0), 2=Ramp Step, 3=RCLK Div；Ramp 后续状态暂不在本阶段处理
+reg [2:0]  param_phase     [0:7]; // 当前一条 Parameter Record 内的寄存器配置阶段。
+reg [3:0]  param_device_id [0:7]; //当前 BUS 正在操作的 device id
 
 reg [2:0] selected_bus;
 
@@ -246,14 +251,45 @@ always @(*) begin
         end
 
         ST_PARAM_REQ: begin
-            seq_ram_rd_en = 1'b1;
-
-            if (param_phase[selected_bus] == 2'd0)
+            // 固定值步骤不访问 RAM；这里只给真正需要读取的 Parameter 字段发起同步读。
+            if (param_phase[selected_bus] == 3'd0) begin
+                seq_ram_rd_en   = 1'b1;
                 seq_ram_rd_addr = param_ptr[selected_bus];
-            else if (seq_mode_reg == MODE_POWER_ON)
-                seq_ram_rd_addr = param_ptr[selected_bus] + param_phase[selected_bus];
-            else
-                seq_ram_rd_addr = param_ptr[selected_bus] + 11'd3 + param_phase[selected_bus];
+            end
+            else if (seq_mode_reg == MODE_POWER_ON) begin
+                case (param_phase[selected_bus])
+                    3'd2: begin
+                        seq_ram_rd_en   = 1'b1;
+                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd1; // UP_RAMP_END
+                    end
+                    3'd3: begin
+                        seq_ram_rd_en   = 1'b1;
+                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd2; // UP_RAMP_STEP
+                    end
+                    3'd4: begin
+                        seq_ram_rd_en   = 1'b1;
+                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd3; // UP_RCLK_DIV
+                    end
+                    3'd5: begin
+                        seq_ram_rd_en   = 1'b1;
+                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd4; // CONTROL_REG_0x02，仅 Power-On
+                    end
+                    default: ; // phase1: FIN DAC 固定写 0
+                endcase
+            end
+            else begin
+                case (param_phase[selected_bus])
+                    3'd2: begin
+                        seq_ram_rd_en   = 1'b1;
+                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd5; // DOWN_RAMP_STEP
+                    end
+                    3'd3: begin
+                        seq_ram_rd_en   = 1'b1;
+                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd6; // DOWN_RCLK_DIV
+                    end
+                    default: ; // phase1: Ramp End 固定写 0；Power-Off 不写 0x02
+                endcase
+            end
         end
 
         ST_STEP_REQ: begin
@@ -306,7 +342,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
             param_count_cfg[reset_i] <= 16'd0;
             param_ptr[reset_i]       <= 11'd0;
             param_left[reset_i]      <= 16'd0;
-            param_phase[reset_i]     <= 2'd0;
+            param_phase[reset_i]     <= 3'd0;
             param_device_id[reset_i] <= 4'd0;
         end
     end
@@ -433,7 +469,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
                     for (reset_i = 0; reset_i < 8; reset_i = reset_i + 1) begin
                         param_ptr[reset_i]   <= param_start_cfg[reset_i];
                         param_left[reset_i]  <= param_count_cfg[reset_i];
-                        param_phase[reset_i] <= 2'd0;
+                        param_phase[reset_i] <= 3'd0;
                     end
 
                     if (seq_mode_reg == MODE_POWER_ON) begin
@@ -482,42 +518,86 @@ always @(posedge i_clk or negedge i_rst_n) begin
                 end
 
                 ST_PARAM_LOAD: begin
-                    // phase0 只读取并锁存 DEVICE_ID，不占用 Driver，因此直接继续读取同一 Record 的参数字段。
-                    if (param_phase[selected_bus] == 2'd0) begin
+                    // phase0 只读取并锁存 DEVICE_ID；后续 phase 按方向生成本次需要写入的寄存器。
+                    if (param_phase[selected_bus] == 3'd0) begin
                         param_device_id[selected_bus] <= seq_ram_rd_data[3:0];
-                        param_phase[selected_bus]     <= 2'd1;
+                        param_phase[selected_bus]     <= 3'd1;
                         state                         <= ST_PARAM_REQ;
                     end
                     else begin
-                        // phase1~3 形成 Driver 写命令；握手后回 Scheduler，重新判断下一条可执行 BUS。
                         o_cmd_bus_id    <= selected_bus;
                         o_cmd_device_id <= param_device_id[selected_bus];
-                        o_cmd_wr_data   <= seq_ram_rd_data;
 
-                        case (param_phase[selected_bus])
-                            2'd1: o_cmd_reg_addr <= REG_RAMP_END;
-                            2'd2: o_cmd_reg_addr <= REG_RAMP_STEP;
-                            2'd3: o_cmd_reg_addr <= REG_RCLK_DIV;
-                            default: o_cmd_reg_addr <= REG_RAMP_END;
-                        endcase
+                        if (seq_mode_reg == MODE_POWER_ON) begin
+                            case (param_phase[selected_bus])
+                                // Power-On 先把 FIN DAC 置 0，建立 Ramp 的 0 V 起始值。
+                                3'd1: begin
+                                    o_cmd_reg_addr <= REG_FIN_DAC;
+                                    o_cmd_wr_data  <= 16'h0000;
+                                end
+                                3'd2: begin
+                                    o_cmd_reg_addr <= REG_RAMP_END;
+                                    o_cmd_wr_data  <= seq_ram_rd_data;
+                                end
+                                3'd3: begin
+                                    o_cmd_reg_addr <= REG_RAMP_STEP;
+                                    o_cmd_wr_data  <= seq_ram_rd_data;
+                                end
+                                3'd4: begin
+                                    o_cmd_reg_addr <= REG_RCLK_DIV;
+                                    o_cmd_wr_data  <= seq_ram_rd_data;
+                                end
+                                // 0x02 最后写；上位机只提供其余 bit，Power-On 显式置 SW_INH(bit15)=1。
+                                3'd5: begin
+                                    o_cmd_reg_addr <= REG_CONTROL;
+                                    o_cmd_wr_data  <= {1'b1, seq_ram_rd_data[14:0]};
+                                end
+                                default: begin
+                                    o_cmd_reg_addr <= REG_CONTROL;
+                                    o_cmd_wr_data  <= {1'b1, seq_ram_rd_data[14:0]};
+                                end
+                            endcase
+                        end
+                        else begin
+                            case (param_phase[selected_bus])
+                                // Power-Off 的目标电压固定为 0，不需要从 RAM 读取 DOWN_RAMP_END。
+                                3'd1: begin
+                                    o_cmd_reg_addr <= REG_RAMP_END;
+                                    o_cmd_wr_data  <= 16'h0000;
+                                end
+                                3'd2: begin
+                                    o_cmd_reg_addr <= REG_RAMP_STEP;
+                                    o_cmd_wr_data  <= seq_ram_rd_data;
+                                end
+                                3'd3: begin
+                                    o_cmd_reg_addr <= REG_RCLK_DIV;
+                                    o_cmd_wr_data  <= seq_ram_rd_data;
+                                end
+                                default: begin
+                                    o_cmd_reg_addr <= REG_RCLK_DIV;
+                                    o_cmd_wr_data  <= seq_ram_rd_data;
+                                end
+                            endcase
+                        end
 
                         o_cmd_valid <= 1'b1;
                         state       <= ST_PARAM_SEND;
                     end
                 end
 
-                // valid/ready 成功后才推进 phase；Divider 提交后该 Record 才算完成，ptr +7、left -1。
+                // Power-On 以 Control(0x02) 为最后一步；Power-Off 目前以 RCLK Divider 为最后一步。
                 ST_PARAM_SEND: begin
                     if (o_cmd_valid && i_cmd_ready) begin
                         o_cmd_valid <= 1'b0;
 
-                        if (param_phase[selected_bus] == 2'd3) begin
-                            param_phase[selected_bus] <= 2'd0;
+                        if (((seq_mode_reg == MODE_POWER_ON)  && (param_phase[selected_bus] == 3'd5)) ||
+                            ((seq_mode_reg == MODE_POWER_OFF) && (param_phase[selected_bus] == 3'd3))) begin
+                            param_phase[selected_bus] <= 3'd0;
                             param_ptr[selected_bus]   <= param_ptr[selected_bus] + 11'd7;
                             param_left[selected_bus]  <= param_left[selected_bus] - 16'd1;
                         end
                         else begin
-                            param_phase[selected_bus] <= param_phase[selected_bus] + 2'd1;
+                            param_phase[selected_bus] <= param_phase[selected_bus] + 3'd1;
                         end
 
                         state <= ST_PARAM_SCHED;
