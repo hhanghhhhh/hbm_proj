@@ -38,6 +38,13 @@ Config RAM 采用单块全局 RAM，不按 8 条 SPI BUS 分开。
 
 有效字段共 30 bit，高 2 bit 保留。
 
+**Config RAM Image 与上位机 `CONFIG_DATA` 下发均采用大端字节序**：
+
+- 每个 32-bit Config Record 按高字节到低字节依次发送，即 `[31:24] → [23:16] → [15:8] → [7:0]`，低地址保存先发送的完整 Record。
+- Record 中的每个 16-bit 数据也采用大端：例如 `REG_DATA = 16'h1234`，上位机发送 `8'h12, 8'h34`，FPGA 写入的 `REG_DATA[15:0]` 为 `16'h1234`，无需交换字节。
+- 例如 `BUS_ID=3`、`DEVICE_ID=5`、`REG_ADDR=7'h3E`、`REG_DATA=16'h1234`，且 Reserved=0，则 Record 为 `32'h1ABE1234`，上位机连续发送 `1A BE 12 34`。通信模块拼接为 `{byte0, byte1, byte2, byte3}` 后写入 `cfg_ram_wr_data[31:0]`。
+- 多条 Record 按 RAM 地址从低到高依次排列；RAM Image CRC-16/MODBUS 也按此顺序逐字节计算。
+
 第一版 Config Table 只执行寄存器写操作，因此记录中不需要 `RW` 字段。
 
 ### 2.2 RAM 容量计算
