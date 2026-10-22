@@ -27,7 +27,11 @@ seq_done
 
 ## 2. Power Sequence RAM
 
-RAM 使用 `2048 × 16 bit`。所有地址均以 16-bit word 为单位。
+RAM 使用 `2048 × 16 bit`。所有地址均以 16-bit word 为单位。**Power Sequence RAM Image 统一采用大端字节序**：
+
+- **上位机下发的每个 16-bit word 均采用大端传输**：先高字节 `[15:8]`、后低字节 `[7:0]`，例如 `16'h1234` 在 `POWER_SEQUENCE_DATA` 的 `DATA` 中按 `8'h12, 8'h34` 发送，FPGA 写入 RAM 的 16-bit 数据为 `16'h1234`，不交换字节。
+- 多个 16-bit word 按 RAM 地址从低到高依次传输；对于跨多个 word 的整体数据（如 128-bit `TRIGGER_MASK`），**高位 word 存低地址，低位 word 存高地址**。
+- RAM Image 的 CRC-16/MODBUS 按地址递增，且每个 word 按 `[15:8] → [7:0]` 顺序计算。
 
 ### 2.1 总体布局
 
@@ -51,15 +55,24 @@ RAM 使用 `2048 × 16 bit`。所有地址均以 16-bit word 为单位。
 |  | +1 | `UP_RAMP_END` |
 |  | +2 | `UP_RAMP_STEP` |
 |  | +3 | `UP_RCLK_DIV` |
-|  | +4 | `DOWN_RAMP_END` |
+|  | +4 | `CONTROL_REG_0x02[14:0]`，仅 Power-On 使用；bit15(SW_INH) 由 FPGA 强制写 1 |
 |  | +5 | `DOWN_RAMP_STEP` |
 |  | +6 | `DOWN_RCLK_DIV` |
-| Sequence Step | +0..7 | `TRIGGER_MASK[127:0]`，word0→CH[15:0]，word7→CH[127:112] |
+| Sequence Step | +0..7 | `TRIGGER_MASK[127:0]`，按大端排列：word0→CH[127:112]、word1→CH[111:96]、…、word7→CH[15:0] |
 |  | +8 | `Delay_ms` |
 
 Parameter Record 属于哪条 BUS，由对应 `BUSx_PARAM_START / COUNT` 决定；同 BUS 内建议按 DEVICE_ID 递增排列。
 
-`TRIGGER_MASK[n]=1` 表示该 Step 对 Channel n 执行 Ramp Enable，其中：
+其中：
+
+- Power-On 的 `FIN DAC(0x08)` 固定写 `16'h0000`，作为 Ramp 起始值，因此不占 RAM 字段；
+- Power-Down 的 `Ramp End(0x3E)` 固定写 `16'h0000`，因此不需要上位机下发 `DOWN_RAMP_END`；
+- `CONTROL_REG_0x02` 当前仅用于 Power-On，上位机提供寄存器 `0x02` 的其它控制位，FPGA 写出时强制 `SW_INH(bit15)=1`；
+- Power-Off 的 Parameter 阶段暂不修改 `0x02 / SW_INH`；Ramp 到 0 V 后如何进入最终关断状态，后续单独设计。
+
+`TRIGGER_MASK[n]=1` 表示该 Step 对 Channel n 执行 Ramp Enable。128-bit Mask 的最高位为 CH127、最低位为 CH0；每个 word 内同样先存高字节、后存低字节。例如仅 CH0 置 1 时，8 个 word 为 `0000 0000 0000 0000 0000 0000 0000 0001`。
+
+其中：
 
 ```text
 BUS_ID    = channel[6:4]
@@ -102,24 +115,6 @@ seq_done
 - 不修改当前进度；
 - 不重新锁存 mode。
 
----
-
-## 4. 空 Sequence
-
-读取 Header 后，根据 mode 选择：
-
-```text
-POWER_ON  -> UP_STEP_COUNT
-POWER_OFF -> DOWN_STEP_COUNT
-```
-
-如果本方向 `STEP_COUNT=0`：
-
-```text
-不装载 Ramp 参数
-不执行 Sequence
-直接 seq_done
-```
 
 ---
 
@@ -128,18 +123,18 @@ POWER_OFF -> DOWN_STEP_COUNT
 每条 BUS 独立维护：
 
 ```text
-param_ptr[bus]
-param_left[bus]
-param_phase[bus]
-device_id[bus]
+param_ptr[bus]：当前 BUS 正在处理的 Parameter Record 起始地址。
+每完成一个 Device param_ptr += 7
+ 
+param_left[bus]：当前 BUS 还剩多少条 Parameter Record。
+每完成一个 Device param_left--
+
+param_phase[bus]：当前一条 Parameter Record 内的寄存器配置执行到哪一步。
+Power-On 以 `0x02` Control Register 作为最后一步；Power-Off 当前以 RCLK Divider 作为最后一步。
+
+device_id[bus]：当前 BUS 正在操作的 device id
 ```
 
-初始化：
-
-```text
-param_ptr  = BUSx_PARAM_START
-param_left = BUSx_PARAM_COUNT
-```
 
 当：
 
@@ -150,26 +145,50 @@ param_left != 0
 
 即可调度该 BUS。
 
-每个 Record 执行：
+每个 Record 根据 `seq_mode` 执行不同的 Parameter 写入序列。
+
+Power-On：
 
 ```text
 读 DEVICE_ID
     ↓
-写 0x3E Ramp End
+写 0x08 FIN DAC = 16'h0000
     ↓
-写 0x3F Ramp Step
+写 0x3E Ramp End = UP_RAMP_END
     ↓
-写 0x40 RCLK Divider
+写 0x3F Ramp Step = UP_RAMP_STEP
+    ↓
+写 0x40 RCLK Divider = UP_RCLK_DIV
+    ↓
+写 0x02 Control Register = {SW_INH=1, CONTROL_REG_0x02[14:0]}
     ↓
 param_ptr += 7
 param_left--
 ```
 
+其中 `FIN DAC=0` 用于建立本次 Power-On Ramp 的 0 V 起始值。
+
+Power-Off：
+
+```text
+读 DEVICE_ID
+    ↓
+写 0x3E Ramp End = 16'h0000
+    ↓
+写 0x3F Ramp Step = DOWN_RAMP_STEP
+    ↓
+写 0x40 RCLK Divider = DOWN_RCLK_DIV
+    ↓
+param_ptr += 7
+param_left--
+```
+
+Power-Down 不修改 `FIN DAC(0x08)`；Ramp End 固定为 0，因此无需从 RAM 读取。
+
+`0x02` Control Register 当前只在 Power-On Parameter 阶段最后写，`SW_INH(bit15)` 强制为 1。Power-Off 不修改该寄存器。
+
 不同 BUS 可交叉派发。
 
-如果 BUS0 busy，而 BUS1 ready，必须继续派发 BUS1，不允许 BUS0 阻塞其他 BUS。
-
-公共命令完成 `valid / ready` 握手后即认为该寄存器命令已提交，不等待 SPI/BUSY 完成。
 
 所有 `param_left == 0` 后进入完成屏障：
 
@@ -208,7 +227,6 @@ valid / ready 握手
 
 不同 BUS 中，busy BUS 不阻塞其他 ready BUS。
 
-第一版 BUS / Channel 选择使用固定优先级，不要求公平仲裁。
 
 ---
 

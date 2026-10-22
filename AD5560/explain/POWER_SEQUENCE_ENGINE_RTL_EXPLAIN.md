@@ -142,93 +142,12 @@ param_select_bus = 当前组合逻辑实时算出的候选 BUS
 selected_bus     = 时钟沿已经锁存、本次事务真正使用的 BUS
 ```
 
-### for 循环为什么不会产生 multiple driver
 
-Scheduler 中的 `for` 是组合逻辑描述，综合时会展开成固定的优先级选择逻辑，并不是硬件在一个周期内依次执行 8 次。
 
-当前写法等价于：
 
-```text
-if BUS0 available
-    select BUS0
-else if BUS1 available
-    select BUS1
-else if BUS2 available
-    select BUS2
-...
-else if BUS7 available
-    select BUS7
-```
 
-因此如果 8 个 BUS 全部满足条件：
 
-```text
-param_select_valid = 1
-param_select_bus   = 0
-```
 
-BUS0 优先级最高。
-
-原因是循环开始时：
-
-```verilog
-param_select_valid = 1'b0;
-```
-
-BUS0 命中后使用阻塞赋值立即变为：
-
-```verilog
-param_select_valid = 1'b1;
-param_select_bus   = 3'd0;
-```
-
-后续 BUS1~BUS7 再判断：
-
-```verilog
-!param_select_valid
-```
-
-已经为假，因此不会再次覆盖选择结果。
-
-这不属于 multiple driver，因为所有对 `param_select_bus` 的赋值都在同一个 `always @(*)` 块内，综合后是一个 priority encoder / mux 网络。
-
-真正的 multiple driver 通常是同一个信号被两个独立的 `always` 块或其他独立驱动源同时驱动。
-
-选中 BUS 后统一进入：
-
-```text
-PARAM_REQ
-    ↓
-PARAM_LOAD
-```
-
-`PARAM_REQ` 根据 `param_phase` 决定 RAM 地址：
-
-```text
-phase=0 -> 读 DEVICE_ID
-phase=1 -> 读 Ramp End
-phase=2 -> 读 Ramp Step
-phase=3 -> 读 RCLK Divider
-```
-
-`PARAM_LOAD` 再根据 phase 判断读回数据的用途：
-
-```text
-phase=0
-    ↓
-锁存 DEVICE_ID
-phase=1
-    ↓
-回 PARAM_SCHED
-
-phase=1/2/3
-    ↓
-生成对应寄存器写命令
-    ↓
-PARAM_SEND
-```
-
-因此 ID 和参数共用同一套 RAM 读取状态，不需要分别维护 ID_REQ/LOAD 和 DATA_REQ/LOAD。
 
 ---
 

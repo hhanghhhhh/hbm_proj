@@ -10,6 +10,9 @@
  *
  * 关键数据：
  * - Config RAM 固定 1024 x 32 bit。
+ * - 上位机下发 Record 使用大端字节序：[31:24]、[23:16]、[15:8]、[7:0]；
+ *   其中 REG_DATA[15:0] 也按高字节在前传输。通信侧须按大端拼成 i_cfg_ram_wr_data，
+ *   本模块原样写入 32-bit RAM，不进行字节交换。
  * - Record：[31:30] Reserved，[29:27] BUS_ID，[26:23] DEVICE_ID，
  *           [22:16] REG_ADDR，[15:0] REG_DATA。
  * - CRC 覆盖 RAM[0] ~ RAM[record_count-1]，每个 word 按

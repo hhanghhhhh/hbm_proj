@@ -619,7 +619,8 @@ always @(posedge i_clk or negedge i_rst_n) begin
 
                 ST_STEP_LOAD: begin
                     if (step_word_index < 4'd8)
-                        pending_mask[step_word_index*16 +: 16] <= seq_ram_rd_data;
+                        // TRIGGER_MASK 按大端 word 顺序存储：word0=CH[127:112]，word7=CH[15:0]。
+                        pending_mask[127 - step_word_index*16 -: 16] <= seq_ram_rd_data;
                     else
                         delay_ms_reg <= seq_ram_rd_data;
 
