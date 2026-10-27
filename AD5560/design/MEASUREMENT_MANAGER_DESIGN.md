@@ -2,12 +2,12 @@
 
 ## 1. 定位与总体方案
 
-`Measurement Manager` 负责 128 路 AD5560 的电压/电流（V/I）交替测量调度、采样数据归属及 Result RAM 更新。它不实现 AD4114/AD5560 底层 SPI，也不独占 System Controller 的主业务状态机。
+`Measurement Manager` 负责 128 路 AD5560 的电压/电流（V/I）交替测量调度、采样数据归属及 Result RAM 更新。它不实现 AD4114/AD5560 底层 SPI；获得System授权期间独占AD5560 Driver资源池，内部8BUS可并行。
 
 - `ad4114_sample_manager`：负责 ADC 初始化、连续轮询、错误过滤，输出 `sample_valid + adc_id + adc_channel + sample_data[23:0]`。
 - `Measurement Manager`：根据采样来源定位 AD5560 通道；保存数据到 V/I RAM；生成下一次 MEASOUT 切换请求；管理启停/暂停。
 - `AD5560 Driver ×8`：执行 AD5560 寄存器写及 BUSY 超时检测，复用现有 `valid/ready` 命令接口。
-- **寄存器 Shadow RAM 是独立外部模块，不放在 Measurement Manager 内部**；Manager 通过读写接口访问。
+- **不再使用外部 Shadow RAM**；Measurement Manager 通过 AD5560 Driver 对器件寄存器执行 READ → 修改相关位 → WRITE，保留其他配置位。
 - 上位机通过 `TELEMETRY_ENABLE` 选择参与测量的通道，通过 `TELEMETRY_READ` 按需读取最新缓存；读取不触发采样。
 
 核心简化：**每通道只维护一个 V/I 状态位和一个待切换位，不实例化 128 个状态机**；全局只有一套调度 FSM。
@@ -35,13 +35,13 @@ AD4114 配置为连续转换（当前 Filter0 = `0x0510`，约 20.13 ms/通道�
 | `enable_mask` | 128 bit | 上位机使能测量的通道 |
 | `vi_state` | 128 bit | 该通道**已确认切换完成**的模式；0=V，1=I |
 | `switch_pending` | 128 bit | 收到采样后，等待切换到相反 V/I 模式的通道 |
-| 切换调度 FSM | 1 套 | 选取 pending 通道、读 Shadow、修改位域、发 AD5560 写命令、等待完成 |
+| 切换调度 FSM | 1 套 | 选取 pending 通道、读取 AD5560 寄存器、计算 Gain、读改写并等待完成 |
 | Voltage Result RAM | 128 × 24 bit | 各通道最近一次有效电压 ADC Raw |
 | Current Result RAM | 128 × 24 bit | 各通道最近一次有效电流 ADC Raw |
 
 V/I Result RAM 可分别实例化为独立存储块。总容量 `128×24×2 = 6144 bit = 768 Byte`。结果数据只有 24-bit 原码，不额外向上位机返回 FLAG。
 
-**外部 Shadow RAM**：独立维护每颗 AD5560 的 `0x01` 和 `0x02` 当前寄存器值；逻辑容量建议 `128 × 32 bit = 4096 bit`，具体模块接口和初值来源后续确定。
+**不配置 Shadow RAM**。切换时直接通过 AD5560 Driver 读回 `0x08`、`0x01`、`0x02` 的当前寄存器内容，并执行读改写。FSM 只临时锁存当前正在处理通道的读回值，不需要保存 128 路寄存器镜像。
 
 ## 4. 接收 ADC 数据：直接写 RAM，异步排队切换
 
@@ -54,34 +54,59 @@ V/I Result RAM 可分别实例化为独立存储块。总容量 `128×24×2 = 61
 
 ADC 数据与 Result RAM 写入在采样接收侧完成；**不需要为 ADC 数据做大 FIFO**。切换命令通过 `switch_pending` 128-bit 位图缓存，即使连续多个 `sample_valid` 相隔很近，也不丢失各通道的切换请求。实现时需处理同周期 pending 置位/清除的优先级。
 
-## 5. 切换调度器（单个 FSM）
+## 5. 切换调度器（单个 FSM，直接读改写）
+
+不使用 Shadow RAM；由当前目标模式决定读回内容、计算增益，再通过同一 AD5560 Driver 逐笔执行。**具体电压阈值、各电流挡位对应的 MEASOUT Gain，以及 0x01 的精确位域数值后续再确定。**
+
+### 5.1 目标为 V：根据 FIN DAC 选择电压 Gain
 
 ```text
-查找 switch_pending 中可处理的通道
-      ↓
-读外部 Shadow RAM：该 CH 的 0x01、0x02
-      ↓
-按目标 V/I 修改测量相关 bit，保留其它 bit
-      ↓
-必要时写 AD5560 0x01（MEASOUT Gain）
-      ↓
-写 AD5560 0x02（MEASOUT 选择）
-      ↓
-等待对应 Driver 的写事务真正结束
-      ↓
-同步外部 Shadow RAM 的寄存器当前值
-      ↓
-vi_state[CH] 翻转；switch_pending[CH] 清零
-      ↓
-继续查找下一个 pending
+选中待切换 CH（目标模式 V）
+    ↓
+READ 0x08 FIN DAC → 等 rsp_valid，锁存当前 FIN DAC x1
+    ↓
+根据 FIN DAC 码判断应选择的电压测量 Gain
+    ↓
+READ 0x01 → 等 rsp_valid → 只修改 Gain 对应位 → WRITE 0x01
+    ↓
+READ 0x02 → 等 rsp_valid → 只修改 MEASOUT 选择位为 V → WRITE 0x02
+    ↓
+等待最后一笔写完成、Driver ready；确认无 bus_fault
+    ↓
+vi_state[CH] = V；switch_pending[CH] = 0
 ```
 
-- `0x02` 只修改 MEASOUT 的 `ME[8:5]` 字段，不覆盖 SW_INH、量程、Clamp 等配置。
-- `0x01` 是否每次都要写，取决于该 Device 的 V/I 测量增益是否不同；不变时可不写。
-- `valid && ready` 只表示 Driver 接收了写事务，**不等于写完成**；切换状态应在最后一笔写执行完成、目标 Driver 恢复 ready 且未发生 bus_fault 后更新。
-- 某 BUS 正在执行 SPI 写时，调度器可继续提交其它 BUS 的切换；8 个 Driver 彼此独立。相同 BUS 内仍由 Driver 顺序执行。
-- 若一次 V/I 切换需写 0x01 和 0x02，应作为同一个通道的完整切换任务，在两笔操作完成后才更新 `vi_state`。
-- Shadow RAM 的并发访问/读改写一致性需由外部 Shadow 管理及命令仲裁保证，避免 Config/Sequence/Measurement 互相覆盖。
+这里读取的是器件**当前 FIN DAC x1 寄存器码**，用于估算应选择的电压测量增益；它不必然等同于上位机最初设置的最终目标电压（例如 Ramp 过程中）。正常测量切换安排在 System 允许测量的阶段，Gain 的换算关系、切换阈值和边界条件后续确定。
+
+### 5.2 目标为 I：根据电流挡位选择电流 Gain
+
+```text
+选中待切换 CH（目标模式 I）
+    ↓
+READ 0x02 → 等 rsp_valid，提取当前电流挡位
+    ↓
+根据电流挡位判断应选择的电流测量 Gain
+    ↓
+READ 0x01 → 等 rsp_valid → 只修改 Gain 对应位 → WRITE 0x01
+    ↓
+READ 0x02 → 等 rsp_valid → 只修改 MEASOUT 选择位为 I → WRITE 0x02
+    ↓
+等待最后一笔写完成、Driver ready；确认无 bus_fault
+    ↓
+vi_state[CH] = I；switch_pending[CH] = 0
+```
+
+电流模式必须**先取得 0x02 当前电流挡位**，否则无法在写 0x01 前计算 Gain。为统一读改写流程，这里在最终修改 MEASOUT 选择位前再次读取 0x02；后续确认独占授权与寄存器一致性后，可评估复用第一次读回值，减少一次 READ。
+
+### 5.3 读写事务约束
+
+- `0x01`：保留非 MEASOUT Gain 字段；仅覆盖选定 Gain 的相关位，读回值与写入值由 FSM 临时寄存。
+- `0x02`：仅修改 `ME[8:5]` 的测量选择位，保留 SW_INH、电流挡位、Clamp 等其他字段。
+- **READ 必须在 `valid && ready` 握手后等待相应 Driver 的 `rsp_valid`，再使用 `rsp_rd_data`**。不可仅凭 Driver ready 当作读数据有效。System/Top 在切换授权前须排空旧 READ 及其响应，避免跨业务混淆。
+- WRITE 的 `valid && ready` 只表示命令被接收，不等于完成；下一笔依赖当前寄存器内容的操作须确保前一笔已完成；最终仅在全部写完且无 fault 时更新 `vi_state`。
+- 一次通道切换中的读改写须在同一业务授权范围内完成，防止其他业务在读与写之间改动 0x01/0x02，造成旧值覆盖新配置。
+- 不同 BUS 的 Driver 可并行执行事务；公共调度器仍是一套 FSM，可利用各 BUS ready 交叉调度。一个通道的多笔 READ/WRITE 必须严格保持先后依赖顺序。
+- 如果读回无响应、Driver fault 或 System 禁止继续切换，当前模式不得提前翻转；停止写入模式不确定的 ADC 结果，待重新授权后恢复/重新建立 V 基线。
 
 ## 6. 数据有效性约定
 
@@ -99,7 +124,7 @@ vi_state[CH] 翻转；switch_pending[CH] 清零
 
 ## 7. System Controller 协作、暂停与恢复
 
-Measurement 属于**低优先级后台业务**，不作为长期独占 `sel_id` 的 Config/Sequence/Alarm 主任务。现有高优先级业务优先使用 Driver；测量命令通过顶层仲裁入口复用现有 8 路 Driver。
+Measurement属于**低优先级后台业务**，将来作为受控业务由System互斥授权整个8BUS Driver资源池。高优先级业务启动前，Measurement先暂停并释放授权；不与Config/Power/Alarm同时提交命令。现阶段不实现Measurement RTL，也不新增sel编码。
 
 ### 7.1 正常运行
 
@@ -119,9 +144,9 @@ Measurement 属于**低优先级后台业务**，不作为长期独占 `sel_id` 
 
 ### 7.3 紧急 Alarm / bus_fault
 
-Alarm/Fault 需立即获得高优先级处理，**不能等待全部通道 I→V 回切完成**。Manager 立即停止提交新切换；对尚未完成的切换状态保持待确认/失效处理，不把不确定模式的 ADC 点写入 Result RAM。故障处理完毕且重新允许测量后，再执行模式恢复/重新建立 V 基线。
+Alarm/Fault需优先处理，**不能等待全部通道I→V回切完成**。Alarm仍必须等旧业务停止提交及已接受的Driver事务/响应排空后获得授权；bus_fault独立转FAULT，不受普通ready屏障阻塞。Manager 立即停止提交新切换；对尚未完成的切换状态保持待确认/失效处理，不把不确定模式的 ADC 点写入 Result RAM。故障处理完毕且重新允许测量后，再执行模式恢复/重新建立 V 基线。
 
-上电、配置或复位等流程若修改了测量相关寄存器，也必须重新同步实际 V/I 模式与 Shadow，不允许继续假定旧的 `vi_state` 必然有效。
+上电、配置或复位等流程若修改了测量相关寄存器，恢复测量时应先通过 AD5560 READ/WRITE 重新建立 V 模式，不能继续假定旧的 `vi_state` 必然有效；不依赖 Shadow RAM 同步。
 
 > 正常暂停完成返回 `meas_paused`，与紧急故障打断并不等价；紧急打断后不承诺所有器件已回到 V。
 
@@ -142,9 +167,9 @@ Alarm/Fault 需立即获得高优先级处理，**不能等待全部通道 I→V
 
 ## 9. 待下一步确定
 
-1. 外部 Shadow RAM 的初值如何建立；Config/Sequence 写 `0x01 / 0x02` 时如何统一更新；是否单独保存各 Device 的 V/I Gain 配置。
-2. 顶层测量命令仲裁具体接口，以及 `meas_pause / meas_paused` 的时序。
-3. 由外部 Shadow 模块提供 RAM 读/写握手和互斥机制的具体定义。
+1. 按 FIN DAC（0x08）读回码确定电压 Gain 的阈值/换算规则；按 0x02 电流挡位确定电流 Gain 的对应表；0x01 Gain 的具体字段值（后续讨论）。
+2. 顶层测量命令仲裁及 READ response 路由、`meas_pause / meas_paused` 的具体握手和排空时序。
+3. System 重新授权后，逐通道读取/恢复 V 模式的初始化及异常处理策略；读改写期间禁止其他业务交叉修改相关寄存器。
 4. 上板验证 V/I 切换相对 ADC 转换窗口的裕量、暂停/故障后的重新同步，以及测量数据的实际刷新周期。
 
 本文件只记录架构讨论，尚未实现 Measurement Manager RTL，也不修改现有 AD4114 采样模块。

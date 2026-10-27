@@ -109,7 +109,7 @@ PSE 重点覆盖 Header / Parameter Record 解析、多 BUS 调度、TRIGGER_MAS
 | PSE-003 | 单 Record | 指定 BUS/DEVICE | DEVICE_ID 与三组参数解析正确 |
 | PSE-004 | 同 BUS 多 Record | 多个 DEVICE_ID | 按 Record 顺序执行，ptr 每次 +7 |
 | PSE-005 | POWER_ON 参数 | seq_mode=ON | 使用 +1/+2/+3 |
-| PSE-006 | POWER_OFF 参数 | seq_mode=OFF | 使用 +4/+5/+6 |
+| PSE-006 | POWER_OFF 参数 | seq_mode=OFF | 固定End=0，使用+5/+6；+4保留不执行 |
 | PSE-007 | 参数寄存器顺序 | 单 Record | End/Step/Divider 顺序正确 |
 | PSE-008 | 8 BUS 参数 | 各 BUS 独立 start/count | BUS/DEVICE 路由正确 |
 
@@ -119,7 +119,7 @@ PSE 重点覆盖 Header / Parameter Record 解析、多 BUS 调度、TRIGGER_MAS
 |---|---|---|---|
 | PSE-009 | 多 BUS ready | 多 BUS 同时有 Record | 可跨 BUS 连续派发 |
 | PSE-010 | BUS0 busy | BUS0 not ready，BUS1 ready | BUS1 不被 BUS0 阻塞 |
-| PSE-011 | 同 Device 三参数 | Driver 间歇 ready | phase 按 0→1→2→3 推进，DEVICE_ID 仅在 phase=0 读取 |
+| PSE-011 | 同 Device 三参数 | Driver 间歇 ready | ON phase0→1→2→3→4→5(READ)→6(WRITE)，OFF phase0→1→2→3，DEVICE_ID 仅在 phase=0 读取 |
 | PSE-012 | 随机 backpressure | ready 随机变化 | 不丢、不重、不串 Record |
 | PSE-013 | 参数全部提交 | 所有 param_left=0 | 不立即进入 Sequence |
 | PSE-014 | 参数完成屏障 | 部分 Driver 尚 busy | 等 `seq_bus_ready=FF` |
@@ -287,3 +287,9 @@ A-SYS-005: start/abort/clear 类控制信号均为规定脉冲宽度
 - reset：IDLE、BUSY、WAIT_RSP、WAIT_DELAY、FAULT 等状态。
 
 
+
+## 12. 2026-10-26 READ与System释放专项
+
+执行前工况见 `READ_ARBITRATION_PENDING.md`；可复现入口为 `read_arbitration_cocotb/run_cocotb.py`，最终结论见 `AD5560_READ_ARBITRATION_verification_report.md`。
+
+新增必须检查：每BUS单笔pending且不跨Device；全8BUS/128DEV读改写；BUS0长延迟不阻塞其他BUS；BUS0/1/7同拍响应不丢失；valid反压保持全部字段；ON 0x02=(read&3FF0)|8000，OFF不读改写；参数pending和ready双屏障；seq_done时Driver仍忙的System释放；Config/Power Alarm抢占排空；abort/response及检测Alarm/握手同沿；旧response不进入Alarm；fault中断DRAIN及reset恢复。默认无波形、无代码覆盖率。

@@ -11,7 +11,7 @@
  * 关键约束：
  * - MUX / BUS Route 逻辑较薄，直接保留在 Top，不单独拆模块。
  * - Driver ready 向量同时供 Config/PSE 调度和 System Controller fault reset 使用。
- * - 当前只有 Alarm Handler 使用 READ response，因此 8 路 rsp 在 Top 汇总后送回 Alarm Handler。
+ * - READ response 由 sel_id 分发；PSE 保留全部 8 路响应，Alarm 单笔等待读回。
  * - ALARM 为板级异步输入，在 Top 内两拍同步后送 System Controller。
  */
 
@@ -101,6 +101,9 @@ end
 //-------------------------------------------------------------------
 // System Controller control signals
 //-------------------------------------------------------------------
+wire        cmd_enable;
+wire [7:0]  seq_read_pending;
+wire [7:0]  seq_rsp_valid;
 wire        cfg_start;
 wire        cfg_abort;
 wire        seq_start;
@@ -168,7 +171,8 @@ wire [7:0]   driver_rsp_valid;
 wire [127:0] driver_rsp_data;
 
 // 当前业务模块看到的 ready 只来自本条命令指定的 BUS；未被 sel_id 选中的业务模块 ready 强制为 0。
-assign common_cmd_ready = driver_ready[common_cmd_bus_id];
+assign common_cmd_ready = cmd_enable && driver_ready[common_cmd_bus_id];
+assign seq_rsp_valid = (o_sel_id == SEL_SEQUENCE) ? driver_rsp_valid : 8'd0;
 assign cfg_cmd_ready     = (o_sel_id == SEL_CONFIG)   ? common_cmd_ready : 1'b0;
 assign seq_cmd_ready     = (o_sel_id == SEL_SEQUENCE) ? common_cmd_ready : 1'b0;
 assign alarm_cmd_ready   = (o_sel_id == SEL_ALARM)    ? common_cmd_ready : 1'b0;
@@ -186,7 +190,7 @@ always @(*) begin
 
     case (o_sel_id)
         SEL_CONFIG: begin
-            common_cmd_valid     = cfg_cmd_valid;
+            common_cmd_valid     = cfg_cmd_valid && cmd_enable;
             common_cmd_rw        = cfg_cmd_rw;
             common_cmd_bus_id    = cfg_cmd_bus_id;
             common_cmd_device_id = cfg_cmd_device_id;
@@ -194,7 +198,7 @@ always @(*) begin
             common_cmd_wr_data   = cfg_cmd_wr_data;
         end
         SEL_SEQUENCE: begin
-            common_cmd_valid     = seq_cmd_valid;
+            common_cmd_valid     = seq_cmd_valid && cmd_enable;
             common_cmd_rw        = seq_cmd_rw;
             common_cmd_bus_id    = seq_cmd_bus_id;
             common_cmd_device_id = seq_cmd_device_id;
@@ -203,7 +207,7 @@ always @(*) begin
         end
 
         SEL_ALARM: begin
-            common_cmd_valid     = alarm_cmd_valid;
+            common_cmd_valid     = alarm_cmd_valid && cmd_enable;
             common_cmd_rw        = alarm_cmd_rw;
             common_cmd_bus_id    = alarm_cmd_bus_id;
             common_cmd_device_id = alarm_cmd_device_id;
@@ -216,7 +220,7 @@ always @(*) begin
 end
 
 //-------------------------------------------------------------------
-// READ response 汇总：当前只有 Alarm Handler 发 READ，且保证一次只有一笔 outstanding READ。
+// READ response 分发：PSE 使用原始8路向量；仅 Alarm 独占时汇总其单笔响应。
 //-------------------------------------------------------------------
 integer rsp_i;
 always @(*) begin
@@ -225,7 +229,7 @@ always @(*) begin
 
     // 因此正常情况下最多一路 rsp_valid；命中的 BUS 数据直接回送 Alarm Handler。
     for (rsp_i = 0; rsp_i < 8; rsp_i = rsp_i + 1) begin
-        if (driver_rsp_valid[rsp_i]) begin
+        if ((o_sel_id == SEL_ALARM) && driver_rsp_valid[rsp_i]) begin
             alarm_rsp_valid   = 1'b1;
             alarm_rsp_rd_data = driver_rsp_data[rsp_i*16 +: 16];
         end
@@ -244,6 +248,12 @@ system_controller u_system_controller (
     .i_alarm_clear_req      (i_alarm_clear_req),
     .i_alarm_clear_all      (i_alarm_clear_all),
     .i_fault_reset          (i_fault_reset),
+    .i_cfg_busy             (o_cfg_busy),
+    .i_seq_busy             (o_seq_busy),
+    .i_alarm_busy           (o_alarm_busy || o_alarm_clear_busy),
+    .i_seq_read_pending     (seq_read_pending),
+    .i_driver_rsp_valid     (driver_rsp_valid),
+    .o_cmd_enable           (cmd_enable),
     .i_cfg_done             (o_cfg_done),
     .i_seq_done             (o_seq_done),
     .i_alarm_done           (o_alarm_done),
@@ -306,12 +316,20 @@ power_sequence_engine #(
     .i_seq_ram_wr_en   (i_seq_ram_wr_en),
     .i_seq_ram_wr_addr (i_seq_ram_wr_addr),
     .i_seq_ram_wr_data (i_seq_ram_wr_data),
+    .i_seq_word_count  (12'd0),
+    .i_seq_expected_crc(16'd0),
+    .i_seq_crc_start   (1'b0),
+    .o_seq_crc_done    (),
+    .o_seq_crc_ok      (),
     .i_seq_start       (seq_start),
     .i_seq_mode        (seq_mode),
     .i_seq_abort       (seq_abort),
     .o_seq_busy        (o_seq_busy),
     .o_seq_done        (o_seq_done),
     .i_seq_bus_ready   (driver_ready),
+    .i_rsp_valid       (seq_rsp_valid),
+    .i_rsp_rd_data     (driver_rsp_data),
+    .o_read_pending    (seq_read_pending),
     .o_cmd_valid       (seq_cmd_valid),
     .i_cmd_ready       (seq_cmd_ready),
     .o_cmd_rw          (seq_cmd_rw),

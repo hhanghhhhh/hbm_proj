@@ -36,7 +36,7 @@ sel_id    = SEL_CONFIG
 
 通信模块负责在此之前完成 Config RAM CRC 校验，只有校验通过才向 System Controller 发配置启动请求。System Controller 不接收也不判断 CRC 结果。
 
-Config Manager 完成全部配置记录派发，并等待 8 个 Driver 全部恢复 `ready` 后返回 `cfg_done`。System Controller 收到 `cfg_done` 后进入 `READY`。
+Config Manager 完成全部配置记录派发，并等待 8 个 Driver 全部恢复 `ready` 后返回 `cfg_done`。System Controller 收到 `cfg_done` 后进入 `ST_DRAIN`，确认模块停止、Driver空闲且无响应后进入 `READY`。
 
 因此进入 `READY` 时，可以认为本轮配置涉及的最后一批 SPI / BUSY 事务已经全部结束。
 
@@ -53,14 +53,18 @@ Power Sequence Engine 按时序产生寄存器写事务，直到 `seq_done`。
 
 ### 3.3 Alarm
 
-任意 `ALARM[n]` 有效时，System Controller 锁存报警向量，终止当前 Config / Sequence，并启动 `Alarm Handler`：
+任意 `ALARM[n]` 有效时，System Controller 锁存报警向量，停止当前 Config / Sequence，排空已提交事务后启动 `Alarm Handler`：
 
 ```text
 ALARM
   ↓
 锁存 alarm_vector
   ↓
-abort 当前业务
+abort 当前业务并关闭命令派发（保留旧 sel_id）
+  ↓
+等待模块停止、Driver全ready、响应消退
+  ↓
+切换 sel_id = SEL_ALARM，发 alarm_start
   ↓
 Alarm Handler 扫描并定位故障 Device
   ↓
@@ -153,3 +157,15 @@ bus_fault > ALARM > 当前正常工作状态
 
 - `ALARM`：进入 Alarm Handler，读取状态后再决定后续策略；
 - `bus_fault`：直接停止 Config / Sequence，进入 `FAULT`。
+
+## 8. Driver资源池独占与安全释放
+
+任意时刻只授权Config、Power或Alarm中的一个业务使用整个8BUS Driver资源池；同一业务内部8BUS继续独立并行。沿用 `sel_id`，没有跨业务rsp_owner队列或事务ID。
+
+`ST_DRAIN` 保存 `drain_owner` 和 `drain_next`。正常cfg_done/seq_done/alarm_done/alarm_clear_done进入排空；整个排空期间 `sel_id` 保持旧owner，`o_cmd_enable=0`。Top同时门控公共cmd_valid及回送ready，避免模块误以为已提交被屏蔽的命令。
+
+新增输入 `i_cfg_busy/i_seq_busy/i_alarm_busy`（Alarm的scan/clear busy合并）、`i_seq_read_pending[7:0]`、`i_driver_rsp_valid[7:0]`。释放须满足旧模块busy=0、Power pending=0、Driver ready=FF、原始rsp_valid=0，并连续两个采样沿确认。这样ready与rsp同拍恢复时仍由旧模块处理响应，不会转发给新业务。未来Measurement可复用“停止/暂停确认→排空→释放”的契约，本次不增加Measurement RTL或新的sel编码。
+
+Alarm抢占Config/Power时先锁存向量，发单周期abort并进入排空，不启动Alarm。进入排空前采样沿可能仍有一笔valid&&ready，该事务已被Driver锁存，之后ready下降自然纳入屏障。进入排空后的abort沿Top禁止握手。旧业务收到abort后停止，不要求执行剩余记录或Step。旧读响应继续按旧sel路由，若业务已退出则丢弃；8路物理rsp都消退后再给Alarm授权并发start。排空期间新出现的报警BUS合并到锁存向量；正常完成排空期间的Alarm也优先处理。Alarm结束后不恢复被抢占业务。
+
+`bus_fault`继续最高优先级，正常态和DRAIN均可立即进入FAULT，不以ready=FF为进入FAULT的前提；按旧owner发送abort并保留原Driver fault clear策略。FAULT_RESET_WAIT仅在显式fault_reset后等待所有Driver恢复、所有业务停止、pending清零及rsp消退，然后回IDLE。没有增加HW_INH或改变紧急硬件保护。

@@ -273,3 +273,7 @@ alarm_result_rd_data[15:0]
 若 Alarm Handler 正在等待 `rsp_valid` 时收到 `alarm_abort`，立即退出当前流程并回到 IDLE；已经提交给 Driver 的读事务不撤销，之后晚到的 `rsp_valid` 直接忽略。
 
 
+
+## 8. 共享Driver授权边界
+
+System抢占Config/Power时先abort旧业务、保持旧sel并关闭新命令，等待模块停止、8个Driver已提交事务与全部response排空，再切到SEL_ALARM并发alarm_start。Top仅在SEL_ALARM将Driver response汇总给Alarm，因此旧Power读回不进入Alarm。Alarm自身仍一次只提交一笔READ并等待其rsp_valid，扫描0x43和清除0x44逻辑不变。alarm_done/clear_done后也经过System释放屏障。

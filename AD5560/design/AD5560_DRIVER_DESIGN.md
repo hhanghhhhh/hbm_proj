@@ -170,3 +170,9 @@ Driver 收到清除脉冲后清除本地 sticky fault 并回到空闲状态。
 ```
 
 8 路 Driver 的 `bus_fault` 输出统一送到 `System Controller`，由其进行系统级 fault 锁存和处理。
+
+## 9. 业务READ接入与释放契约
+
+底层双帧READ实现保持不变。每BUS同一时刻最多一笔READ未完成，不同BUS可同时READ/WRITE。Driver返回ready与单周期rsp_valid可以同拍出现，上层必须检查rsp并处理其数据，不能只凭ready切换业务授权。
+
+Top保留8路独立rsp及数据；Power全部接收，Alarm独占时按原单笔等待流程接收。System关闭派发后继续保留旧sel，确认业务停止、8路事务及响应排空后才能启动新业务；无跨业务owner队列。
