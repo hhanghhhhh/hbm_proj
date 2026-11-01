@@ -12,7 +12,7 @@
  * - Sequence RAM：2048 x 16 bit；Header 固定 20 word。
  * - Header 直接保存每个 BUS 的 Parameter 起始地址和 Record 数量。
  * - Parameter Record 共 7 word：DEVICE_ID、UP End/Step/Div、Control(0x02)、DOWN Step/Div。
- * - Control(0x02) 当前仅用于 Power-On；bit15=SW_INH 由 FPGA 强制写 1。Power-Off 暂不修改该寄存器。
+ * - Control(+4) 保留兼容；Power-On 对 0x02 读改写，bit15=1，保留位清零。Power-Off 暂不修改该寄存器。
  * - Sequence Step：8 word TRIGGER_MASK + 1 word Delay_ms。
  *
  * 关键约束：
@@ -50,10 +50,15 @@ module power_sequence_engine #(
     // 8 Driver ready summary
     input  wire [7:0]   i_seq_bus_ready,
 
+    // 各 BUS 独立读响应；同一 BUS 最多一笔未完成 READ。
+    input  wire [7:0]   i_rsp_valid,
+    input  wire [127:0] i_rsp_rd_data,
+    output wire [7:0]   o_read_pending,
+
     // Common Driver command interface
     output reg          o_cmd_valid,
     input  wire         i_cmd_ready,
-    output wire         o_cmd_rw,
+    output reg          o_cmd_rw,
     output reg  [2:0]   o_cmd_bus_id,
     output reg  [3:0]   o_cmd_device_id,
     output reg  [6:0]   o_cmd_reg_addr,
@@ -75,7 +80,7 @@ localparam [6:0] REG_RAMP_EN   = 7'h41;
 
 localparam integer CLK_PER_MS = SYS_CLK_FREQ / 1000;
 
-assign o_cmd_rw = 1'b0;
+assign o_read_pending = read_pending;
 //-------------------------------------------------------------------
 // Power Sequence RAM
 //-------------------------------------------------------------------
@@ -176,10 +181,14 @@ reg [31:0]  delay_clk_cnt;
 reg [10:0] param_ptr       [0:7]; //当前 BUS 正在处理的 Parameter Record 起始地址。
 reg [15:0] param_left      [0:7]; //当前 BUS 还剩多少条 Parameter Record。
 // phase=0 读取 DEVICE_ID；后续 phase 根据上下电方向执行固定值或 RAM 参数写入。
-// Power-On : 1=FIN(0), 2=Ramp End, 3=Ramp Step, 4=RCLK Div, 5=Control(0x02)
+// Power-On : 1=FIN(0), 2=Ramp End, 3=Ramp Step, 4=RCLK Div, 5=READ 0x02, 6=WRITE 0x02
 // Power-Off: 1=Ramp End(0), 2=Ramp Step, 3=RCLK Div；Ramp 后续状态暂不在本阶段处理
 reg [2:0]  param_phase     [0:7]; // 当前一条 Parameter Record 内的寄存器配置阶段。
 reg [3:0]  param_device_id [0:7]; //当前 BUS 正在操作的 device id
+
+reg [7:0] read_pending;
+reg [15:0] read_data [0:7];
+integer rsp_i;
 
 reg [2:0] selected_bus;
 
@@ -201,12 +210,12 @@ always @(*) begin
     param_all_done     = 1'b1;
 
     for (sched_i = 0; sched_i < 8; sched_i = sched_i + 1) begin
-        if (param_left[sched_i] != 16'd0)
+        if ((param_left[sched_i] != 16'd0) || read_pending[sched_i])
             param_all_done = 1'b0;
 
         if (!param_select_valid &&
             (param_left[sched_i] != 16'd0) &&
-            i_seq_bus_ready[sched_i]) begin
+            !read_pending[sched_i] && i_seq_bus_ready[sched_i]) begin
             param_select_valid = 1'b1;
             param_select_bus   = sched_i[2:0];
         end
@@ -270,10 +279,6 @@ always @(*) begin
                         seq_ram_rd_en   = 1'b1;
                         seq_ram_rd_addr = param_ptr[selected_bus] + 11'd3; // UP_RCLK_DIV
                     end
-                    3'd5: begin
-                        seq_ram_rd_en   = 1'b1;
-                        seq_ram_rd_addr = param_ptr[selected_bus] + 11'd4; // CONTROL_REG_0x02，仅 Power-On
-                    end
                     default: ; // phase1: FIN DAC 固定写 0
                 endcase
             end
@@ -332,12 +337,15 @@ always @(posedge i_clk or negedge i_rst_n) begin
         o_seq_busy           <= 1'b0;
         o_seq_done           <= 1'b0;
         o_cmd_valid          <= 1'b0;
+        o_cmd_rw             <= 1'b0;
+        read_pending         <= 8'd0;
         o_cmd_bus_id         <= 3'd0;
         o_cmd_device_id      <= 4'd0;
         o_cmd_reg_addr       <= 7'd0;
         o_cmd_wr_data        <= 16'd0;
 
         for (reset_i = 0; reset_i < 8; reset_i = reset_i + 1) begin
+            read_data[reset_i]       <= 16'd0;
             param_start_cfg[reset_i] <= 11'd0;
             param_count_cfg[reset_i] <= 16'd0;
             param_ptr[reset_i]       <= 11'd0;
@@ -356,8 +364,18 @@ always @(posedge i_clk or negedge i_rst_n) begin
             o_seq_busy         <= 1'b0;
             o_cmd_valid        <= 1'b0;
             pending_mask       <= 128'd0;
+            read_pending       <= 8'd0;
         end
         else begin
+            // 每拍检查全部 BUS，响应与全局 FSM/RAM 访问并行；同拍多响应不会互相覆盖。
+            // abort 分支使旧结果失效；System 保留授权并排空 Driver 后才能启新业务。
+            for (rsp_i = 0; rsp_i < 8; rsp_i = rsp_i + 1) begin
+                if (read_pending[rsp_i] && i_rsp_valid[rsp_i]) begin
+                    read_data[rsp_i]   <= i_rsp_rd_data[rsp_i*16 +: 16];
+                    read_pending[rsp_i] <= 1'b0;
+                    param_phase[rsp_i] <= 3'd6;
+                end
+            end
             case (state)
                 ST_IDLE: begin
                     o_seq_busy  <= 1'b0;
@@ -525,6 +543,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
                         state                         <= ST_PARAM_REQ;
                     end
                     else begin
+                        o_cmd_rw        <= 1'b0;
                         o_cmd_bus_id    <= selected_bus;
                         o_cmd_device_id <= param_device_id[selected_bus];
 
@@ -547,14 +566,15 @@ always @(posedge i_clk or negedge i_rst_n) begin
                                     o_cmd_reg_addr <= REG_RCLK_DIV;
                                     o_cmd_wr_data  <= seq_ram_rd_data;
                                 end
-                                // 0x02 最后写；上位机只提供其余 bit，Power-On 显式置 SW_INH(bit15)=1。
+                                // READ 提交后让出全局调度器；phase6 仅在对应 BUS 返回后就绪。
                                 3'd5: begin
+                                    o_cmd_rw       <= 1'b1;
                                     o_cmd_reg_addr <= REG_CONTROL;
-                                    o_cmd_wr_data  <= {1'b1, seq_ram_rd_data[14:0]};
+                                    o_cmd_wr_data  <= 16'h0000;
                                 end
-                                default: begin
+                                default: begin // phase6：Rev.F Table18，bit14/bit3:0 必须为0。
                                     o_cmd_reg_addr <= REG_CONTROL;
-                                    o_cmd_wr_data  <= {1'b1, seq_ram_rd_data[14:0]};
+                                    o_cmd_wr_data  <= (read_data[selected_bus] & 16'h3FF0) | 16'h8000;
                                 end
                             endcase
                         end
@@ -585,12 +605,15 @@ always @(posedge i_clk or negedge i_rst_n) begin
                     end
                 end
 
-                // Power-On 以 Control(0x02) 为最后一步；Power-Off 目前以 RCLK Divider 为最后一步。
+                // Power-On READ(phase5)仅置pending，WRITE(phase6)提交后才完成Record；OFF不变。
                 ST_PARAM_SEND: begin
                     if (o_cmd_valid && i_cmd_ready) begin
                         o_cmd_valid <= 1'b0;
 
-                        if (((seq_mode_reg == MODE_POWER_ON)  && (param_phase[selected_bus] == 3'd5)) ||
+                        if (o_cmd_rw) begin
+                            read_pending[selected_bus] <= 1'b1;
+                        end
+                        else if (((seq_mode_reg == MODE_POWER_ON)  && (param_phase[selected_bus] == 3'd6)) ||
                             ((seq_mode_reg == MODE_POWER_OFF) && (param_phase[selected_bus] == 3'd3))) begin
                             param_phase[selected_bus] <= 3'd0;
                             param_ptr[selected_bus]   <= param_ptr[selected_bus] + 11'd7;
@@ -605,7 +628,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
                 end
                 // Parameter 只是“提交给 Driver”即完成；进入 Sequence 前必须等 8 个 Driver 都重新 ready，确保参数已真正执行完。
                 ST_PARAM_BARRIER: begin
-                    if (i_seq_bus_ready == 8'hFF) begin
+                    if ((i_seq_bus_ready == 8'hFF) && (read_pending == 8'd0)) begin
                         step_word_index <= 4'd0;
                         pending_mask    <= 128'd0;
                         state           <= ST_STEP_REQ;
@@ -647,6 +670,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
                             state <= ST_DELAY;
                     end
                     else if (seq_select_valid) begin
+                        o_cmd_rw        <= 1'b0;
                         o_cmd_bus_id    <= seq_select_bus;
                         o_cmd_device_id <= seq_select_device;
                         o_cmd_reg_addr  <= REG_RAMP_EN;

@@ -31,6 +31,14 @@ module system_controller (
     input  wire        i_alarm_done,
     input  wire        i_alarm_clear_done,
 
+    // 停止提交确认与响应排空；busy=0 表示模块已退出执行。
+    input  wire        i_cfg_busy,
+    input  wire        i_seq_busy,
+    input  wire        i_alarm_busy,
+    input  wire [7:0]  i_seq_read_pending,
+    input  wire [7:0]  i_driver_rsp_valid,
+    output wire        o_cmd_enable,
+
     // Device / Driver status
     input  wire [7:0]  i_alarm,
     input  wire [7:0]  i_driver_bus_fault,
@@ -56,7 +64,12 @@ module system_controller (
     output reg         o_alarm_clear_all,
     // Driver / system fault
     output reg  [7:0]  o_driver_fault_clear,
-    output reg  [7:0]  o_fault_vector_latched
+    output reg  [7:0]  o_fault_vector_latched,
+    output reg  [7:0]  o_sys_state,
+    output reg  [1:0]  o_cfg_result,
+    output reg  [1:0]  o_seq_result,
+    output wire       o_cfg_start_allowed,
+    output wire       o_seq_start_allowed
 );
 
 //-------------------------------------------------------------------
@@ -80,10 +93,56 @@ localparam [3:0] ST_ALARM_CLEAR      = 4'd6;
 localparam [3:0] ST_FAULT            = 4'd7;
 localparam [3:0] ST_FAULT_RESET_WAIT = 4'd8;
 
+localparam [3:0] ST_DRAIN = 4'd9;
 reg [3:0] state;
+reg [1:0] drain_owner;
+reg [3:0] drain_next;
+reg       drain_quiet;
+wire      owner_stopped;
+wire      pool_quiet;
+assign owner_stopped = (drain_owner == SEL_CONFIG) ? !i_cfg_busy :
+                       (drain_owner == SEL_SEQUENCE) ? (!i_seq_busy && (i_seq_read_pending == 0)) :
+                       !i_alarm_busy;
+assign pool_quiet = (i_driver_ready == 8'hFF) && (i_driver_rsp_valid == 8'd0);
+// DRAIN 保留响应归属但关闭命令；Top 必须同时门控 valid 和回送 ready。
+assign o_cmd_enable = (state == ST_CONFIG) || (state == ST_SEQUENCE) ||
+                      (state == ST_ALARM) || (state == ST_ALARM_CLEAR);
 reg       clear_return_ready;
 wire [7:0] new_fault_vector;
 assign new_fault_vector = i_driver_bus_fault & ~o_fault_vector_latched;
+
+// 通信请求在 allowed 为真时与 System 同沿提交，避免回复成功但请求被忽略。
+assign o_cfg_start_allowed = ((state == ST_IDLE) || (state == ST_READY)) &&
+                             (i_alarm == 0) && (new_fault_vector == 0);
+assign o_seq_start_allowed = (state == ST_READY) &&
+                             (i_alarm == 0) && (new_fault_vector == 0);
+
+// DRAIN 不占用新的协议编码，回报仍在排空的业务类别。
+always @(*) begin
+    o_sys_state = {4'd0, state};
+    if (state == ST_DRAIN) begin
+        case (drain_owner)
+            SEL_CONFIG:   o_sys_state = 8'h01;
+            SEL_SEQUENCE: o_sys_state = 8'h03;
+            default:      o_sys_state = 8'h04;
+        endcase
+    end
+end
+
+// 只观察实际启动/完成/中止事件，不改变原控制 FSM。
+always @(posedge i_clk or negedge i_rst_n) begin
+    if (!i_rst_n) begin
+        o_cfg_result <= 2'd0;
+        o_seq_result <= 2'd0;
+    end else begin
+        if (o_cfg_start) o_cfg_result <= 2'd1;
+        else if (o_cfg_abort) o_cfg_result <= 2'd3;
+        else if (i_cfg_done) o_cfg_result <= 2'd2;
+        if (o_seq_start) o_seq_result <= 2'd1;
+        else if (o_seq_abort) o_seq_result <= 2'd3;
+        else if (i_seq_done) o_seq_result <= 2'd2;
+    end
+end
 
 //-------------------------------------------------------------------
 // sel_id 完全由系统状态决定；FAULT/IDLE/READY 等状态不允许业务模块占用公共 Driver 通路。
@@ -100,6 +159,9 @@ always @(*) begin
         ST_ALARM_CLEAR:
             o_sel_id = SEL_ALARM;
 
+        ST_DRAIN:
+            o_sel_id = drain_owner;
+
         default:
             o_sel_id = SEL_NONE;
     endcase
@@ -111,6 +173,9 @@ end
 always @(posedge i_clk or negedge i_rst_n) begin
     if (!i_rst_n) begin
         state                  <= ST_IDLE;
+        drain_owner            <= SEL_NONE;
+        drain_next             <= ST_IDLE;
+        drain_quiet            <= 1'b0;
         clear_return_ready     <= 1'b0;
         o_cfg_start            <= 1'b0;
         o_cfg_abort            <= 1'b0;
@@ -142,13 +207,14 @@ always @(posedge i_clk or negedge i_rst_n) begin
                                       i_driver_bus_fault;
             o_driver_fault_clear   <= new_fault_vector;
             // 进入 FAULT 前中止当前业务模块；已经被 Driver 接收的底层事务不再撤销。
-            if (state == ST_CONFIG)
+            if ((state == ST_CONFIG) || ((state == ST_DRAIN) && (drain_owner == SEL_CONFIG)))
                 o_cfg_abort <= 1'b1;
 
-            if (state == ST_SEQUENCE)
+            if ((state == ST_SEQUENCE) || ((state == ST_DRAIN) && (drain_owner == SEL_SEQUENCE)))
                 o_seq_abort <= 1'b1;
 
-            if ((state == ST_ALARM) || (state == ST_ALARM_CLEAR))
+            if ((state == ST_ALARM) || (state == ST_ALARM_CLEAR) ||
+                ((state == ST_DRAIN) && (drain_owner == SEL_ALARM)))
                 o_alarm_abort <= 1'b1;
 
             state <= ST_FAULT;
@@ -179,16 +245,21 @@ always @(posedge i_clk or negedge i_rst_n) begin
                         state               <= ST_ALARM_CLEAR;
                     end
                 end
-                // Config 执行期间 ALARM 可抢占：先 abort Config，再立即切到 Alarm Scan，不恢复旧配置流程。
+                // Config 执行期间 ALARM 可抢占：先 abort Config，排空后切到 Alarm Scan，不恢复旧配置流程。
                 ST_CONFIG: begin
                     if (i_alarm != 8'd0) begin
                         o_alarm_vector <= i_alarm;
                         o_cfg_abort    <= 1'b1;
-                        o_alarm_start  <= 1'b1;
-                        state          <= ST_ALARM;
+                        drain_owner    <= SEL_CONFIG;
+                        drain_next     <= ST_ALARM;
+                        drain_quiet    <= 1'b0;
+                        state          <= ST_DRAIN;
                     end
                     else if (i_cfg_done) begin
-                        state <= ST_READY;
+                        drain_owner <= SEL_CONFIG;
+                        drain_next  <= ST_READY;
+                        drain_quiet <= 1'b0;
+                        state       <= ST_DRAIN;
                     end
                 end
 
@@ -216,24 +287,32 @@ always @(posedge i_clk or negedge i_rst_n) begin
                     end
                 end
 
-                // Sequence 执行期间 ALARM 可抢占：abort PSE 后启动扫描，旧上下电流程不恢复。
+                // Sequence 执行期间 ALARM 可抢占：abort PSE 后排空 Driver，再启动扫描，旧上下电流程不恢复。
                 ST_SEQUENCE: begin
                     if (i_alarm != 8'd0) begin
                         o_alarm_vector <= i_alarm;
                         o_seq_abort    <= 1'b1;
-                        o_alarm_start  <= 1'b1;
-                        state          <= ST_ALARM;
+                        drain_owner    <= SEL_SEQUENCE;
+                        drain_next     <= ST_ALARM;
+                        drain_quiet    <= 1'b0;
+                        state          <= ST_DRAIN;
                     end
                     else if (i_seq_done) begin
-                        // 正常 Sequence 完成后回 READY，可继续接受下一条业务命令。
-                        state <= ST_READY;
+                        // done 只表示业务已停止派发，最后一个 Step 的 Driver 仍可能忙。
+                        drain_owner <= SEL_SEQUENCE;
+                        drain_next  <= ST_READY;
+                        drain_quiet <= 1'b0;
+                        state       <= ST_DRAIN;
                     end
                 end
 
                 ST_ALARM: begin
                     if (i_alarm_done) begin
                         // Alarm Scan 只负责定位并保存故障；完成后进入 FAULT_HANDLE，等待上层完成故障处理再发 Clear。
-                        state <= ST_FAULT_HANDLE;
+                        drain_owner <= SEL_ALARM;
+                        drain_next  <= ST_FAULT_HANDLE;
+                        drain_quiet <= 1'b0;
+                        state       <= ST_DRAIN;
                     end
                 end
 
@@ -249,10 +328,32 @@ always @(posedge i_clk or negedge i_rst_n) begin
                 // Clear 完成后的返回位置由启动来源决定：READY 发起则回 READY，故障处理/初始化发起则回 IDLE。
                 ST_ALARM_CLEAR: begin
                     if (i_alarm_clear_done) begin
-                        if (clear_return_ready)
-                            state <= ST_READY;
-                        else
-                            state <= ST_IDLE;
+                        drain_owner <= SEL_ALARM;
+                        drain_next  <= clear_return_ready ? ST_READY : ST_IDLE;
+                        drain_quiet <= 1'b0;
+                        state       <= ST_DRAIN;
+                    end
+                end
+
+                // 旧业务先停止；已接受的事务（含 abort 同沿握手）由 Driver 自行完成。
+                ST_DRAIN: begin
+                    // 即使原先为正常完成，排空期间出现的 ALARM 也锁存并优先处理。
+                    if ((drain_owner != SEL_ALARM) && (i_alarm != 8'd0)) begin
+                        o_alarm_vector <= (drain_next == ST_ALARM) ?
+                                          (o_alarm_vector | i_alarm) : i_alarm;
+                        drain_next <= ST_ALARM;
+                    end
+                    drain_quiet <= owner_stopped && pool_quiet;
+                    if (drain_quiet && owner_stopped && pool_quiet) begin
+                        if ((drain_owner != SEL_ALARM) &&
+                            ((drain_next == ST_ALARM) || (i_alarm != 8'd0))) begin
+                            o_alarm_start <= 1'b1;
+                            state <= ST_ALARM;
+                        end
+                        else begin
+                            state <= drain_next;
+                        end
+                        drain_quiet <= 1'b0;
                     end
                 end
 
@@ -265,7 +366,8 @@ always @(posedge i_clk or negedge i_rst_n) begin
 
                 // Driver clear 后仍需等 8 路全部 ready，确认底层已恢复，再清系统 fault_vector 并回 IDLE。
                 ST_FAULT_RESET_WAIT: begin
-                    if (i_driver_ready == 8'hFF) begin
+                    if (pool_quiet && !i_cfg_busy && !i_seq_busy && !i_alarm_busy &&
+                        (i_seq_read_pending == 8'd0)) begin
                         o_fault_vector_latched <= 8'd0;
                         state                  <= ST_IDLE;
                     end

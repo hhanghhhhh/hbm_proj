@@ -34,6 +34,7 @@ System Controller 只根据系统状态产生 `sel_id`，用于选择当前业�
 
 ```text
 cmd_valid
+cmd_rw
 cmd_bus_id
 cmd_device_id
 cmd_reg_addr
@@ -131,3 +132,11 @@ flowchart TB
     DRV -->|SYNC 128 路| DEV
     DEV -->|BUSY 8 路| DRV
 ```
+
+## 4. 通用READ与独占授权释放
+
+System用唯一sel_id独占授权整个Driver资源池；8BUS并行能力由业务内部调度保留。WRITE握手后继续调度；READ必须等对应BUS响应。Top保留 `driver_rsp_valid[7:0]` 和每BUS16-bit数据，按sel_id将8路响应直接交给Power；Alarm仍只允许一笔未完成READ，因此仅在SEL_ALARM时汇总其单笔响应。
+
+旧业务完成或Alarm抢占时，System保留旧sel并关闭cmd_enable（同时门控valid和ready），待业务停止、Driver全ready、无pending READ、响应清零并连续两沿安静后释放。尤其Power的seq_done不代表最后Trigger已完成。Alarm仅在排空后启动，旧响应不会误送Alarm。bus_fault立即转FAULT，独立于普通排空；恢复须显式fault_reset。
+
+PowerRAM仍为7word/Record，+4保留参与CRC，Power-On不再使用它覆盖0x02，改为读回保留bit13:4、置bit15、清bit14/3:0。详见Power设计。
