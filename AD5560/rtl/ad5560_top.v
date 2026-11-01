@@ -35,6 +35,11 @@ module ad5560_top #(
     input  wire         i_seq_ram_wr_en,
     input  wire [10:0]  i_seq_ram_wr_addr,
     input  wire [15:0]  i_seq_ram_wr_data,
+    input  wire [11:0]  i_seq_word_count,
+    input  wire [15:0]  i_seq_expected_crc,
+    input  wire         i_seq_crc_start,
+    output wire         o_seq_crc_done,
+    output wire         o_seq_crc_ok,
 
     // Host / command control
     input  wire         i_cfg_start_req,
@@ -63,6 +68,11 @@ module ad5560_top #(
     output wire [127:0] o_device_fault_vector,
     output wire [7:0]   o_fault_vector_latched,
     output wire [1:0]   o_sel_id,
+    output wire [7:0]   o_sys_state,
+    output wire [1:0]   o_cfg_result,
+    output wire [1:0]   o_seq_result,
+    output wire         o_cfg_start_allowed,
+    output wire         o_seq_start_allowed,
 
     // AD5560 physical interface
     input  wire [7:0]   i_alarm,
@@ -273,7 +283,12 @@ system_controller u_system_controller (
     .o_alarm_clear_start    (alarm_clear_start),
     .o_alarm_clear_all      (alarm_clear_all),
     .o_driver_fault_clear   (driver_fault_clear),
-    .o_fault_vector_latched (o_fault_vector_latched)
+    .o_fault_vector_latched (o_fault_vector_latched),
+    .o_sys_state            (o_sys_state),
+    .o_cfg_result           (o_cfg_result),
+    .o_seq_result           (o_seq_result),
+    .o_cfg_start_allowed    (o_cfg_start_allowed),
+    .o_seq_start_allowed    (o_seq_start_allowed)
 );
 
 //-------------------------------------------------------------------
@@ -316,11 +331,11 @@ power_sequence_engine #(
     .i_seq_ram_wr_en   (i_seq_ram_wr_en),
     .i_seq_ram_wr_addr (i_seq_ram_wr_addr),
     .i_seq_ram_wr_data (i_seq_ram_wr_data),
-    .i_seq_word_count  (12'd0),
-    .i_seq_expected_crc(16'd0),
-    .i_seq_crc_start   (1'b0),
-    .o_seq_crc_done    (),
-    .o_seq_crc_ok      (),
+    .i_seq_word_count  (i_seq_word_count),
+    .i_seq_expected_crc(i_seq_expected_crc),
+    .i_seq_crc_start   (i_seq_crc_start),
+    .o_seq_crc_done    (o_seq_crc_done),
+    .o_seq_crc_ok      (o_seq_crc_ok),
     .i_seq_start       (seq_start),
     .i_seq_mode        (seq_mode),
     .i_seq_abort       (seq_abort),

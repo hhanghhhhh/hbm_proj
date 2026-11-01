@@ -3,6 +3,7 @@
 /*
  * 简版测量缓存：接收 AD4114 有效采样，覆盖保存各通道的最新 24-bit 原码。
  * 通道地址 = ADC_ID * 8 + ADC_CHANNEL；16 颗 ADC 对应 128 路，不区分 V/I。
+ * i_enable_mask 只控制采样写入，不清除旧缓存，也不改变 ADC 连续转换。
  * 通信侧按 TELEMETRY_READ 的 Mask 升序提交地址，将返回值按高字节在前组包：
  * [47:24] 为 Voltage Raw（当前采样），[23:0] 为 Current Raw（固定 0）。
  * 所有接口共用 i_clk。读请求在上升沿接受，沿后 rd_valid/data 有效；可逐拍读。
@@ -18,6 +19,8 @@ module measurement_manager (
     input  wire [7:0]   i_sample_adc_id,
     input  wire [2:0]   i_sample_channel,
     input  wire [23:0]  i_sample_data,
+    // 由 TELEMETRY_ENABLE 原子更新；禁用只停止更新，保留已有缓存。
+    input  wire [127:0] i_enable_mask,
 
     input  wire         i_result_rd_en,
     input  wire [6:0]   i_result_rd_addr,
@@ -32,7 +35,8 @@ reg [127:0] channel_written;
 reg         result_rd_written;
 
 assign result_wr_addr = {i_sample_adc_id[3:0], i_sample_channel};
-assign result_wr_en   = i_rst_n && i_sample_valid && (i_sample_adc_id < 8'd16);
+assign result_wr_en   = i_rst_n && i_sample_valid && (i_sample_adc_id < 8'd16) &&
+                        i_enable_mask[result_wr_addr];
 assign o_result_rd_data = {result_rd_written ? result_rd_data : 24'd0, 24'd0};
 
 measurement_result_ram u_measurement_result_ram (

@@ -64,7 +64,12 @@ module system_controller (
     output reg         o_alarm_clear_all,
     // Driver / system fault
     output reg  [7:0]  o_driver_fault_clear,
-    output reg  [7:0]  o_fault_vector_latched
+    output reg  [7:0]  o_fault_vector_latched,
+    output reg  [7:0]  o_sys_state,
+    output reg  [1:0]  o_cfg_result,
+    output reg  [1:0]  o_seq_result,
+    output wire       o_cfg_start_allowed,
+    output wire       o_seq_start_allowed
 );
 
 //-------------------------------------------------------------------
@@ -105,6 +110,39 @@ assign o_cmd_enable = (state == ST_CONFIG) || (state == ST_SEQUENCE) ||
 reg       clear_return_ready;
 wire [7:0] new_fault_vector;
 assign new_fault_vector = i_driver_bus_fault & ~o_fault_vector_latched;
+
+// 通信请求在 allowed 为真时与 System 同沿提交，避免回复成功但请求被忽略。
+assign o_cfg_start_allowed = ((state == ST_IDLE) || (state == ST_READY)) &&
+                             (i_alarm == 0) && (new_fault_vector == 0);
+assign o_seq_start_allowed = (state == ST_READY) &&
+                             (i_alarm == 0) && (new_fault_vector == 0);
+
+// DRAIN 不占用新的协议编码，回报仍在排空的业务类别。
+always @(*) begin
+    o_sys_state = {4'd0, state};
+    if (state == ST_DRAIN) begin
+        case (drain_owner)
+            SEL_CONFIG:   o_sys_state = 8'h01;
+            SEL_SEQUENCE: o_sys_state = 8'h03;
+            default:      o_sys_state = 8'h04;
+        endcase
+    end
+end
+
+// 只观察实际启动/完成/中止事件，不改变原控制 FSM。
+always @(posedge i_clk or negedge i_rst_n) begin
+    if (!i_rst_n) begin
+        o_cfg_result <= 2'd0;
+        o_seq_result <= 2'd0;
+    end else begin
+        if (o_cfg_start) o_cfg_result <= 2'd1;
+        else if (o_cfg_abort) o_cfg_result <= 2'd3;
+        else if (i_cfg_done) o_cfg_result <= 2'd2;
+        if (o_seq_start) o_seq_result <= 2'd1;
+        else if (o_seq_abort) o_seq_result <= 2'd3;
+        else if (i_seq_done) o_seq_result <= 2'd2;
+    end
+end
 
 //-------------------------------------------------------------------
 // sel_id 完全由系统状态决定；FAULT/IDLE/READY 等状态不允许业务模块占用公共 Driver 通路。
