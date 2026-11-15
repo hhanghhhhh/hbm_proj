@@ -2,8 +2,58 @@
 
 ### 代码待做
 
-1. ADC 代码移植过来，增加给上位机回传数据的相关协议。不同 device 选择 MI\MV 的时候 gain 设置不一样，这个存在哪里？
-2. 在线升级
+紧急下电不能走 ramp，所以下电斜率也没必要了。
+
+branch 2 的功能要考虑。通过 config 提供，还是通过什么提供，提前切好继电器？
+
+上位机打印日志格式可以参考如下，或者说给上位机提供的指令列表（点表）格式：
+``` text
+// 1. 配置所有 Device
+WRITE BUS0 DEV0  0x08 = 0x1C19  // FIN DAC = 0V
+WRITE BUS0 DEV0  0x3E = xxxx    // Ramp End
+WRITE BUS0 DEV0  0x3F = xxxx    // Ramp Step
+WRITE BUS0 DEV0  0x40 = xxxx    // RCLK Div
+...
+WRITE BUS7 DEV15 0x40 = xxxx
+
+BARRIER                         // 所有配置完成
+
+// 2. 第一组上电
+WRITE BUS0 DEV0  0x41 = 0xFFFF
+...
+WRITE BUS2 DEV1 0x41 = 0xFFFF
+
+DELAY 10ms
+
+// 3. 第二组上电
+WRITE BUS2 DEV3  0x41 = 0xFFFF
+...
+WRITE BUS3 DEV1 0x41 = 0xFFFF
+
+DELAY 10ms
+```
+
+
+CLAMP 会改变 FIN DAC？后续测下看看。   OSD 也会改变，这个注意一下？，可用来判断是否告警。
+
+发生异常后 clamp、开路这种状况，ramp 功能应该是失效了，FIN DAC 无法被正确控制。先试下这个。
+然后再看看紧急下电的流程，直接通过 SW_INH，或者直接写 FIN DAC？搞一个紧急下电流程。
+目前测试的现象是，
+1. clamp 短路，ramp 上电是 ok 的，FIN DAC 正常到设定值，但是 ramp 下电失败， FIN DAC 无法被改变了？
+2. OSD 开路，ramp 上电失败，FIN DAC 回读值 0。
+
+手册中说，ramp 过程中，告警会自动终止 ramp 流程状态机。但是还是无法解释开路上电回读 FIN DAC 为 0。 
+
+同一条总线上连续下发 16 个 ramp 指令，ramp 过程中是否会频繁拉高 busy 信号？这个要看看，如果会的话，影响其余通信。
+这个单测一下，单独 ramp 某一个 device，看看过程中 busy 信号是否频繁动作。
+这个已经验证，ramp 过程中，busy 不会拉低。
+
+16 个 device 都焊上后，最好看看 SPI 的波形，10M 有没有问题。
+
+上位机的每条指令最好都有对应的状态可以查询，获取执行到哪一步、是否执行完成、执行结果。
+
+AD5560 的通信频率目前 1M，后续要改为 10M，试试看 16 路是否 ok。
+
 
 ### CPO 告警
 
@@ -58,7 +108,16 @@ Vmid = 7.6875 - Voffset = 6V
 ### 2. 限流
 
 `CLH/CLL` 是用来设置限流 current clamp 的，分别设置正向、负向过流，并触发 `CLALM` 报警。
-电流精度大概 10%*FSCR，精度较差。
+电流精度 `10%*FS (gain = 20)` 或者 `20%*FS (gain = 10)`。
+
+`CLH/CLL` 两个 DAC 之间差值最小 2V，单个 DAC 距离 0A 至少设置 1V。
+
+这里 1V 对应电流 I = 1 / (R * MIgain)，其中正常电流量程 Irange(FS) = 0.5V / R，
+因此 1V 对应 2 / MIgain * FS，MIgain = 20 时，就是 10%*FS。
+
+这里有两个值，一个是精度，一个是最小设定值，这两个值是一样的。然后外部档位的 FS 是按照 0.5V / R 计算的，不是自己定义的一个数值。
+
+也就是说单个 DAC 至少设置 1V，clamp 的精度对应到 dac 那边也是 1V。
 
 限流值与 `Voffset` 无关（由于 Vmid，应该内部做差消去 offset 的影响）：
 
@@ -93,13 +152,7 @@ gain = 0.2：Vout = I * Rsense * MIgain * 0.2 + 0.5125 * 2.5
 
 使用 ramp 后，slew rate 设置为最快 1V/us 即可。
 
-```
-1. 初始状态：Force Amplifier 禁止，DUT 为 High-Z。
-2. Ramp 前完成所有静态配置（挡位、限流、以及固定配置）
-3. 设置起点和终点：FIN DAC x1 = 0、Ramp End Code = END_CODE
-4. 先输出 0 V：SW_INH = 1，HW_INH = 1。（GANG 模式先启动 master）
-5. 启动 Ramp：SPI 命令 Write 0x41 = 0xFFFF （逐个启动）
-```
+ramp 过程中出现告警信号会自动停止 ramp，下电时可以先主动 0x42 停止 ramp 再执行其余下电操作。
 
 #### Ramp 启动延迟
 
@@ -150,10 +203,10 @@ D_ideal = 2.502441 * S / SR_target
 ### 4. OSD\DUTGOND
 
 ```
-V = 2.5 * code / 65536
+V = 3 * code / 65536
 ```
 
-与 offset DAC 无关，范围 0 ~ 2.5V。
+与 offset DAC 无关，范围 0 ~ 3V。
 
 #### 寄存器
 
