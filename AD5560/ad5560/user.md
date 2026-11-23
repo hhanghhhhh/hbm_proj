@@ -33,22 +33,7 @@ WRITE BUS3 DEV1 0x41 = 0xFFFF
 DELAY 10ms
 ```
 
-
-CLAMP 会改变 FIN DAC？后续测下看看。   OSD 也会改变，这个注意一下？，可用来判断是否告警。
-
-发生异常后 clamp、开路这种状况，ramp 功能应该是失效了，FIN DAC 无法被正确控制。先试下这个。
-然后再看看紧急下电的流程，直接通过 SW_INH，或者直接写 FIN DAC？搞一个紧急下电流程。
-目前测试的现象是，
-1. clamp 短路，ramp 上电是 ok 的，FIN DAC 正常到设定值，但是 ramp 下电失败， FIN DAC 无法被改变了？
-2. OSD 开路，ramp 上电失败，FIN DAC 回读值 0。
-
-手册中说，ramp 过程中，告警会自动终止 ramp 流程状态机。但是还是无法解释开路上电回读 FIN DAC 为 0。 
-
-同一条总线上连续下发 16 个 ramp 指令，ramp 过程中是否会频繁拉高 busy 信号？这个要看看，如果会的话，影响其余通信。
-这个单测一下，单独 ramp 某一个 device，看看过程中 busy 信号是否频繁动作。
-这个已经验证，ramp 过程中，busy 不会拉低。
-
-16 个 device 都焊上后，最好看看 SPI 的波形，10M 有没有问题。
+**latch 的告警也会拒绝 ramp 指令，因此 ramp 指令之前，要先检查是否有告警，及时清除告警后再上电。**
 
 上位机的每条指令最好都有对应的状态可以查询，获取执行到哪一步、是否执行完成、执行结果。
 
@@ -198,6 +183,8 @@ D_ideal = 2.502441 * S / SR_target
 | `0x40` | RCLK Divider |
 | `0x41` | Enable Ramp，写 `0xFFFF` 启动 |
 | `0x42` | Interrupt Ramp，写 `0x0000` 中断 |
+
+对于 enable ramp 指令，如果之前有告警，latch 的或者实时的，都会拒绝执行该指令，且 FIN DAC 有概率为 0，在 ramp 过程中出现告警，则会停止 ramp，FIN DAC 会未达到目标值。
 
 
 ### 4. OSD\DUTGOND

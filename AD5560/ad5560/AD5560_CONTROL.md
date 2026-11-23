@@ -1,57 +1,6 @@
 # AD5560 控制与上电时序说明
 
-
-
-## 3. FIN DAC、SW_INH 与 HW_INH
-
-### 3.1 FIN DAC
-
-`FIN DAC x1` 位于地址 `0x08`，决定 Force Voltage 的目标值。
-
-需要明确：
-
-> 写 FIN DAC 是修改目标电压，不等同于打开或关闭 Force Amplifier。
-
-
-### 3.4 SW_INH 与 HW_INH 的组合关系
-
-`SW_INH` 与 `HW_INH` 为 AND 关系：
-
-
-任意一个为 0，Force Amplifier 都被禁止，输出 High-Z。
-
----
-
-## 4. High-Z 与主动输出 0 V
-
-
-### 4.1 High-Z
-
-
-```text
-SW_INH = 0 或 HW _INH = 0
-```
-
-Force Amplifier 被禁止，DUT 端相当于高阻。
-
-
-### 4.2 主动输出 0 V
-
-
-```text
-SW_INH = 1
-HW_INH = 1
-FIN DAC = 0 V 对应 Code
-```
-
-Force Amplifier 已经工作，AD5560 会主动把 DUT rail 调节到 0 V 附近。
-
-
----
-
 ## 5. FIN DAC 的完整数据链路与计算关系
-
-AD5560 的 FIN DAC 不是简单地把 SPI 写入的 16-bit 原码直接送入模拟 DAC。
 
 ### 5.1 完整链路
 
@@ -71,6 +20,7 @@ Calibration Engine
       v
 FIN DAC x2
       |
+      | 是否立即更新由 LOAD 模式决定
       v
 16-bit Resistor-String DAC
       |
@@ -99,6 +49,7 @@ DUT
 - `x2` 不支持通过 SPI 直接 Readback；
 - `5.125` 是芯片内部固定的 DAC amplifier 模拟增益，不是可编程增益；
 - `Offset DAC` 与校准寄存器 `c` 是两个不同概念。
+- `LOAD` 控制的是经过 Calibration Engine 得到的新 `x2` 以及相关受 LOAD 控制的数据，什么时候真正加载到实际工作部分。
 
 ### 5.2 VREF 与固定 5.125 增益
 
@@ -128,49 +79,17 @@ VREF = 5 V
 
 AD5560 标称 Force Voltage span 为约 `25 V`，额外的模拟增益用于给系统 gain/offset correction 留出校准余量。Offset DAC 可以在器件 headroom 允许的范围内上下移动这个电压窗口。
 
-
 `5.125` 本身固定，不能通过寄存器关闭或修改；有效数字增益由 `m` register 另外控制。
-
 
 ---
 
 ## 6. 两种输出变化速度控制方式
 
-
 ### 6.1 Programmable Slew Rate
 
 `DPS Register 2` 地址 `0x03`，`SR[2:0]` 位于 Bit[14:12]。
 
-典型可选 Slew Rate：
-
-| SR | Slew Rate |
-|---:|---:|
-| 0 | 1 V/us |
-| 1 | 0.875 V/us |
-| 2 | 0.75 V/us |
-| 3 | 0.625 V/us |
-| 4 | 0.5 V/us |
-| 5 | 0.4375 V/us |
-| 6 | 0.35 V/us |
-| 7 | 0.313 V/us |
-
 该功能通过改变 Force DAC 输出放大器相关内部补偿，限制模拟输出追踪目标值的速度。
-
-例如：
-
-```text
-FIN DAC = 1.1 V
-SW_INH = 1
-HW_INH = 0
-```
-
-随后：
-
-```text
-HW_INH: 0 -> 1
-```
-
-Force Amplifier 开始向已预设的 1.1 V 目标值变化，输出边沿受 Slew Rate、Current Range、负载电容及环路条件共同影响。
 
 Slew Rate 适合较快的受控电压变化。
 
@@ -180,19 +99,6 @@ Ramp Function 的本质是：
 
 > **Ramp Engine 直接在 FIN DAC `x1` code 上做加减；每一步得到新的 `x1` 后，再经过 Calibration Engine 计算新的 `x2`，最后更新实际 DAC。**
 
-
-
-
-相关寄存器：
-
-| 地址 | 功能 |
-|---|---|
-| `0x08` | FIN DAC x1；Ramp 开始前的当前值就是 Start Code |
-| `0x3E` | Ramp End Code，与 FIN x1 属于同一 code 域 |
-| `0x3F` | Ramp Step Size，定义 x1 每一步变化多少 |
-| `0x40` | RCLK Divider |
-| `0x41` | Enable Ramp，写 `0xFFFF` 启动 |
-| `0x42` | Interrupt Ramp，写 `0x0000` 中断 |
 
 ### 6.3 Ramp Step Size 寄存器
 
@@ -219,12 +125,9 @@ end       = Ramp End Code
 step      = Ramp step size
 ```
 
-
 Ramp 的方向由当前 FIN `x1` 与 `Ramp End Code` 的大小关系决定。
 
 如果最后剩余的 code 差小于一个完整 Step，最后一步自动缩小，使 FIN x1 恰好到达 End Code。
-
-
 
 ### 6.6 为什么数据手册写 16 LSB = 6.1 mV
 
@@ -240,17 +143,11 @@ Ramp 的方向由当前 FIN `x1` 与 `Ramp End Code` 的大小关系决定。
 16 LSB ~= 25 * 16 / 65536  ~= 6.1 mV
 ```
 
-
-
 本项目使用使用 `3 V Vref`，则得到：
 
 ```text
 16 LSB ~= 3 * 5.125 * 16 / 655366  = 3.754 mV
 ```
-
-
-
-
 
 ### 6.7 RCLK Divider 与理论 Ramp 更新周期
 
@@ -271,21 +168,11 @@ Ramp 每一步都需要经过 Calibration Engine。数据手册说明 calibratio
 ```
 
 
-
-
-
-
-
-
-
-
 则稳态 Ramp step 的更新周期：
 
 ```text
 T_STEP = D / F_RCLK
 ```
-
-
 
 ### 6.8 理论 Ramp 斜率公式
 
@@ -294,10 +181,6 @@ T_STEP = D / F_RCLK
 ```text
 SR = Delta_V_STEP / T_STEP
 ```
-
-
-
-
 
 ### 6.9 datasheet 的 0.775 V/us 与 833 kHz 说明
 
@@ -327,77 +210,6 @@ ADI EngineerZone 对该问题的答复指出，datasheet 中的 `0.775 V/us` 应
 
 实际 DUT 节点电压还会受到 Force Amplifier slew、负载电容、电流限制、环路稳定性以及线路压降等模拟因素影响。
 
-### 6.10 Ramp 启动延迟
-
-Ramp Enable 后通常需要约：
-
-```text
-(2 x Divider + 2) 个 RCLK
-```
-
-才开始实际更新，如果不同 device 使用不同 RCLK 需要考虑该延迟，因为 Divider = 255 时延迟还挺大的。
-
-
-
----
-
-## 8. Ramp Function 用于 DUT 上电时的典型顺序
-
-假设目标是从 0 V Ramp 到 `V_TARGET`。
-
-### 8.1 初始安全状态
-
-
-Force Amplifier 禁止，DUT 为 High-Z。
-
-### 8.2 Ramp 前完成静态配置
-
-
-### 8.3 设置起点和终点
-
-```text
-FIN DAC x1 = START_CODE
-Ramp End Code = END_CODE
-```
-
-Ramp Start 没有独立寄存器，启动 Ramp 时当前 FIN `x1` 就是 Start Code。
-
-
-### 8.4 先进入 ZERO_FORCE
-
-
-
-```text
-SW_INH = 1
-HW_INH = 1
-FIN DAC = 0 V 对应 x1
-```
-
-Force Amplifier 已经接管 DUT，DUT 被主动调节到 Ramp 起始电压。
-
-### 8.5 启动 Ramp
-
-
-```text
-Address = 0x41
-Data    = 0xFFFF
-```
-
-
-### 8.6 不应先 Ramp 完再打开 Force Amplifier
-
-如果：
-
-```text
-HW_INH = 0
-FIN: START -> V_TARGET 完成 Ramp
-然后 HW_INH = 1
-```
-
-则 DUT 在 Ramp 期间一直 High-Z，最后仍然是从 High-Z 直接接到目标电压，Ramp 没有作用到 DUT。
-
----
-
 ## 9. Ramp 结束、中断与状态判断
 
 ### 9.1 Ramp 的结束条件
@@ -414,12 +226,9 @@ Ramp 会在以下情况之一发生时退出：
 
 AD5560 没有独立的 RAMP_DONE pin，也没有专门的 Ramp Complete status bit 供 FPGA 轮询。
 
-
 ### 9.3 FPGA 如何确认 Ramp 完成
 
 此可以计算 Ramp 所需步数和预计时间。
-
-
 
 如果需要进一步确认，可在预计完成后读取：
 
@@ -433,105 +242,11 @@ FIN DAC x1 (0x08)
 
 ---
 
-## 10. Ramp 与硬件触发
-
-Ramp Function 不能由：
-
-- `HW_INH`；
-- `CLEN/LOAD`；
-- `HW_INH/LOAD`；
-- 其他外部硬件引脚；
-
-直接触发。
-
-Ramp 的启动方式是 SPI 命令：
-
-```text
-Write 0x41 = 0xFFFF
-```
-
-
----
-
-## 11. LOAD 的实际作用
-
-### 11.1 LOAD 不是 Power Enable，也不是 Ramp Start
-
-`LOAD` 最主要的用途是：
-
-> 允许控制器先把新的 DAC / Range / Compensation 数据准备好，但暂时不让这些新值作用到实际输出；等 LOAD 条件到来时再统一更新。
-
-
-### 11.2 LOAD 与 x1/x2 的关系
-
-以 FIN DAC 为例，可以把内部数据路径理解为：
-
-```text
-SPI Write
-   |
-   v
-FIN x1 Register
-   |
-   v
-Calibration Engine
-   |
-   v
-new FIN x2 ready
-   |
-   | 是否立即更新由 LOAD 模式决定
-   v
-Actual DAC
-```
-
-因此：
-
-> LOAD 不是把某个额外“预写寄存器”复制到 FIN x1；FIN x1 在 SPI 写入时已经更新。LOAD 控制的是经过 Calibration Engine 得到的新 `x2` 以及相关受 LOAD 控制的数据，什么时候真正加载到实际工作部分。
-
-### 11.3 System Control 的 LOAD 模式
-
-`System Control Register 0x01` 的 `LOAD[1:0]` 用于选择更新方式。
-
-#### `LOAD = 0`
-
-默认直接更新模式。
-
-
-不需要外部 LOAD 动作。
-
-#### `LOAD = 1`
-
-`CLEN/LOAD` 引脚被重配置为 LOAD。
-
-
-该模式下 `CLEN/LOAD` 不再承担原来的硬件 CLEN 功能。
-
-#### `LOAD = 2`
-
-`HW_INH/LOAD` 引脚被重配置为 LOAD。
-
-此时该引脚不再承担硬件 `HW_INH` 功能，因此如果系统依赖 HW_INH 做快速关断，应谨慎使用这种模式。
-
-#### `LOAD = 3`
-
-不占用额外 LOAD 引脚，利用 `BUSY` 的释放实现同步更新。
-
-多颗 AD5560 的 `BUSY` 为 open-drain，可按设计要求 wired-OR。只有当共享 BUSY 恢复 High，表示这一组相关内部计算都完成后，才进行同步更新。
-
-该模式适合多器件同步更新，又希望保留 `CLEN` 和 `HW_INH` 原始功能的情况。
-
-
-### 11.5 LOAD 的典型使用场景
-
- LOAD 更适合“同步更新已有工作通道”，而不是承担普通上电时序。
-
----
-
 ## 12. 多颗 AD5560 的控制与同步
 
 ### 12.1 HW_INH 同步 Enable
 
 如果多个 AD5560 已经预配置目标 FIN DAC，可以让多个器件共用一根 `HW_INH`，可实现多个 Force Amplifier 的硬件级同时 Enable。
-
 
 ### 12.3 多颗器件的 Ramp 时序
 
@@ -543,43 +258,13 @@ Ramp 没有公共硬件 Start pin。
 Write 0x41 = 0xFFFF
 ```
 
-
 ### 12.4 多通道在线同步电压变化
 
 如果多个已经在线的通道需要在同一时刻由各自 V1 切换到新的 V2，并且同步精度高于顺序 SPI 写能够提供的水平，则 LOAD 更有价值。
 
-
 ### 12.5 GANG 并联输出
 
 GANG 用于多颗 AD5560 并联提高输出电流。可采用 FV/FV 或 FV/FI；需要均流时优先采用 **Master FV + Slave FI**。
-
-`DPS Register 2` 的 `GANGMODE[10:9]` 与内部开关关系如下：
-
-| GANGMODE | 模式 | SW1 | SW2 | SW5 | SW6 |
-|---|---|---|---|---|---|
-| `00` | Master FV，电压复制 | b | a | a | OFF |
-| `01` | Master FV，电流复制 | b | a | b | OFF |
-| `10` | Slave FV | c | c | OFF | ON |
-| `11` | Slave FI | c | b | OFF | ON |
-
-
-FV/FI 的典型连接为：
-
-```text
-Master  GANGMODE = 01
-MASTER_OUT = Master MI
-       |
-       v
-Slave1  SLAVE_IN   GANGMODE = 11
-         MASTER_OUT
-       |
-       v
-Slave2  SLAVE_IN   GANGMODE = 11
-         MASTER_OUT
-       |
-       v
-...
-```
 
 Slave 的 `SW6 = ON` 用于把前级 GANG reference 继续传到下一颗，**不是重新用本 Slave 的测量电流生成新的参考**。
 
@@ -595,30 +280,6 @@ FV/FI GANG 需满足以下约束：
 - `LOAD` 不能同步切换 `GANGMODE`。
 
 进入或退出 GANG 时，正在改变 GANG 配置的 Slave 应保持 High-Z。典型进入顺序为：先关闭 Slave 输出并完成 Range、MI Gain、Clamp、Compensation 配置，再设置 Master=`01`、Slave=`11`，最后使能 Slave；退出时采用相反顺序，必要时先将 Master 输出降到安全电压。
-
----
-
-## 13. 下电控制
-
-### 13.1 直接禁止输出
-
-直接执行：
-
-```text
-HW_INH = 0 或 SW_INH = 0
-```
-
-会使 Force Amplifier 进入 High-Z。
-
-此后 DUT rail 的下降过程主要由 DUT 电容、负载、泄放和外围电路决定，并不等于受控 Ramp Down。
-
-### 13.2 受控下降到 0 V 再进入 High-Z
-
-如果需要明确控制下降斜率，可以使用 ramp function，把电压下降到 0 后再断开进入 High-Z。
-
-
-
-
 
 ---
 
@@ -669,8 +330,6 @@ Manual 模式下设置 `0x05[15] = 1`，由软件直接设置 gm、RZ、RP、CF�
 
 量产时可以针对不同 DUT / Range 固化不同 Manual Compensation Profile。
 
-
-
 ### 14.6 GANG 模式
 
 FV/FI GANG 时：
@@ -685,26 +344,96 @@ FV/FI GANG 时：
 
 > Safe 用于未知状态和初始化；Auto 用于已知 C / ESR 的正常优化；Manual 用于已经充分表征后的固定配置；Slave FI 按 GANG FI 的内部补偿规则工作，不照搬 Master FV 参数。
 
+# AD5560 项目上下电时序方案
+
+## 6. Ramp 完成与 Alarm
+
+AD5560 没有独立的 `RAMP_DONE` 引脚或 Ramp Complete 状态位。
+
+FPGA 采用以下方式管理 Ramp：
+
+```text
+1. 根据 Start Code、End Code、Step、RCLK Divider 和 RCLK 计算预计 Ramp 时间；
+2. 到达预计结束时间后留出必要裕量；
+3. 需要确认时可读回 `FIN DAC x1 (0x08)`，检查是否已经到达 End Code。
+```
+
+一定要确保 ramp 完成，因为 ramp 会被 alarm 打断，很可能报错导致没有完成。紧急下电可不用 ramp 功能。
+
+AD5560 不做后台状态寄存器轮询。
+
+收到 `ALARM` 后，由 `System Controller` 暂停新的 Sequence 命令派发并启动 `Alarm Handler`，事件触发读取 Alarm / Fault Status 寄存器。已经被 Driver 接受的 SPI 事务不取消。
+
+Alarm Handler 完成状态读取后，是否继续 Sequence 或转入故障处理由系统策略决定。
+
 ---
 
-## 16. 器件控制约束总结
+## 7. 故障处理原则
 
-1. 复位完成后先等待 `BUSY = High`，再开始寄存器配置；
+运行过程中发生 AD5560 Alarm 时，FPGA 读取对应状态寄存器进行故障定位，再由系统策略决定是否继续运行。
 
-10. 默认 `LOAD = 0` 时，写 FIN x1 后经过 Calibration Engine，新的 x2 在内部处理完成后自动作用到实际 DAC；
+如果 SPI / BUSY 等底层执行出现系统级异常，则停止当前上下电流程。需要立即关断输出时，可使用全局 `HW_INH` 进入 High-Z，不要求等待正常 Ramp Down 完成。
 
-13. Programmable Slew Rate 和 Ramp Function 是两种不同的输出变化机制；
-14. Ramp Step Size 直接作用于 FIN DAC `x1`，不是作用于 `x2`；
-15. Ramp Start Code、End Code 和 Step Size 均属于 `x1` code 域；
-16. 每一个新的 Ramp x1 都经过 Calibration Engine 生成 x2，再加载到实际 DAC；
-17. `m` 和 `VREF` 会影响实际 Ramp 电压步长和斜率；`c`、Offset DAC、DUTGND 不影响相邻 Ramp Step 的电压差；
+具体状态机和模块接口见 `SYSTEM_CONTROLLER_DESIGN.md` 与 `POWER_SEQUENCE_ENGINE_DESIGN.md`。
 
-21. AD5560 没有专用 `RAMP_DONE` 标志，FPGA 可依据已知参数计时，并在需要时读回 FIN x1 确认是否达到 End Code；
-22. Ramp 期间 Alarm 可以导致 Ramp 中断；
 
----
+## 6. SPI 数字接口
 
-## 17. 参考资料
+### 6.1 相关引脚
 
-- Analog Devices, **AD5560 Rev.F Data Sheet**: https://www.analog.com/media/en/technical-documentation/data-sheets/AD5560.pdf
-- Analog Devices EngineerZone, **Ramp control of AD5560**：关于 `833 kHz / 2032 LSB / 0.775 V/us` 的计算讨论。
+| 引脚 | 方向 | 作用 |
+|---|---|---|
+| `SYNC` | Input | SPI Frame Sync，低有效，等价于器件片选 |
+| `SCLK` | Input | SPI 时钟，Active Falling Edge |
+| `SDI` | Input | 串行数据输入 |
+| `SDO` | Output | 寄存器 Readback 输出 |
+| `BUSY` | Open-Drain Output | 内部更新忙指示，低有效 |
+| `RESET` | Input | 寄存器复位 |
+
+纯写模式 SCLK 最高可到 **50 MHz**。
+
+Readback 时最大 SCLK 与 DVCC 有关：
+
+| DVCC | Readback 最大 SCLK |
+|---|---:|
+| 2.3 V ~ 2.7 V | 12 MHz |
+| 2.7 V ~ 3.3 V | 15 MHz |
+| 4.5 V ~ 5.5 V | 20 MHz |
+
+### 6.2 24-bit 命令格式
+
+每个命令固定 24 bit，MSB First：
+
+```text
+Bit23       Bit22 ........ Bit16   Bit15 ........ Bit0
++----+      +------------------+   +------------------+
+|R/W |      | Address[6:0]     |   | Data[15:0]       |
++----+      +------------------+   +------------------+
+```
+
+### 6.4 BUSY
+
+`BUSY` 为 Open-Drain、Active-Low：
+
+```text
+BUSY = 0 -> 内部仍在处理
+BUSY = 1 -> 当前内部更新完成
+```
+
+主要时序量级：
+
+- DAC `x1` write：最大约 1.5 µs；
+- 其他寄存器 write：最大约 280 ns；
+- RESET：Timing Table 最大约 400 µs。
+
+多颗 AD5560 的 BUSY 可以 wired-OR，但共享后只能知道组级 Busy。
+
+### 6.6 Readback 是两帧
+
+第一帧发送 Read Request，第二帧发送 NOP 并从 SDO 接收结果：
+
+```text
+Frame 1: Read(addr)
+SYNC high >= 250 ns
+Frame 2: NOP + SDO readback
+```
